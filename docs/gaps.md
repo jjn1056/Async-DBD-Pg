@@ -298,3 +298,157 @@ The ROLLBACK-if-in-transaction path and callback failure handling.
 
 No tests for simultaneous pool acquisition, race between timeout and connection
 availability, or multiple PubSub listeners receiving notifications concurrently.
+
+---
+
+## Section 7: Feature Gaps (competitive parity with mature async PG libraries)
+
+Cross-language analysis of asyncpg (Python), pgx (Go), tokio-postgres (Rust),
+node-postgres (Node.js), Npgsql (.NET), and Perl's Mojo::Pg / AnyEvent::Pg identified
+these as table-stakes features we're missing.
+
+### 46. COPY protocol support
+
+Every mature async PG library has COPY support built-in or via companion package. It's the
+standard mechanism for bulk data loading/export — dramatically faster than multi-row INSERT.
+
+**COPY TO (reading out):** Fully async via DBD::Pg's `pg_getcopydata_async`. This is
+non-blocking and maps directly to our Future::IO poll pattern. Should be straightforward.
+
+**COPY FROM (writing in):** DBD::Pg's `pg_putcopydata` is fundamentally blocking — DBD::Pg
+never calls `PQsetnonblocking()`, does not expose `PQflush()`, and has no
+`pg_putcopydata_async`. The C implementation blocks in `PQputCopyData` when the TCP send
+buffer fills.
+
+**Plan:** Implement as "mostly async" for the initial release — issue the COPY command
+asynchronously, accept that `pg_putcopydata` calls block per-chunk, send data in small
+chunks to minimize blocking time. Document the write-side blocking caveat clearly. For most
+real-world usage (CSV loading, ETL), individual putcopydata calls are fast (just buffering
+into libpq) and only block when the TCP buffer fills.
+
+**Upstream:** True non-blocking COPY FROM would require DBD::Pg changes: expose
+`PQsetnonblocking()`, expose `PQflush()`, add `pg_putcopydata_async` returning 0 on
+buffer-full. See Section 10 (DBD::Pg upstream spike) for details.
+
+### 47. Rich error diagnostics from `pg_error_field`
+
+We have the `Error::Query` class with fields for `detail`, `hint`, `constraint`,
+`position` — but `_throw_query_error` never populates them. DBD::Pg exposes
+`$dbh->pg_error_field($field)` with severity, detail, hint, constraint, schema, table,
+column, statement_position, and more. Every other mature library surfaces these.
+
+Must call `pg_error_field` immediately after an error (before any subsequent query clears
+it) and populate the existing Error::Query fields. Also add `schema`, `table`, `column`
+fields to Error::Query.
+
+### 48. Transaction `readonly` and `deferrable` options
+
+asyncpg, pgx, tokio-postgres, r2dbc, and Npgsql all support the full
+`BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE` combination. We
+support isolation levels but not `readonly` or `deferrable`. This matters for read replicas
+and reporting workloads.
+
+Add `readonly` and `deferrable` options to the `transaction()` method.
+
+### 49. PubSub reconnect with subscription recovery
+
+Mojo::Pg has `reconnect_interval` and emits disconnect/reconnect events. AnyEvent::Pg::Pool
+auto-resubscribes channels after reconnect. Our PubSub silently dies on connection loss.
+
+For a feature that is inherently long-lived (listeners run for hours/days), silent failure
+on connection loss is unacceptable. Implement:
+- Configurable `reconnect_interval`
+- Automatic re-LISTEN for all registered channels on reconnect
+- `on_disconnect` / `on_reconnect` callbacks so the application knows
+
+### 50. Connection `max_lifetime` with jitter
+
+pgx, node-postgres (`maxLifetimeSeconds`), asyncpg (`max_inactive_connection_lifetime`),
+Npgsql (`ConnectionLifetime`), and r2dbc (`maxLifeTime`) all have this. Prevents using
+connections that have been open so long they've accumulated leaked state or crossed a server
+restart boundary.
+
+Add a `max_lifetime` pool parameter (separate from `idle_timeout`) that closes connections
+after an absolute age, regardless of activity. Include configurable jitter (like pgx) to
+prevent thundering herd when many connections reach max lifetime simultaneously.
+
+---
+
+## Section 8: Convenience Gaps vs. Plain DBD::Pg
+
+Features that users of DBD::Pg will expect and find missing.
+
+### 51. No type binding control
+
+No way to set `pg_type` on bind params (needed for BYTEA, JSON/JSONB). No way to configure
+`pg_bool_tf`, `pg_expand_array`, `pg_int8_as_string`, or `pg_enable_utf8` at connection
+time. Users working with binary data, JSON, or boolean columns will hit this immediately.
+
+At minimum, support:
+- Per-bind `pg_type` (e.g., `query($sql, { col => [$val, PG_BYTEA] })`)
+- Pool-level type defaults via `on_connect` (already works as escape hatch)
+- Document the `on_connect` pattern for setting type attributes
+
+### 52. No `pg_placeholder_dollaronly` support
+
+Needed for JSONB operators (`?`, `?|`, `?&`) and geometric operators (`?#`, `?-|`). Without
+this, any query using JSONB containment checks will break because `?` is treated as a
+placeholder. JSONB is extremely common in modern PostgreSQL usage.
+
+### 53. No connection diagnostic attributes
+
+No way to get `pg_pid`, `pg_server_version`, `pg_db` from a connection. These are basic for
+logging ("query failed on backend PID 12345"), version-gated behavior, and debugging.
+
+### 54. No explicit prepare/execute cycle
+
+Everything goes through combined prepare+execute. No way to prepare a statement once and
+execute it many times with different parameters. This is a significant performance gap for
+hot loops (e.g., inserting 10,000 rows with the same statement structure).
+
+### 55. No `pg_skip_deallocate` support
+
+Needed for PgBouncer compatibility. Without this, using the library behind PgBouncer (which
+many production deployments use for external connection pooling) will fail with prepared
+statement errors. Should be configurable at the pool level.
+
+---
+
+## Section 9: Nice to Have (future consideration)
+
+### 56. JSON/JSONB column auto-expansion
+
+Mojo::Pg's `expand()` auto-decodes JSON/JSONB columns to Perl hashrefs/arrayrefs on read,
+which is genuinely convenient. Questions to resolve before implementing:
+- Read-only (auto-decode) or also auto-encode on write?
+- Per-query opt-in or connection-level default?
+- How to handle cases where raw JSON string is preferred (e.g., pass-through to HTTP
+  response)?
+- Partial update patterns (modify one key in a large document)?
+
+Low priority for initial release but high user-experience value.
+
+---
+
+## Section 10: DBD::Pg Upstream Spike (COPY FROM async support)
+
+For true non-blocking COPY FROM STDIN, DBD::Pg would need:
+
+1. **Expose `PQsetnonblocking()`** — or call it internally when entering COPY mode. Currently
+   DBD::Pg never calls this; the connection is always in blocking mode.
+
+2. **Expose `PQflush()`** — needed for the non-blocking write loop. When `PQputCopyData`
+   returns 0 (buffer full), the caller must: call `PQflush()`, if it returns 1 wait for
+   socket write-ready or read-ready, if read-ready call `PQconsumeInput()` (to avoid
+   deadlock from server NOTICEs), then retry.
+
+3. **Add `pg_putcopydata_async`** — or modify `pg_putcopydata` to honor non-blocking mode
+   and return 0 on buffer-full instead of blocking. Currently `dbdimp.c:4537` has a
+   `copystatus == 0` branch that is dead code with a comment `/* non-blocking mode only */`.
+
+4. **Possibly expose `PQconsumeInput()`** — for the write-side flush loop. Already used
+   internally for `pg_getcopydata_async`.
+
+The C changes in `dbdimp.c` appear contained: the non-blocking branches already exist as
+dead code, they just need `PQsetnonblocking()` to be called and the return values to be
+surfaced to Perl. A patch to DBD::Pg is feasible but out of scope for our initial release.
