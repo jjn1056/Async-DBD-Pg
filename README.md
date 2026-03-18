@@ -1,14 +1,17 @@
-# Future-IO-Pg
+# Async::DBD::Pg
 
-Event-loop agnostic async PostgreSQL client for Perl using Future::IO.
+Event-loop agnostic async PostgreSQL client for Perl using Future::IO,
+implemented on top of DBD::Pg.
 
 ## Synopsis
 
 ```perl
-use Future::IO::Impl::IOAsync;  # or any Future::IO implementation
-use Future::IO::Pg;
+use Future::IO;
+use Async::DBD::Pg;
 
-my $pg = Future::IO::Pg->new(
+BEGIN { Future::IO->load_best_impl; }
+
+my $pg = Async::DBD::Pg->new(
     dsn             => 'postgresql://user:pass@host/db',
     min_connections => 2,
     max_connections => 10,
@@ -23,9 +26,11 @@ $conn->release;
 ## Features
 
 - **Event-loop agnostic** - Works with any Future::IO implementation (IO::Async, UV, GLib, etc.)
+- **DBD::Pg-backed** - Uses DBI + DBD::Pg as the only database substrate
 - **Connection pooling** - Automatic pool management with min/max connections
 - **Async queries** - Non-blocking query execution using DBD::Pg's async support
-- **Async connect** - Non-blocking connect with DBD::Pg >= 3.19.0 and IOAsync impl
+- **Async connect when supported** - Non-blocking connect with DBD::Pg >= 3.19.0 using Future::IO's official `poll` API
+- **Pub/sub** - `LISTEN`, `UNLISTEN`, and `NOTIFY` over a dedicated listener connection
 - **Named placeholders** - `:name` style in addition to `$1` positional
 - **Transactions** - With savepoint support for nesting
 - **Cursors** - Streaming large result sets
@@ -33,25 +38,64 @@ $conn->release;
 ## Requirements
 
 - Perl 5.18+
-- Future::IO 0.15+
+- Future::IO 0.23
 - Future::AsyncAwait 0.66+
 - DBD::Pg 3.18+ (3.19.0+ for async connect)
 
 ## How It Works
 
-Uses `Future::IO->recv($sock, 1, MSG_PEEK)` to wait for PostgreSQL socket readiness without blocking the event loop. When `ready_for_read`/`ready_for_write` are available in the Future::IO implementation (e.g., IOAsync), those are used instead for better efficiency.
+`Async::DBD::Pg` is intentionally built on top of DBI + DBD::Pg rather than
+binding libpq directly.
+
+For queries, it uses DBD::Pg's async support and waits for PostgreSQL socket
+readiness without blocking the event loop via `Future::IO->poll`.
+
+For connection establishment, fully async connect is enabled when:
+
+- `DBD::Pg >= 3.19.0`
+
+Otherwise connect falls back to ordinary synchronous `DBI->connect`, while
+query execution remains asynchronous after the connection is established.
+
+## Examples
+
+See the `examples/` directory for working examples covering:
+
+- basic queries
+- placeholders
+- transactions
+- cursors
+- parallel queries
+- pub/sub
+- job queues
+- live dashboards
+
+## Advanced Access
+
+Connection objects expose the underlying DBI handle via `dbh` for advanced
+DBD::Pg-specific use. The wrapper API remains the supported primary interface.
 
 ## Installation
 
 ```bash
-cpanm Future::IO::Pg
+cpanm Async::DBD::Pg
 ```
 
 Or from source:
 
 ```bash
 dzil build
-cpanm Future-IO-Pg-*.tar.gz
+cpanm Async-DBD-Pg-*.tar.gz
+```
+
+## Local Test Database
+
+A `docker-compose.yml` file is included for running PostgreSQL locally for
+tests and examples:
+
+```bash
+docker compose up -d
+TEST_PG_DSN='postgresql://postgres:test@localhost:5432/test' prove -r -l t/
 ```
 
 ## Author
