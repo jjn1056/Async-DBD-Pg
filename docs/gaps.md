@@ -159,6 +159,29 @@ waiters can queue up, each with a timer future.
 `host` defaults to `'localhost'` when absent. `postgresql:///dbname` (local socket) is
 forced to TCP. `port` is forced to `5432`.
 
+### 21. Future::IO usage is too low-level (feedback from LeoNerd)
+
+**Feedback source:** LeoNerd (author of Future::IO) on IRC, 2026-03-18.
+
+The `_complete_async_connect` in `Pg.pm` is a hand-rolled ~80 line state machine with
+manual timeout racing, status code checking, and future cancellation. The `_wait_for_result`
+loop and similar patterns are "very lowlevel manual" per LeoNerd's feedback.
+
+**Important nuance:** Our use of `Future::IO->poll()` is actually correct and necessary.
+Unlike Async::Redis (which owns the socket and uses `Future::IO->read()`/`write_exactly()`
+to speak the wire protocol directly), we don't own the socket — DBD::Pg/libpq does. We
+can only wait for readability then call `pg_ready`/`pg_result`. So `->poll()` is the right
+primitive.
+
+The issue is the **scaffolding around the poll calls** — the manual `while(1)` loops,
+inline timeout racing, status code branching. These should use Future combinators:
+- Extract timeout-racing into a reusable helper (the `wait_any` + cancel pattern)
+- Consider `Future::Utils::repeat` for poll loops instead of `while(1)`
+- Study Async::Redis and other Future::IO dependents for idiomatic patterns
+
+LeoNerd pointed to `https://metacpan.org/dist/Future-IO/requires` for examples of
+well-structured Future::IO code.
+
 ---
 
 ## Section 4: CPAN Packaging (release blockers)
