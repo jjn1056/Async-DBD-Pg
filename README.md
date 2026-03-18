@@ -6,10 +6,8 @@ implemented on top of DBD::Pg.
 ## Synopsis
 
 ```perl
-use Future::IO;
+use Future::AsyncAwait;
 use Async::DBD::Pg;
-
-BEGIN { Future::IO->load_best_impl; }
 
 my $pg = Async::DBD::Pg->new(
     dsn             => 'postgresql://user:pass@host/db',
@@ -17,10 +15,12 @@ my $pg = Async::DBD::Pg->new(
     max_connections => 10,
 );
 
-my $conn = await $pg->connection;
-my $result = await $conn->query('SELECT * FROM users WHERE id = $1', $id);
-print $result->first->{name};
-$conn->release;
+(async sub {
+    my $conn = await $pg->connection;
+    my $result = await $conn->query('SELECT * FROM users WHERE id = :id', { id => 1 });
+    print $result->first->{name}, "\n";
+    $conn->release;
+})->()->get;
 ```
 
 ## Features
