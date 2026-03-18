@@ -412,6 +412,31 @@ Needed for PgBouncer compatibility. Without this, using the library behind PgBou
 many production deployments use for external connection pooling) will fail with prepared
 statement errors. Should be configurable at the pool level.
 
+### 56. Document pool sizing vs PostgreSQL `max_connections`
+
+Users need to understand that the pool's `max_connections` should always be well below
+PostgreSQL's `max_connections`. Reasons:
+- Other clients need connections (psql, monitoring, migrations, other app instances)
+- PgBouncer or connection proxies need their own slots
+- Our PubSub checks out a dedicated connection per listener
+- PostgreSQL reserves `superuser_reserved_connections` (default 3) for admin access
+- Multiple app instances share the same PostgreSQL connection limit
+
+A typical setup: PG at 200, each of 3-4 app instances pooling 20-30 connections, with
+headroom for admin/monitoring.
+
+This needs a dedicated documentation section covering pool sizing guidance, the
+relationship between client pool limits and server limits, and what happens when limits
+are exceeded (waiter queue, `Error::PoolExhausted`).
+
+### 57. Validate pool size against PostgreSQL `max_connections` at startup
+
+If a user sets `max_connections = 500` on the pool but PostgreSQL only allows 100, they
+get cryptic connection errors under load instead of a clear message at startup. On the
+first successful connection, query `SHOW max_connections` and warn if the pool's
+`max_connections` exceeds the server's limit. This is a simple safety check that prevents
+a common misconfiguration.
+
 ---
 
 ## Section 9: Nice to Have (future consideration)
