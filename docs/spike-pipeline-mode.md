@@ -226,3 +226,29 @@ DBD::Pg maintainer; pipeline mode would be a natural follow-up.
 a performance optimization, not a correctness feature. Most production workloads will
 benefit more from the pool (connection-level parallelism) than from pipeline mode
 (query-level batching on a single connection).
+
+## Design Decision: Explicit Batching Only
+
+**We will NOT implement implicit/automatic pipelining.** asyncpg (Python) silently
+pipelines prepared statements, which fits Python's "framework knows best" culture. Perl
+users expect to control their own execution model.
+
+Implicit pipelining is also risky: if the library silently batches queries, the error
+semantics change — a failure in query 2 rolls back query 3 that the user thought was
+independent. That's a nasty surprise with a database library. With explicit batching,
+the user opts in and knows the transaction/error boundaries.
+
+The pgx (Go) model is the right fit: explicit batch object, user queues what they want,
+clear error reporting per query, no magic. Our API should follow this pattern:
+
+```perl
+my @results = await $conn->batch(sub {
+    my $batch = shift;
+    $batch->query("INSERT INTO t VALUES (:id)", { id => 1 });
+    $batch->query("INSERT INTO t VALUES (:id)", { id => 2 });
+    $batch->query("SELECT count(*) FROM t");
+});
+```
+
+The user decides when to pipeline, what to include, and can reason about the error and
+transaction semantics because they drew the boundaries themselves.
