@@ -727,6 +727,27 @@ query scheduling or pool lifecycle.
         on_release       => async sub { ... },
     );
 
+=head3 dsn
+
+PostgreSQL connection URI, C<postgresql://user:pass@host:port/dbname>.
+Required.
+
+=head3 min_connections
+
+Connections to open when the pool is built and to keep open thereafter.
+Defaults to 1. Reaping will not take the pool below this, and connections in
+use count towards it.
+
+=head3 max_connections
+
+Most connections the pool will hold. Defaults to 10. Callers arriving when
+every connection is busy wait in a queue rather than opening more.
+
+Keep this well below the server's own C<max_connections>. Every instance of
+your application draws on the same limit, as do psql sessions, monitoring and
+migrations, PostgreSQL reserves a few for superusers, and each pub/sub
+listener holds one for as long as it is subscribed.
+
 =head3 idle_timeout
 
 Seconds a connection may sit idle before it is closed and dropped from the
@@ -739,6 +760,64 @@ currently in use count towards that floor.
 Reaping is driven by a timer that exists only while there are connections old
 enough to be worth closing, so a pool resting at C<min_connections> does not
 hold the event loop open on its own.
+
+=head3 queue_timeout
+
+Seconds a caller waits for a connection once the pool is at
+C<max_connections>, before failing with
+L<Async::DBD::Pg::Error/Async::DBD::Pg::Error::PoolExhausted>. Defaults to 30.
+Pass 0 to wait indefinitely.
+
+=head3 connect_timeout
+
+Seconds to allow for establishing a connection, after which
+L<Async::DBD::Pg::Error/Async::DBD::Pg::Error::Connection> is thrown. Defaults
+to 30. Pass 0 to wait indefinitely.
+
+=head3 statement_timeout
+
+Seconds, applied by setting PostgreSQL's own C<statement_timeout> on each new
+connection, so it covers every statement rather than a chosen one. The
+C<timeout> option to L<Async::DBD::Pg::Connection/query> bounds a single
+query.
+
+=head3 max_queries
+
+Statements a connection may run before it is closed and replaced. Unset by
+default, meaning connections are kept indefinitely. Useful against slow growth
+in a long-lived backend.
+
+=head3 on_connect
+
+    on_connect => async sub {
+        my ($conn) = @_;
+        await $conn->query("SET application_name = 'my app'");
+    },
+
+Called with each newly established connection before it is handed to anyone,
+which is where session settings belong: C<search_path>, timezone, or the
+DBD::Pg attributes this module does not wrap. A callback that dies discards
+the connection and the failure reaches the caller who asked for it.
+
+=head3 on_release
+
+    on_release => async sub {
+        my ($conn) = @_;
+        await $conn->query('DISCARD TEMP');
+    },
+
+Called as a connection returns to the pool. An open transaction is already
+rolled back before this runs, so it is for cleanup of your own. A callback
+that dies causes the connection to be discarded rather than reused.
+
+=head3 on_log
+
+    on_log => sub {
+        my ($level, $message) = @_;
+        ...
+    },
+
+Receives the pool's own diagnostics. Without it they go to C<warn>.
 
 =head2 connection
 

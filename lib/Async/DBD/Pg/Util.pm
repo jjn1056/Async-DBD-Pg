@@ -186,6 +186,27 @@ mistake. A consequence is that an array slice written with identifier
 bounds, C<arr[lower:upper]>, cannot be used together with named
 placeholders; use positional placeholders for such a statement.
 
+=head2 parse_dsn
+
+    my $parsed = parse_dsn('postgresql://user:pass@host:5432/dbname');
+
+Splits a PostgreSQL connection URI into the pieces C<DBI-E<gt>connect> wants,
+returning a hashref of C<dbi_dsn>, C<user> and C<password>. Both the
+C<postgres://> and C<postgresql://> forms are accepted.
+
+Host defaults to C<localhost> and port to 5432 when the URI omits them. A
+query string is carried across as further C<key=value> pairs on the DBI DSN,
+so options such as C<?sslmode=require> reach the driver.
+
+=head2 safe_dsn
+
+    my $safe = safe_dsn('postgresql://user:hunter2@host/db');
+    # postgresql://user:***@host/db
+
+Replaces the password in a URI with C<***>, for a DSN about to be logged or
+put into an error message. Anything that reports a DSN should pass it through
+here first.
+
 =head1 AUTHOR
 
 John Napiorkowski E<lt>jjn1056@yahoo.comE<gt>

@@ -190,19 +190,62 @@ Async::DBD::Pg::Cursor - Streaming cursor for large result sets
 
 =head2 next
 
-Fetch the next batch of rows. Returns arrayref of rows, or undef when exhausted.
+    while (my $rows = await $cursor->next) {
+        ...
+    }
 
-=head2 each($callback)
+Fetches the next batch, returning an arrayref of rows or C<undef> once the
+cursor is exhausted. Each call is one round trip returning up to
+C<batch_size> rows.
 
-Iterate over all remaining rows, calling callback for each row.
+=head2 each
+
+    await $cursor->each(sub {
+        my ($row) = @_;
+        ...
+    });
+
+Walks every remaining row, calling the callback once per row, fetching a batch
+at a time. This keeps only one batch in memory however large the result is.
+Returns the number of rows visited.
 
 =head2 all
 
-Collect all remaining rows into an array. Use with caution on large result sets.
+    my $rows = await $cursor->all;
+
+Collects every remaining row into a single arrayref. This defeats the point of
+a cursor on a large result, since the whole set ends up in memory; prefer
+L</each> or L</next> unless the result is known to be small.
 
 =head2 close
 
-Close the cursor and release server resources.
+    await $cursor->close;
+
+Closes the cursor on the server and commits the transaction if the cursor
+started one.
+
+Always close a cursor you are finished with. One left to be garbage collected
+cannot close itself, because closing has to await and destruction cannot; it
+warns instead, and the cursor stays open until its connection is released.
+
+=head1 ACCESSORS
+
+=head2 name
+
+The cursor's name on the server.
+
+=head2 batch_size
+
+Rows fetched per round trip.
+
+=head2 is_exhausted
+
+True once a fetch has returned fewer rows than C<batch_size>, meaning there
+are no more.
+
+=head2 is_closed
+
+True once the cursor has been closed.
 
 =head1 AUTHOR
 

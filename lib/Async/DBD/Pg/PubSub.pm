@@ -327,4 +327,95 @@ This module provides loop-agnostic PostgreSQL pub/sub support built on top of
 L<DBD::Pg>'s C<LISTEN>, C<UNLISTEN>, and C<pg_notifies> support, with socket
 readiness handled through L<Future::IO>.
 
+Listening occupies one connection from the pool for as long as any channel is
+subscribed, because a session that is listening cannot be handed to anyone
+else. Size the pool with that in mind. L</notify> does not need the listener
+and takes a connection only for as long as the statement runs.
+
+Channel names are validated as plain identifiers. They cannot be bound as
+parameters, so anything else is refused rather than quoted.
+
+=head1 METHODS
+
+=head2 listen
+
+    await $pubsub->listen($channel, sub {
+        my ($channel, $payload, $pid) = @_;
+        ...
+    });
+
+Registers a callback for notifications on C<$channel>, connecting the listener
+if this is the first subscription. C<LISTEN> is only issued the first time a
+channel is subscribed, so registering several callbacks for one channel costs
+one round trip; each is called in turn for every notification.
+
+The callback receives the channel name, the payload sent with the
+notification, and the process id of the backend that sent it. A payload is an
+empty string when the sender supplied none.
+
+Dies if the channel name is not a plain identifier, or if no callback is
+given.
+
+=head2 unlisten
+
+    await $pubsub->unlisten($channel);
+    await $pubsub->unlisten($channel, $callback);
+
+Removes one callback, or every callback for the channel when none is given.
+C<UNLISTEN> is only issued once the last callback for that channel has gone.
+Unsubscribing from a channel with no subscriptions does nothing.
+
+=head2 unlisten_all
+
+    await $pubsub->unlisten_all;
+
+Drops every subscription and issues C<UNLISTEN *>. The listener connection is
+kept; use L</disconnect> to give it back.
+
+=head2 notify
+
+    await $pubsub->notify($channel, $payload);
+
+Sends a notification with C<pg_notify>. This borrows a connection from the
+pool for the statement and releases it again, so it neither needs nor disturbs
+the listener, and can be used from a pub/sub object that is not listening to
+anything.
+
+Notifications are delivered when the sending transaction commits. Sent inside
+a transaction that later rolls back, they are never delivered.
+
+Dies if the channel name is not a plain identifier.
+
+=head2 connect
+
+    await $pubsub->connect;
+
+Checks out the listener connection and starts the listener. Called for you by
+L</listen>; useful when you want to establish the connection ahead of the
+first subscription. Callers arriving together share one attempt, and calling
+it while already connected does nothing.
+
+=head2 disconnect
+
+    await $pubsub->disconnect;
+
+Issues C<UNLISTEN *>, forgets every subscription and returns the listener
+connection to the pool.
+
+=head2 is_connected
+
+True while the listener connection is held.
+
+=head2 subscribed_channels
+
+Number of channels with at least one callback registered.
+
+=head2 pool
+
+The pool this object belongs to.
+
+=head2 conn
+
+The connection the listener is using, or C<undef> when it is not connected.
+
 =cut

@@ -443,6 +443,118 @@ Async::DBD::Pg::Connection - Async PostgreSQL connection using Future::IO
 This module provides a DBD::Pg-backed async PostgreSQL connection that works
 with any Future::IO implementation (IO::Async, libuv, GLib, etc.).
 
+A connection carries out one statement at a time. Running two queries on the
+same connection concurrently is not supported; take a second connection from
+the pool instead.
+
+=head1 METHODS
+
+=head2 query
+
+    my $r = await $conn->query($sql);
+    my $r = await $conn->query($sql, @bind);
+    my $r = await $conn->query($sql, \%params);
+    my $r = await $conn->query($sql, @bind, { timeout => 5 });
+
+Runs a statement and returns an L<Async::DBD::Pg::Results>.
+
+Placeholders come in two forms. PostgreSQL's own C<$1>, C<$2> take their
+values from the remaining positional arguments. Named C<:name> placeholders
+take theirs from a hashref, and are rewritten to positional form before the
+statement is sent; naming a placeholder with no matching key is an error
+rather than something passed through to the server. The two forms cannot be
+mixed in one statement.
+
+A trailing hashref containing C<timeout> is read as options rather than as
+named parameters:
+
+=over 4
+
+=item timeout
+
+Seconds to allow before giving up. On expiry the query is cancelled on the
+server and an L<Async::DBD::Pg::Error/Async::DBD::Pg::Error::Timeout> is
+thrown. Without it a query waits as long as the server takes.
+
+=back
+
+Fails with an L<Async::DBD::Pg::Error/Async::DBD::Pg::Error::Query> carrying
+the SQLSTATE and the diagnostics the server returned.
+
+=head2 transaction
+
+    my $result = await $conn->transaction(async sub {
+        my ($conn) = @_;
+        await $conn->query(...);
+        return $value;
+    });
+
+    await $conn->transaction($code, isolation => 'serializable');
+
+Runs C<$code> inside a transaction, committing when it returns and rolling
+back if it dies, then rethrowing. Whatever C<$code> returns is returned.
+
+Nested calls use savepoints: an inner block that dies rolls back to its
+savepoint and leaves the outer transaction to continue, so failure can be
+handled without discarding work already done.
+
+=over 4
+
+=item isolation
+
+Isolation level for the outermost transaction, such as C<read_committed>,
+C<repeatable_read> or C<serializable>. Underscores become spaces, so
+C<repeatable_read> becomes C<REPEATABLE READ>. Ignored for nested blocks,
+which join the transaction already running.
+
+=back
+
+=head2 cursor
+
+    my $cursor = await $conn->cursor($sql, @bind, { batch_size => 500 });
+
+Returns an L<Async::DBD::Pg::Cursor> for walking a result set in batches
+rather than holding it in memory. Accepts the same placeholder forms as
+L</query>.
+
+A transaction is started if one is not already running, since a cursor lives
+only as long as its transaction.
+
+=over 4
+
+=item batch_size
+
+Rows fetched per round trip. Defaults to 1000. Must be a positive integer.
+
+=item name
+
+Name for the cursor. Defaults to a generated one. Must be a plain identifier
+of at most 63 characters; a cursor name cannot be sent as a bind parameter, so
+anything else is refused.
+
+=back
+
+Close the cursor when finished. A cursor left to be garbage collected warns,
+and holds its transaction open until the connection is released.
+
+=head2 cancel
+
+    $conn->cancel;
+
+Asks the server to abandon the statement in progress and releases the
+statement handle. Used by the C<timeout> option.
+
+=head2 release
+
+    $conn->release;
+
+Returns the connection to the pool. An open transaction is rolled back first,
+so no state carries over to whoever takes it next. The connection must not be
+used afterwards.
+
+Releasing is not optional: a connection that is never released is never
+available to anyone else.
+
 =head1 ACCESSORS
 
 =head2 dbh
@@ -450,6 +562,32 @@ with any Future::IO implementation (IO::Async, libuv, GLib, etc.).
 Returns the underlying DBI handle. This is an advanced escape hatch for
 DBD::Pg-specific use and is not coordinated with the wrapper's async query
 lifecycle.
+
+=head2 in_transaction
+
+True while a transaction is open on this connection.
+
+=head2 is_released
+
+True once the connection has gone back to the pool.
+
+=head2 query_count
+
+Number of statements run on this connection, which the pool compares against
+C<max_queries>.
+
+=head2 created_at
+
+Epoch time at which the connection was established.
+
+=head2 last_used
+
+Epoch time at which the connection was last used. The pool compares this
+against C<idle_timeout> when reaping.
+
+=head2 pool
+
+The pool this connection came from.
 
 =head1 AUTHOR
 
