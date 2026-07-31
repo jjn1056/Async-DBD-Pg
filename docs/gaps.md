@@ -12,13 +12,23 @@ number stay valid. Numbering is therefore unique but not in document order.
 
 ## Section 1: Correctness Bugs (must fix)
 
-### 1. `_query_with_timeout` winner comparison is broken
+### 1. `_query_with_timeout` winner comparison is broken — FIXED
 
 **File:** `Connection.pm:100-112`
 
 `Future->wait_any` returns the result value of the winning future, not the future object.
 `$winner == $timer` compares a scalar to a Future reference — this will never work as
 intended. The timeout path is completely broken.
+
+Worse than described: passing a timeout to `query()` failed in *both* directions, not only
+on timeout. When the query won, `$winner` held a Results object and `$winner->get` died
+with "Can't locate object method get"; when the timer won, `$winner` was undef, the `==`
+warned about an uninitialized value, and `->get` died on undef.
+
+Fixed by reading the outcome from the futures rather than from the awaited value. `wait_any`
+cancels the loser and a cancelled future reports `is_ready`, so completion is tested with
+`is_done`, which also distinguishes a query that failed on its own merits from one that ran
+out of time. Covered by t/integration/connection.t.
 
 ### 2. `pg_result` returning 0 is treated as error — NOT A BUG
 
@@ -120,12 +130,17 @@ When a waiter times out, it removes itself from the queue and fails its future. 
 checking if the future is already failed. If timing aligns, a connection is delivered to a
 dead future and never released — permanent pool shrinkage.
 
-### 12. Statement handle leak on error
+### 12. Statement handle leak on error — FIXED
 
 **File:** `Connection.pm:143-145`
 
 When `pg_result` fails, the sth from `prepare`/`execute` is never `finish`-ed. Under load,
 these accumulate.
+
+Fixed. The in-flight handle is held on the connection as `_active_sth` and released by
+`_release_active_sth`, which runs from the error paths and from `cancel`. This also covers
+a query abandoned by a timeout: its async sub is torn down with the handle still active,
+which made DBI warn "st handle ... cleared whilst still active" during the test run.
 
 ### 13. `_complete_async_connect` fd leak on error — FIXED
 
