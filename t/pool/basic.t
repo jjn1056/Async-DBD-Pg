@@ -123,6 +123,123 @@ subtest 'on_connect callback' => sub {
     $conn->release;
 };
 
+# A caller that has to queue waits on a plain Future, which cannot drive the
+# event loop the way a Future::IO one can, so the loop is pumped here until
+# the future settles.
+sub settle {
+    my ($f, $timeout) = @_;
+
+    $timeout //= 5;
+    my $deadline = time + $timeout;
+
+    while (!$f->is_ready && time < $deadline) {
+        Future::IO->sleep(0.05)->get;
+    }
+
+    return $f;
+}
+
+subtest 'waiting past queue_timeout fails with Error::PoolExhausted' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 1,
+        queue_timeout   => 1,
+    );
+
+    my $held = $pg->connection->get;
+
+    my $queued = settle($pg->connection);
+
+    ok $queued->is_failed, 'a caller that waits too long fails';
+    my $err = $queued->failure;
+    isa_ok $err, 'Async::DBD::Pg::Error::PoolExhausted';
+    is $err->pool_size, 1, 'error reports the limit that was reached';
+    like $err->message, qr/exhausted/i, 'message explains the failure';
+    is $pg->stats->{timeouts}, 1, 'timeout counted';
+
+    # The pool has to keep working once the queue drains.
+    is $pg->waiting_count, 0, 'timed out caller left the queue';
+    $held->release;
+
+    my $next = $pg->connection->get;
+    ok $next, 'connection available again once released';
+    $next->release;
+};
+
+subtest 'a queued caller is served when a connection frees up' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 1,
+        queue_timeout   => 30,
+    );
+
+    my $held = $pg->connection->get;
+    my $queued = $pg->connection;
+
+    Future::IO->sleep(0.1)->get;
+    ok !$queued->is_ready, 'second caller is waiting';
+    is $pg->waiting_count, 1, 'and is on the queue';
+
+    $held->release;
+    settle($queued);
+
+    my $conn = $queued->get;
+    ok $conn, 'queued caller received the released connection';
+    is $pg->waiting_count, 0, 'queue drained';
+
+    my $r = $conn->query('SELECT 1 AS n')->get;
+    is $r->first->{n}, 1, 'handed over connection works';
+
+    $conn->release;
+};
+
+subtest 'on_release runs before a connection is reused' => sub {
+    my @released;
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 1,
+        on_release      => async sub {
+            my ($conn) = @_;
+            push @released, $conn->query_count;
+            await $conn->query('SELECT 1');
+        },
+    );
+
+    my $conn = $pg->connection->get;
+    $conn->query('SELECT 1')->get;
+    $conn->release;
+
+    Future::IO->sleep(0.2)->get;
+
+    is scalar @released, 1, 'on_release called once';
+    is $pg->idle_count, 1, 'connection returned after the callback ran';
+
+    $pg->connection->get->release;
+};
+
+subtest 'a connection whose on_release dies is discarded' => sub {
+    my @logged;
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 2,
+        on_log          => sub { push @logged, $_[1] },
+        on_release      => async sub { die "cleanup failed\n" },
+    );
+
+    my $conn = $pg->connection->get;
+    $conn->release;
+
+    Future::IO->sleep(0.2)->get;
+
+    is $pg->idle_count, 0, 'connection not returned to the pool';
+    is $pg->stats->{discarded}, 1, 'connection discarded instead';
+    ok scalar(grep { /cleanup failed/ } @logged), 'failure reported';
+};
+
 subtest 'concurrent acquisition never exceeds max_connections' => sub {
     my $pg = Async::DBD::Pg->new(
         dsn             => test_dsn(),

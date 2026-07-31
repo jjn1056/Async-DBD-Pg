@@ -430,7 +430,7 @@ Just NAME and AUTHOR. This is the object every query returns — `rows`, `column
 `listen`, `unlisten`, `notify`, `disconnect`, `connect` have no `=head2` entries. Callback
 signature (`$channel, $payload, $pid`) is shown in SYNOPSIS but never described.
 
-### 33. Pool-level pub/sub methods undocumented
+### 33. Pool-level pub/sub methods undocumented — FIXED
 
 **File:** `Pg.pm`
 
@@ -464,7 +464,7 @@ signatures.
 `next`, `each`, `all`, `close`, owns-transaction commit, exhaustion detection — the entire
 module is untested. This is the largest single gap.
 
-### 38. Pool exhaustion/waiting queue: zero tests
+### 38. Pool exhaustion/waiting queue: zero tests — FIXED
 
 The queue logic, timeout, `Error::PoolExhausted`, waiter handoff on release — the most
 complex pool path has no coverage.
@@ -483,12 +483,20 @@ Every unit test uses `new_from_data`. The live DBI path through
 
 Only `23505` and `42601` are covered. The remaining 13 entries in `%STATE_MAP` are untested.
 
-### 42. PubSub error paths untested
+### 42. PubSub error paths untested — PARTLY FIXED
 
 Callback throwing, connection loss, `_process_notifications` error handling,
 `_pool_shutdown`.
 
-### 43. `on_release` callback: untested
+A callback that dies is covered: the other callbacks for that channel still run, the failure
+is reported through `on_log`, and the listener keeps delivering afterwards. A failing control
+query is covered by t/unit/pubsub.t.
+
+Still uncovered: losing the listener connection, and `_pool_shutdown`. Both need the
+connection to be broken underneath a running listener, which is worth doing together with
+item 17, reconnect, since that is the behaviour being tested for.
+
+### 43. `on_release` callback: untested — FIXED
 
 The ROLLBACK-if-in-transaction path and callback failure handling.
 
@@ -496,10 +504,14 @@ The ROLLBACK-if-in-transaction path and callback failure handling.
 
 `ping` failure, `max_queries` discard, waiter handoff.
 
-### 45. No concurrency tests
+### 45. No concurrency tests — FIXED
 
 No tests for simultaneous pool acquisition, race between timeout and connection
 availability, or multiple PubSub listeners receiving notifications concurrently.
+
+Covered as part of fixing items 10 and 11: simultaneous acquisition against a limit of two,
+a waiter that is served when a connection frees up, a waiter that gives up while queued, and
+concurrent pub/sub connect. Several of these failed against the code as it was.
 
 ---
 

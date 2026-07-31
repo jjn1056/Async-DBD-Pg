@@ -846,6 +846,50 @@ take a busy service out of rotation.
 
 Returns hashref of cumulative statistics (created, released, discarded, etc).
 
+=head2 safe_dsn
+
+The pool's DSN with the password replaced by C<***>, for logging.
+
+=head1 PUB/SUB METHODS
+
+=head2 pubsub
+
+    my $pubsub = $pg->pubsub;
+
+The pool's L<Async::DBD::Pg::PubSub>, created on first use. The same object is
+returned every time, so subscriptions made through the pool and through this
+object are the same set.
+
+=head2 listen
+
+    await $pg->listen($channel, sub { ... });
+
+Subscribes to a channel. See L<Async::DBD::Pg::PubSub/listen>.
+
+=head2 unlisten
+
+    await $pg->unlisten($channel);
+
+Unsubscribes. See L<Async::DBD::Pg::PubSub/unlisten>.
+
+=head2 unlisten_all
+
+    await $pg->unlisten_all;
+
+Drops every subscription. See L<Async::DBD::Pg::PubSub/unlisten_all>.
+
+=head2 notify
+
+    await $pg->notify($channel, $payload);
+
+Sends a notification. See L<Async::DBD::Pg::PubSub/notify>.
+
+Each is shorthand for the same method on L</pubsub>, for applications that
+never need the pub/sub object itself.
+
+Listening holds one connection from the pool for as long as any channel is
+subscribed, so allow for it in C<max_connections>.
+
 =head1 SEE ALSO
 
 L<Future::IO>, L<Future::AsyncAwait>, L<Async::DBD::Pg::Connection>, L<DBD::Pg>
