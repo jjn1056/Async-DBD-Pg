@@ -265,6 +265,38 @@ subtest 'concurrent acquisition never exceeds max_connections' => sub {
     $_->get->release for @acquired;
 };
 
+subtest 'giving up while connecting does not consume pool capacity' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 2,
+        queue_timeout   => 5,
+    );
+
+    # A caller that cancels while the handshake is still running must not
+    # leave the pool counting a connection that is never going to arrive.
+    for my $n (1 .. 3) {
+        my $f = $pg->connection;
+        $f->cancel;
+    }
+
+    is $pg->total_count, 0, 'no connections left behind';
+
+    my $conn = $pg->connection->get;
+    ok $conn, 'pool still hands out connections';
+
+    my $result = $conn->query('SELECT 1 AS n')->get;
+    is $result->first->{n}, 1, 'and they work';
+
+    $conn->release;
+
+    # Capacity has to be genuinely intact, not just enough for one.
+    my $a = $pg->connection->get;
+    my $b = $pg->connection->get;
+    ok $a && $b, 'both connection slots still usable';
+    $_->release for $a, $b;
+};
+
 subtest 'a waiter that gives up does not consume a connection' => sub {
     my $pg = Async::DBD::Pg->new(
         dsn             => test_dsn(),

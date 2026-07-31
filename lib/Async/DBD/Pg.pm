@@ -341,13 +341,16 @@ async sub connection {
 
     # 2. Create new connection if under limit
     if ($self->_committed_count < $self->{max_connections}) {
-        $self->{_connecting}++;
+        # Counted as in progress for as long as the handshake runs. This has
+        # to be a guard rather than a decrement afterwards: a caller can
+        # cancel while this sub is suspended at the await below, which tears
+        # the sub down without running another line of it. Losing the
+        # decrement that way would make the pool believe a connection was
+        # arriving forever, and once that happened max_connections times
+        # nothing could ever be created again.
+        my $in_progress = Async::DBD::Pg::_ConnectingGuard->new($self);
 
-        my $conn = eval { await $self->_create_connection };
-        my $err = $@;
-
-        $self->{_connecting}--;
-        die $err if $err;
+        my $conn = await $self->_create_connection;
 
         push @{$self->{active}}, $conn;
         return $conn;
@@ -699,6 +702,36 @@ sub DESTROY {
     return if ${^GLOBAL_PHASE} eq 'DESTRUCT';
     $self->_close_all_connections;
 }
+
+package Async::DBD::Pg::_ConnectingGuard;
+
+# Holds a slot in the pool's in-progress count for as long as it is alive,
+# releasing it however the connect attempt ends: returning, dying, or being
+# cancelled while suspended.
+
+use strict;
+use warnings;
+use Scalar::Util qw(weaken);
+
+sub new {
+    my ($class, $pool) = @_;
+
+    $pool->{_connecting}++;
+
+    my $self = bless { pool => $pool }, $class;
+    weaken($self->{pool});
+
+    return $self;
+}
+
+sub DESTROY {
+    my ($self) = @_;
+
+    my $pool = $self->{pool} or return;
+    $pool->{_connecting}--;
+}
+
+package Async::DBD::Pg;
 
 1;
 

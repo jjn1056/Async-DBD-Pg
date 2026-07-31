@@ -67,11 +67,19 @@ async sub connect {
     my $attempt = $self->_establish($pool);
     $self->{_connecting} = $attempt;
 
-    eval { await $attempt };
-    my $err = $@;
+    # Clear the shared attempt however it ends. Doing it after the await
+    # would be skipped when a caller gives up, because cancelling tears this
+    # sub down where it is suspended, and every later connect would then wait
+    # on an attempt that had already been cancelled.
+    my $pubsub = $self;
+    weaken($pubsub);
 
-    delete $self->{_connecting};
-    die $err if $err;
+    $attempt->on_ready(sub {
+        my $live = $pubsub or return;
+        delete $live->{_connecting};
+    });
+
+    await $attempt;
 
     return $self;
 }

@@ -77,6 +77,33 @@ subtest 'a callback that dies does not stop the others or the listener' => sub {
     $pubsub->disconnect->get;
 };
 
+subtest 'giving up on connect leaves pub/sub usable' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 3,
+    );
+    my $pubsub = $pg->pubsub;
+
+    # Callers arriving together share one connect attempt. A caller that
+    # gives up must not leave that shared attempt behind for everyone after
+    # it to wait on.
+    my $abandoned = $pubsub->connect;
+    $abandoned->cancel;
+
+    my @got;
+    ok lives {
+        $pubsub->listen('give_up_test', sub { push @got, $_[1] })->get;
+    }, 'a later listen still connects';
+
+    $pubsub->notify('give_up_test', 'payload')->get;
+    wait_until(sub { @got }, 'notification arrived', 3);
+
+    is \@got, ['payload'], 'pub/sub works normally afterwards';
+
+    $pubsub->disconnect->get;
+};
+
 subtest 'concurrent connect checks out a single connection' => sub {
     my $pg = Async::DBD::Pg->new(
         dsn             => test_dsn(),

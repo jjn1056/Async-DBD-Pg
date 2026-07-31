@@ -772,3 +772,29 @@ ending, leaving anything already queued unserved.
 active list, so dropping that one left the connection checked out to nobody: it was never
 closed, never reused, and a drain would have waited on it forever. It is released properly
 now.
+
+
+### 61. Cancelling a connect attempt leaked its slot — FIXED
+
+Both defects were introduced by the fixes for items 10 and 6, and both had the same shape:
+state was restored on the line after an `await`, which never runs when the caller cancels,
+because cancelling tears the suspended sub down where it stands.
+
+**The pool.** `connection` incremented `_connecting` before the handshake and decremented it
+afterwards. A caller giving up mid-handshake left the count raised for good. Measured: three
+cancelled attempts against `max_connections => 2` left `_connecting` at 2, after which
+`_committed_count` was always at the limit and no connection could ever be created again.
+The pool was bricked, silently, and every later caller queued until its timeout.
+
+Now held by a guard object whose destructor releases the slot, so it unwinds however the
+attempt ends: returning, dying, or being cancelled while suspended.
+
+**Pub/sub.** `connect` stored the shared attempt in `_connecting` and deleted it after
+awaiting. A caller giving up left the cancelled attempt in place, and every later `connect`
+awaited a future that was already cancelled, so the listener could never be established
+again. Cleared from an `on_ready` handler instead, which fires on completion, failure and
+cancellation alike.
+
+Worth remembering as a shape rather than two bugs: in an async sub, anything that must be
+undone cannot be undone by the code after the `await`. It needs a guard or a callback on the
+future.
