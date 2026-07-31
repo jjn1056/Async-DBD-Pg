@@ -870,3 +870,22 @@ Both paths now check the flag and close instead of returning the connection, and
 keeps a handle on the futures it starts so `shutdown` cancels whatever is left. That is the
 part of Conduit's `Future::Selector` collection that applies to a library, without the
 selector's own run loop.
+
+
+### 64. `->retain` used as a substitute for ownership — FIXED
+
+`->retain` says only that a future must not be cancelled when the last reference goes. It
+says nothing about who owns the work, what happens if it fails, or how to stop it. Used on
+its own it means starting something and hoping, which is how item 63 happened.
+
+There is no `->retain` left in the distribution.
+
+- Background pool work is held in the `_background` collection, which both keeps it alive
+  and gives `shutdown` something to cancel. Retaining as well would have made it
+  uncancellable, which is the opposite of what was wanted.
+- Restarting the listener returned an already complete future, since `_start_listener`
+  awaits nothing and only builds and stores the loop's future. There was nothing to retain,
+  only a failure that was being dropped, so it is logged instead.
+
+The general form: if a future is worth starting, something should own it and something
+should look at how it ends. `->retain` supplies neither.

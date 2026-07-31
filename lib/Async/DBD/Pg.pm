@@ -219,7 +219,9 @@ sub _run_in_background {
         delete $live->{_background}{$key};
     });
 
-    $f->retain;
+    # No retain: the collection above is what keeps this future alive, and it
+    # is what lets shutdown cancel it. Retaining as well would only mean
+    # nothing could ever stop it.
 
     return $f;
 }

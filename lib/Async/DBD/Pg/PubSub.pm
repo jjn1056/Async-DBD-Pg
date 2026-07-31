@@ -345,10 +345,17 @@ sub restore {
     $pubsub->{_stopping} = 0;
     return unless $pubsub->{connected};
 
-    # Starting the listener only builds the loop's future; it does no I/O
-    # itself, so it is safe from a destructor. Retained because nobody is
-    # waiting on it.
-    $pubsub->_start_listener->retain;
+    # Starting the listener only builds the loop's future and stores it on
+    # the object; it awaits nothing itself, so it completes at once and is
+    # safe to call from a destructor. The loop it starts is held as
+    # _listener_future, so there is nothing here to retain, only a failure
+    # worth reporting rather than dropping.
+    my $started = $pubsub->_start_listener;
+
+    $started->on_fail(sub {
+        my ($err) = @_;
+        $pubsub->_log(warn => "Could not restart listener: $err");
+    });
 }
 
 sub DESTROY { shift->restore }
