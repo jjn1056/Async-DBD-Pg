@@ -95,4 +95,32 @@ subtest 'a failed control query leaves pub/sub usable' => sub {
         'the later statement reached the connection';
 };
 
+subtest 'backoff ceiling doubles and then holds' => sub {
+    my @ceilings = map {
+        Async::DBD::Pg::PubSub::_backoff_ceiling($_, 0.5, 30)
+    } 1 .. 8;
+
+    is \@ceilings, [ 0.5, 1, 2, 4, 8, 16, 30, 30 ],
+        'doubles from the minimum and stops at the maximum';
+
+    is Async::DBD::Pg::PubSub::_backoff_ceiling(1, 2, 10), 2,
+        'first attempt waits the minimum';
+    is Async::DBD::Pg::PubSub::_backoff_ceiling(99, 0.5, 30), 30,
+        'never exceeds the maximum';
+};
+
+subtest 'backoff delay is jittered within its ceiling' => sub {
+    # Equal jitter: half the ceiling, plus a random half. Decorrelates many
+    # listeners reconnecting at once while keeping a predictable floor.
+    for my $attempt (1 .. 6) {
+        my $ceiling = Async::DBD::Pg::PubSub::_backoff_ceiling($attempt, 0.5, 30);
+
+        for (1 .. 20) {
+            my $delay = Async::DBD::Pg::PubSub::_backoff_delay($attempt, 0.5, 30);
+            ok $delay >= $ceiling / 2, "attempt $attempt delay at or above half the ceiling";
+            ok $delay <= $ceiling,     "attempt $attempt delay at or below the ceiling";
+        }
+    }
+};
+
 done_testing;

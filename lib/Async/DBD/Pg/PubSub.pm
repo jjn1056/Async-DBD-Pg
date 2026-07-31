@@ -49,6 +49,28 @@ sub _log {
     warn "Async::DBD::Pg::PubSub [$level]: $message\n";
 }
 
+# How long to wait before reconnect attempt $attempt, counting from 1. The
+# ceiling doubles from the minimum until it reaches the maximum and stays
+# there.
+sub _backoff_ceiling {
+    my ($attempt, $min, $max) = @_;
+
+    my $ceiling = $min * (2 ** ($attempt - 1));
+
+    return $ceiling > $max ? $max : $ceiling;
+}
+
+# Equal jitter: half the ceiling plus a random half. Keeps a predictable floor
+# while spreading out many listeners reconnecting to the same server, so one
+# coming back does not receive every reconnect at the same instant.
+sub _backoff_delay {
+    my ($attempt, $min, $max) = @_;
+
+    my $ceiling = _backoff_ceiling($attempt, $min, $max);
+
+    return ($ceiling / 2) + rand($ceiling / 2);
+}
+
 async sub connect {
     my ($self) = @_;
 
