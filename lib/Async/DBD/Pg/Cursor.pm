@@ -12,8 +12,8 @@ sub new {
     my ($class, %args) = @_;
 
     my $self = bless {
-        name              => $args{name} // _generate_name(),
-        batch_size        => $args{batch_size} // 1000,
+        name              => _validate_name($args{name} // _generate_name()),
+        batch_size        => _validate_batch_size($args{batch_size} // 1000),
         conn              => $args{conn},
         _owns_transaction => $args{_owns_transaction} // 0,
         exhausted         => 0,
@@ -26,6 +26,43 @@ sub new {
 
 sub _generate_name {
     return "cursor_" . ++$cursor_counter;
+}
+
+# PostgreSQL will not accept a bind parameter for a cursor name or a fetch
+# count, so both are written into the statement text and must be checked
+# first. Anything outside a plain identifier or a positive integer is
+# rejected rather than quoted, since neither has a legitimate reason to
+# contain anything else.
+
+# Longest identifier PostgreSQL keeps before truncating (NAMEDATALEN - 1).
+my $MAX_IDENTIFIER_LENGTH = 63;
+
+sub _validate_name {
+    my ($name) = @_;
+
+    die "Cursor name must be defined\n"
+        unless defined $name;
+
+    die "Invalid cursor name '$name': expected a letter or underscore "
+      . "followed by letters, digits or underscores\n"
+        unless $name =~ /\A[A-Za-z_][A-Za-z0-9_]*\z/;
+
+    die "Invalid cursor name '$name': longer than $MAX_IDENTIFIER_LENGTH characters\n"
+        if length($name) > $MAX_IDENTIFIER_LENGTH;
+
+    return $name;
+}
+
+sub _validate_batch_size {
+    my ($size) = @_;
+
+    die "Cursor batch_size must be defined\n"
+        unless defined $size;
+
+    die "Invalid cursor batch_size '$size': expected a positive integer\n"
+        unless $size =~ /\A[1-9][0-9]*\z/;
+
+    return $size;
 }
 
 # Accessors

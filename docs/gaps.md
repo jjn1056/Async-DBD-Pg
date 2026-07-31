@@ -89,13 +89,19 @@ If a cursor is garbage collected without `close()`, the server-side cursor stays
 the owning transaction is never committed. For long-lived pooled connections, this leaks
 server resources and holds transaction locks.
 
-### 9. Cursor SQL injection
+### 9. Cursor SQL injection — FIXED
 
 **Files:** `Cursor.pm:47`, `Connection.pm:272`
 
 Cursor name and batch_size are interpolated directly into SQL (`"FETCH $batch_size FROM
 $name"`, `"DECLARE $cursor_name CURSOR FOR $sql"`). User-supplied cursor names are an
 injection vector. `batch_size` should be validated as a positive integer.
+
+Fixed. PostgreSQL accepts a bind parameter for neither a cursor name nor a fetch count, so
+both are validated instead of parameterised: the name must be a plain identifier within the
+63 character limit, and batch_size must be a positive integer. Checked in
+`Cursor::_validate_name` and `Cursor::_validate_batch_size`, called both from `Cursor::new`
+and from `Connection::cursor` before the DECLARE is built. Covered by t/unit/cursor.t.
 
 ### 10. Pool can exceed `max_connections`
 

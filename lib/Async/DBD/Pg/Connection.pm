@@ -293,8 +293,14 @@ async sub cursor {
         ($sql, $bind) = convert_placeholders($sql, $bind);
     }
 
-    my $batch_size = delete $opts->{batch_size} // 1000;
-    my $cursor_name = delete $opts->{name} // Async::DBD::Pg::Cursor::_generate_name();
+    # Both are interpolated into the statements below, so they are checked
+    # before any SQL is built rather than after the DECLARE has run.
+    my $batch_size = Async::DBD::Pg::Cursor::_validate_batch_size(
+        delete $opts->{batch_size} // 1000
+    );
+    my $cursor_name = Async::DBD::Pg::Cursor::_validate_name(
+        delete $opts->{name} // Async::DBD::Pg::Cursor::_generate_name()
+    );
 
     my $was_in_transaction = $self->{in_transaction};
     if (!$was_in_transaction) {
