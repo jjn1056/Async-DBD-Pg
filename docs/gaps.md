@@ -798,3 +798,32 @@ cancellation alike.
 Worth remembering as a shape rather than two bugs: in an async sub, anything that must be
 undone cannot be undone by the code after the `await`. It needs a guard or a callback on the
 future.
+
+
+### 62. Cancellation left statements and the listener stranded — FIXED
+
+The same shape as item 61, found by sweeping deliberately for it rather than by stumbling
+over it, and both predating this series rather than being introduced by it.
+
+**Statement handles.** `_execute_async` released the in-flight handle on the error paths and
+handed it to Results on success. A caller cancelling the query did neither, so the handle
+stayed on the connection until the next query overwrote the slot, at which point DBI
+collected it while still active and said so. Now held by a guard that releases from its
+destructor.
+
+That exposed a second detail. Finishing the handle is not enough on its own when the
+statement is still running: the server has to be told to stop first, which is why the
+timeout path worked, since it cancels before releasing. The guard's destructor now cancels
+and then releases, and the warning goes away.
+
+**The listener.** `_run_control_query` stops the listener, runs a statement, then clears
+`_stopping` and starts it again. A cancelled control query skipped both, leaving the flag
+set and the listener stopped: notifications simply stopped arriving, with nothing logged and
+nothing thrown. It self-healed on the next control statement, which made it the kind of
+fault that comes and goes. A guard restores the flag and restarts the listener however the
+statement ends.
+
+**The pattern, stated once.** In an async sub, anything that has to be undone cannot be
+undone by the code after the `await`. A caller may cancel while the sub is suspended, which
+tears it down where it stands. Undo belongs in a guard object's destructor, or in a callback
+on the future. Four separate defects in this distribution came from getting that wrong.

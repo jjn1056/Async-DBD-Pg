@@ -134,12 +134,14 @@ async sub _execute_async {
         $self->_throw_query_error($@ || $dbh->errstr, $sql);
     }
 
-    # Hold the in-flight handle on the connection. A query that is abandoned
-    # part way through, by a timeout for instance, has its async sub torn
-    # down along with the lexicals inside it, and DBI warns when a statement
-    # handle is collected while still active. Keeping a reference here lets
-    # cancel release the handle deliberately.
-    $self->{_active_sth} = $sth;
+    # Hold the in-flight handle on the connection. A query abandoned part way
+    # through has its async sub torn down along with the lexicals inside it,
+    # and DBI warns when a statement handle is collected while still active.
+    #
+    # A guard rather than a release at the end, because a caller cancelling
+    # the query stops this sub where it is suspended and nothing after the
+    # await runs.
+    my $statement = Async::DBD::Pg::Connection::_StatementGuard->new($self, $sth);
 
     my $rv = eval {
         if (ref $bind eq 'ARRAY' && @$bind) {
@@ -152,7 +154,7 @@ async sub _execute_async {
 
     if ($@ || !defined $rv) {
         my $err = $@ || $sth->errstr || $dbh->errstr;
-        $self->_release_active_sth;
+        $statement->release;
         $self->_throw_query_error($err, $sql);
     }
 
@@ -162,12 +164,12 @@ async sub _execute_async {
     my $result = eval { $dbh->pg_result };
     if ($@ || !$result) {
         my $err = $@ || $dbh->errstr;
-        $self->_release_active_sth;
+        $statement->release;
         $self->_throw_query_error($err, $sql);
     }
 
     # Results takes over the handle and finishes it.
-    delete $self->{_active_sth};
+    $statement->hand_over;
 
     return Async::DBD::Pg::Results->new($sth);
 }
@@ -414,6 +416,62 @@ sub _throw_query_error {
         context    => $diag{context},
     );
 }
+
+package Async::DBD::Pg::Connection::_StatementGuard;
+
+# Keeps the connection's reference to an in-flight statement handle, and
+# finishes that handle unless the result was handed to a Results object.
+# Releasing from a destructor covers the case the code cannot: a caller
+# cancelling the query while it is suspended awaiting the server.
+
+use strict;
+use warnings;
+use Scalar::Util qw(weaken);
+
+sub new {
+    my ($class, $conn, $sth) = @_;
+
+    $conn->{_active_sth} = $sth;
+
+    my $self = bless { conn => $conn }, $class;
+    weaken($self->{conn});
+
+    return $self;
+}
+
+# The statement is finished with and nobody is going to read it.
+sub release {
+    my ($self) = @_;
+
+    my $conn = delete $self->{conn} or return;
+    $conn->_release_active_sth;
+}
+
+# Ownership passes to the caller, who finishes the handle instead.
+sub hand_over {
+    my ($self) = @_;
+
+    my $conn = delete $self->{conn} or return;
+    delete $conn->{_active_sth};
+}
+
+sub DESTROY {
+    my ($self) = @_;
+
+    return if ${^GLOBAL_PHASE} eq 'DESTRUCT';
+
+    my $conn = $self->{conn} or return;
+
+    # Reaching the destructor with the statement still held means the query
+    # was abandoned rather than read. The server is still working on a result
+    # nobody wants, and the handle cannot be finished cleanly until it stops,
+    # so cancel first and then release.
+    $conn->cancel;
+
+    $self->release;
+}
+
+package Async::DBD::Pg::Connection;
 
 1;
 

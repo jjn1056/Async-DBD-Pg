@@ -234,6 +234,32 @@ subtest 'query exceeding its timeout fails with Error::Timeout' => sub {
     $conn->_close_dbh;
 };
 
+subtest 'cancelling a query releases its statement handle' => sub {
+    my $conn = make_connection();
+
+    # Nothing after the await runs when a caller cancels, so the handle has
+    # to be released from a destructor. Left held, it is collected while
+    # still active and DBI says so.
+    my @warnings;
+    {
+        local $SIG{__WARN__} = sub { push @warnings, join '', @_ };
+
+        my $abandoned = $conn->query('SELECT pg_sleep(5)');
+        Future::IO->sleep(0.2)->get;
+        $abandoned->cancel;
+
+        # The next query reuses the slot, which is when a leaked handle is
+        # collected and complains.
+        my $next = $conn->query('SELECT 7 AS n')->get;
+        is $next->first->{n}, 7, 'connection usable after the cancelled query';
+    }
+
+    is \@warnings, [], 'cancelled query left no statement handle behind'
+        or diag("warnings: @warnings");
+
+    $conn->_close_dbh;
+};
+
 subtest 'DML affecting no rows succeeds' => sub {
     my $conn = make_connection();
 

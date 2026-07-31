@@ -77,6 +77,33 @@ subtest 'a callback that dies does not stop the others or the listener' => sub {
     $pubsub->disconnect->get;
 };
 
+subtest 'cancelling a listen leaves the listener running' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 3,
+    );
+    my $pubsub = $pg->pubsub;
+
+    my @got;
+    $pubsub->listen('cancel_listen_a', sub { push @got, $_[1] })->get;
+
+    # Issuing a control statement stops the listener for the duration. A
+    # caller cancelling part way through must not leave it stopped, or
+    # notifications quietly stop arriving with nothing to say why.
+    my $abandoned = $pubsub->listen('cancel_listen_b', sub { });
+    $abandoned->cancel;
+
+    is $pubsub->{_stopping}, 0, 'listener not left in the stopping state';
+
+    $pubsub->notify('cancel_listen_a', 'still here')->get;
+    wait_until(sub { @got }, 'notification after the cancelled listen', 3);
+
+    is \@got, ['still here'], 'existing subscription still delivering';
+
+    $pubsub->disconnect->get;
+};
+
 subtest 'giving up on connect leaves pub/sub usable' => sub {
     my $pg = Async::DBD::Pg->new(
         dsn             => test_dsn(),

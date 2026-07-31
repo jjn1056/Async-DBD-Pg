@@ -255,14 +255,16 @@ async sub _run_control_query {
     await $self->_stop_listener if $self->{_listener_future};
 
     # Stopping the listener set _stopping, and the listener loop refuses to
-    # run while it is set. Clearing it and restarting must happen even when
-    # the statement fails, or every later listen and unlisten quietly does
-    # nothing.
+    # run while it is set. A guard puts it back and restarts the listener
+    # however this ends: on success, on a failed statement, and on a caller
+    # cancelling while the statement is in flight, which stops this sub
+    # where it stands and runs nothing after the await.
+    my $listener = Async::DBD::Pg::PubSub::_ListenerGuard->new($self);
+
     my $result = eval { await $self->{conn}->query($sql, @bind) };
     my $err = $@;
 
-    $self->{_stopping} = 0;
-    await $self->_start_listener if $self->{connected};
+    $listener->restore;
 
     die $err if $err;
 
@@ -314,6 +316,44 @@ sub DESTROY {
     return if ${^GLOBAL_PHASE} eq 'DESTRUCT';
     $self->_pool_shutdown;
 }
+
+package Async::DBD::Pg::PubSub::_ListenerGuard;
+
+# Clears the stopping flag and starts the listener again. Restoring from a
+# destructor as well as explicitly covers a caller cancelling the control
+# query, which would otherwise leave the flag set and the listener stopped,
+# so notifications would stop arriving with nothing to say why.
+
+use strict;
+use warnings;
+use Scalar::Util qw(weaken);
+
+sub new {
+    my ($class, $pubsub) = @_;
+
+    my $self = bless { pubsub => $pubsub }, $class;
+    weaken($self->{pubsub});
+
+    return $self;
+}
+
+sub restore {
+    my ($self) = @_;
+
+    my $pubsub = delete $self->{pubsub} or return;
+
+    $pubsub->{_stopping} = 0;
+    return unless $pubsub->{connected};
+
+    # Starting the listener only builds the loop's future; it does no I/O
+    # itself, so it is safe from a destructor. Retained because nobody is
+    # waiting on it.
+    $pubsub->_start_listener->retain;
+}
+
+sub DESTROY { shift->restore }
+
+package Async::DBD::Pg::PubSub;
 
 1;
 
