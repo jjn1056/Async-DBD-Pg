@@ -124,6 +124,36 @@ subtest 'scalar method' => sub {
     $conn->_close_dbh;
 };
 
+subtest 'query completing inside its timeout returns normally' => sub {
+    my $conn = make_connection();
+
+    my $result = $conn->query('SELECT 42 AS answer', { timeout => 10 })->get;
+    is $result->first->{answer}, 42, 'result returned when the query beats the timeout';
+
+    $conn->_close_dbh;
+};
+
+subtest 'query exceeding its timeout fails with Error::Timeout' => sub {
+    my $conn = make_connection();
+
+    # An abandoned query must release its statement handle, or DBI warns that
+    # the handle was cleared whilst still active when it is collected.
+    my @warnings;
+    my $err;
+    {
+        local $SIG{__WARN__} = sub { push @warnings, join '', @_ };
+        $err = dies { $conn->query('SELECT pg_sleep(5)', { timeout => 0.5 })->get };
+    }
+
+    ok $err, 'slow query fails';
+    isa_ok $err, 'Async::DBD::Pg::Error::Timeout';
+    is $err->timeout, 0.5, 'error carries the timeout that was exceeded';
+    is \@warnings, [], 'abandoned statement handle released without warnings'
+        or diag("warnings: @warnings");
+
+    $conn->_close_dbh;
+};
+
 subtest 'DML affecting no rows succeeds' => sub {
     my $conn = make_connection();
 

@@ -97,11 +97,21 @@ async sub _query_with_timeout {
     my $query_future = $self->_execute_async($sql, $bind);
     my $timer = Future::IO->sleep($timeout);
 
-    my $winner = await Future->wait_any($query_future, $timer);
+    # wait_any yields the result of whichever future won rather than the
+    # winning future, so the outcome has to be read back from the futures
+    # themselves. It also cancels the loser, and a cancelled future reports
+    # is_ready, so completion is tested with is_done.
+    eval { await Future->wait_any($query_future, $timer); 1 };
+    my $failure = $@;
 
-    if ($winner == $timer) {
+    $timer->cancel unless $timer->is_ready;
+
+    return $query_future->get if $query_future->is_done;
+
+    # The query lost the race. Stop it server side so the backend is not left
+    # working on a result nobody is waiting for.
+    if (!$query_future->is_failed) {
         $self->cancel;
-        eval { await $query_future };
 
         die Async::DBD::Pg::Error::Timeout->new(
             message => "Query timeout after ${timeout}s",
@@ -109,7 +119,7 @@ async sub _query_with_timeout {
         );
     }
 
-    return $winner->get;
+    die $failure;
 }
 
 # Core async query execution using DBD::Pg async support
@@ -124,6 +134,13 @@ async sub _execute_async {
         $self->_throw_query_error($@ || $dbh->errstr, $sql);
     }
 
+    # Hold the in-flight handle on the connection. A query that is abandoned
+    # part way through, by a timeout for instance, has its async sub torn
+    # down along with the lexicals inside it, and DBI warns when a statement
+    # handle is collected while still active. Keeping a reference here lets
+    # cancel release the handle deliberately.
+    $self->{_active_sth} = $sth;
+
     my $rv = eval {
         if (ref $bind eq 'ARRAY' && @$bind) {
             $sth->execute(@$bind);
@@ -134,7 +151,9 @@ async sub _execute_async {
     };
 
     if ($@ || !defined $rv) {
-        $self->_throw_query_error($@ || $sth->errstr || $dbh->errstr, $sql);
+        my $err = $@ || $sth->errstr || $dbh->errstr;
+        $self->_release_active_sth;
+        $self->_throw_query_error($err, $sql);
     }
 
     # Wait for async result using Future::IO
@@ -142,8 +161,13 @@ async sub _execute_async {
 
     my $result = eval { $dbh->pg_result };
     if ($@ || !$result) {
-        $self->_throw_query_error($@ || $dbh->errstr, $sql);
+        my $err = $@ || $dbh->errstr;
+        $self->_release_active_sth;
+        $self->_throw_query_error($err, $sql);
     }
+
+    # Results takes over the handle and finishes it.
+    delete $self->{_active_sth};
 
     return Async::DBD::Pg::Results->new($sth);
 }
@@ -189,10 +213,19 @@ async sub _wait_for_result {
     }
 }
 
+# Release the statement handle of a query that will not be read
+sub _release_active_sth {
+    my ($self) = @_;
+
+    my $sth = delete $self->{_active_sth} or return;
+    eval { $sth->finish };
+}
+
 # Cancel current query
 sub cancel {
     my ($self) = @_;
     eval { $self->{dbh}->pg_cancel };
+    $self->_release_active_sth;
 }
 
 # Execute code within a transaction
