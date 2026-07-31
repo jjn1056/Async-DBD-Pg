@@ -1,46 +1,41 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+use Future;
 use Future::AsyncAwait;
+use Future::IO;
 use Time::HiRes;
 
-# Load Future::IO implementation
-use Future::IO::Impl::IOAsync;
-use IO::Async::Loop;
-use IO::Async::Timer::Periodic;
+use Async::DBD::Pg;
 
-use Future::IO::Pg;
+BEGIN { Future::IO->load_best_impl; }
 
 my $dsn = $ENV{TEST_PG_DSN} // 'postgresql://postgres:test@localhost:5432/test';
 
 print "=" x 60, "\n";
-print "Proving Future::IO::Pg is truly async\n";
+print "Proving Async::DBD::Pg is truly async\n";
 print "=" x 60, "\n\n";
 
 # Check capabilities
 print "Capabilities:\n";
 print "  DBD::Pg version: $DBD::Pg::VERSION\n";
 print "  Future::IO impl: $Future::IO::IMPL\n";
-my $test_pg = Future::IO::Pg->new(dsn => $dsn, min_connections => 0);
+my $test_pg = Async::DBD::Pg->new(dsn => $dsn, min_connections => 0);
 print "  Async connect: ", ($test_pg->_supports_async_connect ? "YES" : "NO"), "\n";
-print "  ready_for_read: ", ($Future::IO::IMPL->can('ready_for_read') ? "YES" : "NO"), "\n\n";
+print "  Future::IO poll: ", (Future::IO->can('poll') ? "YES" : "NO"), "\n\n";
 
-my $loop = IO::Async::Loop->new;
-
-# Create a timer that ticks every 50ms
+# Create a ticker that ticks every 50ms
 my $ticks = 0;
-my $timer = IO::Async::Timer::Periodic->new(
-    interval => 0.05,
-    on_tick  => sub {
+my $ticker = async sub {
+    while (1) {
+        await Future::IO->sleep(0.05);
         $ticks++;
         print "  [tick $ticks] Event loop is running!\n";
-    },
-);
-$timer->start;
-$loop->add($timer);
+    }
+}->();
 
 # Create the pool
-my $pg = Future::IO::Pg->new(
+my $pg = Async::DBD::Pg->new(
     dsn             => $dsn,
     min_connections => 0,
     max_connections => 5,
@@ -133,12 +128,11 @@ async sub run_test {
     $conn->release;
 
     print "=" x 60, "\n";
-    print "All tests demonstrate Future::IO::Pg is truly async!\n";
+    print "All tests demonstrate Async::DBD::Pg is truly async!\n";
     print "=" x 60, "\n";
 }
 
 # Run the test
 run_test()->get;
 
-$timer->stop;
-$loop->remove($timer);
+$ticker->cancel unless $ticker->is_ready;
