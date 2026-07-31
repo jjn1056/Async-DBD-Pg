@@ -303,7 +303,7 @@ waiters can queue up, each with a timer future.
 `host` defaults to `'localhost'` when absent. `postgresql:///dbname` (local socket) is
 forced to TCP. `port` is forced to `5432`.
 
-### 21. Future::IO usage is too low-level (feedback from LeoNerd)
+### 21. Future::IO usage is too low-level (feedback from LeoNerd) — PARTLY ANSWERED
 
 **Feedback source:** LeoNerd (author of Future::IO) on IRC, 2026-03-18.
 
@@ -325,6 +325,29 @@ inline timeout racing, status code branching. These should use Future combinator
 
 LeoNerd pointed to `https://metacpan.org/dist/Future-IO/requires` for examples of
 well-structured Future::IO code.
+
+**Read Conduit, LeoNerd's own Future::IO based HTTP server, for those patterns.** Two of the
+three concerns in this entry do not survive contact with it.
+
+- `while` loops around `await` are not the problem. Conduit's own accept loop is
+  `while( my $clientsock = await Future::IO->accept( $listensock ) )`, and its client loop
+  is `while( defined( my $req = await $self->read_request ) )`. Our `_wait_for_result` is the
+  same shape. `Future::Utils::repeat` predates `async`/`await` and is not what its author
+  reaches for now.
+- `Future::Buffer` and `Future::IO`'s `sysread`/`write_exactly` are the idiomatic parts we
+  cannot use, for the reason already recorded above: Conduit owns its socket and speaks the
+  protocol itself, and we do not.
+
+What did transfer is how Conduit treats work nobody is awaiting. It collects those futures
+in a `Future::Selector` and gives each an `->else` that logs and returns `Future->done`, so
+one failed client cannot take the server down. We had the opposite: `->retain` scattered
+about, meaning start it and hope. See item 63.
+
+`Future::Selector` itself was considered and not adopted. It wants a run loop of its own,
+which suits a server with a top level `run` and does not suit a library living inside
+someone else's event loop; adopting it would either force a supervisor future on callers or
+amount to `->retain` with extra machinery and an `Object::Pad` dependency. The idea was
+worth taking without the module.
 
 ---
 
@@ -827,3 +850,23 @@ statement ends.
 undone by the code after the `await`. A caller may cancel while the sub is suspended, which
 tears it down where it stands. Undo belongs in a guard object's destructor, or in a callback
 on the future. Four separate defects in this distribution came from getting that wrong.
+
+
+### 63. Background work could outlive the pool — FIXED
+
+Found by reading Conduit after item 21, rather than from this list.
+
+Releasing a connection finishes in the background when there is a transaction to roll back
+or an `on_release` callback to run, and `_ensure_min_connections` creates connections the
+same way. Both ended in `->retain`: started, with nothing holding them and nothing able to
+stop them.
+
+So a release that was still in flight when `shutdown` ran would finish afterwards and call
+`_release_to_idle_or_waiting`, which put the connection back into a pool that was already
+closed. Measured: `is_shut_down` true, `total_count` 1, and an open connection that nothing
+would ever close. A connection leak that only appears if you look after shutdown returns.
+
+Both paths now check the flag and close instead of returning the connection, and the pool
+keeps a handle on the futures it starts so `shutdown` cancels whatever is left. That is the
+part of Conduit's `Future::Selector` collection that applies to a library, without the
+selector's own run loop.

@@ -15,7 +15,7 @@ use Async::DBD::Pg::PubSub;
 use Async::DBD::Pg::Util qw(parse_dsn);
 use IO::Socket;
 use POSIX qw(dup);
-use Scalar::Util qw(weaken);
+use Scalar::Util qw(refaddr weaken);
 
 # $VERSION is stamped into each package at build time by Dist::Zilla, so it
 # is absent when running straight from a git checkout.
@@ -186,6 +186,11 @@ async sub shutdown {
     # Whatever is still checked out is closed, whether it came back or not.
     $_->_close_dbh for splice @{$self->{active}};
 
+    # Stop anything the pool started that nobody is waiting on.
+    for my $f (values %{ delete $self->{_background} || {} }) {
+        $f->cancel unless $f->is_ready;
+    }
+
     delete $self->{_drained};
     $self->{_shut_down} = 1;
 
@@ -193,6 +198,31 @@ async sub shutdown {
 }
 
 sub is_shut_down { shift->{_shut_down} ? 1 : 0 }
+
+# Keep a handle on work the pool started that nobody is waiting for, so
+# shutdown can stop it rather than leaving it to run against a closed pool.
+# Conduit collects its background futures in a Future::Selector for the same
+# reason; a selector wants a run loop of its own, which suits a server but not
+# a library living inside someone else's loop, so this keeps just the part
+# that matters.
+sub _run_in_background {
+    my ($self, $f) = @_;
+
+    my $key = refaddr $f;
+    $self->{_background}{$key} = $f;
+
+    my $pool = $self;
+    weaken($pool);
+
+    $f->on_ready(sub {
+        my $live = $pool or return;
+        delete $live->{_background}{$key};
+    });
+
+    $f->retain;
+
+    return $f;
+}
 
 # Signal a drain once nothing is checked out any more.
 sub _check_drained {
@@ -625,11 +655,21 @@ sub _return_connection {
         }
         $self->_release_to_idle_or_waiting($conn);
     };
-    $cleanup->()->retain;
+    $self->_run_in_background($cleanup->());
 }
 
 sub _release_to_idle_or_waiting {
     my ($self, $conn) = @_;
+
+    # Work started before the pool closed can finish after it. The pool is
+    # shut, so the connection is closed rather than put back where nothing
+    # would ever close it.
+    if ($self->{_shutting_down}) {
+        $conn->_close_dbh;
+        $self->{stats}{discarded}++;
+        $self->_check_drained;
+        return;
+    }
 
     # Give the connection to the first caller still waiting for one. A waiter
     # whose future has already settled has timed out or been cancelled, and
@@ -663,18 +703,24 @@ sub _ensure_min_connections {
     my $needed = $self->{min_connections} - $self->_committed_count;
     return if $needed <= 0;
 
-    # Create connections in parallel (fire and forget)
     for (1 .. $needed) {
         my $f = $self->_create_connection;
         $f->on_done(sub {
             my ($conn) = @_;
+
+            # The pool may have closed while this was connecting.
+            if ($self->{_shutting_down}) {
+                $conn->_close_dbh;
+                return;
+            }
+
             push @{$self->{idle}}, $conn;
         });
         $f->on_fail(sub {
             my ($err) = @_;
             $self->_log(warn => "Failed to create initial connection: $err");
         });
-        $f->retain;
+        $self->_run_in_background($f);
     }
 }
 

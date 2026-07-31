@@ -141,6 +141,31 @@ subtest 'callers waiting in the queue are told' => sub {
     settle($shutdown, 3);
 };
 
+subtest 'work still in flight cannot revive a closed pool' => sub {
+    my $pg = make_pool(
+        on_release => async sub {
+            # Cleanup that is still running when shutdown is called.
+            await Future::IO->sleep(0.4);
+        },
+    );
+
+    my $conn = $pg->connection->get;
+    $conn->release;
+
+    # Releasing a connection finishes in the background, so a shutdown can
+    # start while that work is still going.
+    settle($pg->shutdown, 5);
+
+    ok $pg->is_shut_down, 'pool reports shut down';
+    is $pg->total_count, 0, 'pool empty when shutdown returns';
+
+    # Whatever was in flight must not put a connection back afterwards.
+    Future::IO->sleep(1)->get;
+
+    is $pg->total_count, 0, 'still empty once the background work finished';
+    is $pg->idle_count, 0, 'nothing returned to the idle list';
+};
+
 subtest 'shutdown gives back the pub/sub listener connection' => sub {
     my $pg = make_pool(max_connections => 3);
     my $pubsub = $pg->pubsub;
