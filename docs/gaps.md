@@ -20,12 +20,26 @@ number stay valid. Numbering is therefore unique but not in document order.
 `$winner == $timer` compares a scalar to a Future reference — this will never work as
 intended. The timeout path is completely broken.
 
-### 2. `pg_result` returning 0 is treated as error
+### 2. `pg_result` returning 0 is treated as error — NOT A BUG
 
 **File:** `Connection.pm:144`
 
-`!$result` is true when `pg_result` returns `0`, which is a valid return for UPDATE/DELETE
-affecting zero rows. Any zero-row DML will throw a spurious error.
+Claimed: `!$result` is true when `pg_result` returns `0`, which is a valid return for
+UPDATE/DELETE affecting zero rows, so any zero-row DML throws a spurious error.
+
+This is incorrect and no change is needed. `pg_result` follows the DBI convention and
+returns the string `'0E0'` for zero rows, which is numerically 0 but true in boolean
+context, so `!$result` is false. Measured against DBD::Pg 3.20.2:
+
+    UPDATE zero rows   pg_result='0E0'  bool=TRUE   numeric=0
+    DELETE zero rows   pg_result='0E0'  bool=TRUE   numeric=0
+    ON CONFLICT NOP    pg_result='0E0'  bool=TRUE   numeric=0
+    UPDATE one row     pg_result='1'    bool=TRUE   numeric=1
+
+The existing check is right: it distinguishes `undef` (a genuine failure) from `'0E0'` (a
+successful statement that matched nothing). Zero-row UPDATE, DELETE and
+`INSERT ... ON CONFLICT DO NOTHING` are covered by t/integration/connection.t so that this
+contract is not "corrected" into a numeric test later.
 
 ### 3. `_throw_query_error` uses wrong DBD::Pg attribute
 

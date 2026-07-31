@@ -124,6 +124,36 @@ subtest 'scalar method' => sub {
     $conn->_close_dbh;
 };
 
+subtest 'DML affecting no rows succeeds' => sub {
+    my $conn = make_connection();
+
+    $conn->query('CREATE TEMP TABLE dml_zero (id int primary key, name text)')->get;
+    $conn->query("INSERT INTO dml_zero VALUES (1, 'one')")->get;
+
+    # pg_result reports affected rows as the DBI '0E0', which is false
+    # numerically but true in boolean context, so a statement that matches
+    # nothing must not be mistaken for a failed one.
+    my $updated = $conn->query('UPDATE dml_zero SET name = $1 WHERE id = $2', 'x', 999)->get;
+    ok $updated, 'UPDATE matching no rows returns a result';
+    is $updated->rows_affected, 0, 'UPDATE reports zero rows affected';
+
+    my $deleted = $conn->query('DELETE FROM dml_zero WHERE id = $1', 999)->get;
+    ok $deleted, 'DELETE matching no rows returns a result';
+    is $deleted->rows_affected, 0, 'DELETE reports zero rows affected';
+
+    my $conflicted = $conn->query(
+        'INSERT INTO dml_zero VALUES (1, $1) ON CONFLICT DO NOTHING', 'dup'
+    )->get;
+    ok $conflicted, 'INSERT ... ON CONFLICT DO NOTHING returns a result';
+    is $conflicted->rows_affected, 0, 'conflicting INSERT reports zero rows affected';
+
+    # The row that was there must be untouched.
+    my $check = $conn->query('SELECT name FROM dml_zero WHERE id = 1')->get;
+    is $check->first->{name}, 'one', 'existing row unchanged';
+
+    $conn->_close_dbh;
+};
+
 subtest 'event loop not blocked during query' => sub {
     my $conn = make_connection();
 
