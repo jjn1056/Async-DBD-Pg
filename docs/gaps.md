@@ -347,10 +347,16 @@ does.
 All URLs reference `github.com/jjn1056/future-io-pg`. CPAN will link users to a stale or
 nonexistent repo.
 
-### 23. License inconsistency
+### 23. License inconsistency — FIXED
 
 `dist.ini` says `Artistic_2_0`. README and module POD say "same terms as Perl itself"
 (which is Artistic 1.0 OR GPL). These are legally different licenses. Pick one.
+
+Resolved as Artistic 2.0, which is what `dist.ini` already declared and what the generated
+LICENSE file and `META.json` already carried. The README and the module POD were the ones
+out of step, and now state Artistic 2.0 with a copyright line and a pointer to the LICENSE
+file. Verified against a built distribution: metadata reports `artistic_2`, LICENSE carries
+the Artistic 2.0 text, and no file claims the Perl terms any more.
 
 ### 24. `.gitignore` has old package name
 

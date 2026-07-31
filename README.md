@@ -104,4 +104,6 @@ John Napiorkowski <jjn1056@yahoo.com>
 
 ## License
 
-This library is free software; you can redistribute it and/or modify it under the same terms as Perl itself.
+Copyright (c) 2026 John Napiorkowski.
+
+This library is free software; you may redistribute it and/or modify it under the terms of the Artistic License 2.0. See the [LICENSE](LICENSE) file for the full text.
