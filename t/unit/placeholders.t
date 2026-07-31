@@ -109,4 +109,47 @@ subtest 'positional placeholders pass through' => sub {
     is $bind, [], 'no bind values';
 };
 
+subtest 'named placeholder with no matching parameter is rejected' => sub {
+    # Passing the literal ':name' through produces SQL that PostgreSQL
+    # rejects with a syntax error pointing at the wrong thing, so the
+    # mistake is reported here instead.
+    my $err = dies {
+        convert_placeholders('SELECT * FROM users WHERE id = :id', {})
+    };
+
+    ok $err, 'missing placeholder is an error';
+    like $err, qr/\bid\b/, 'error names the placeholder';
+
+    my $partial = dies {
+        convert_placeholders(
+            'SELECT * FROM users WHERE id = :id AND name = :name',
+            { id => 1 }
+        )
+    };
+    like $partial, qr/\bname\b/, 'error names the placeholder that is missing';
+
+    ok lives {
+        convert_placeholders(
+            'SELECT * FROM users WHERE id = :id AND name = :name',
+            { id => 1, name => 'x' }
+        )
+    }, 'no error when every placeholder is supplied';
+};
+
+subtest 'colons that are not placeholders are left alone' => sub {
+    # An array slice bound is a bare integer, not an identifier, so it must
+    # not be mistaken for a placeholder name.
+    my ($slice) = convert_placeholders('SELECT arr[1:3] FROM t', {});
+    is $slice, 'SELECT arr[1:3] FROM t', 'array slice preserved';
+
+    my ($open_slice) = convert_placeholders('SELECT arr[:2] FROM t', {});
+    is $open_slice, 'SELECT arr[:2] FROM t', 'slice with omitted lower bound preserved';
+
+    my ($cast) = convert_placeholders('SELECT 1::integer', {});
+    is $cast, 'SELECT 1::integer', 'cast preserved';
+
+    my ($quoted) = convert_placeholders("SELECT ':id' AS literal", {});
+    is $quoted, "SELECT ':id' AS literal", 'colon inside a string literal preserved';
+};
+
 done_testing;

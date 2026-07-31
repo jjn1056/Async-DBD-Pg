@@ -11,7 +11,9 @@ sub convert_placeholders {
     my ($sql, $params) = @_;
     $params //= {};
 
-    return ($sql, []) unless %$params;
+    # No early return for an empty parameter hash: a statement carrying a
+    # named placeholder with nothing to bind to it is the very case that
+    # needs reporting.
 
     my %seen;
     my @bind;
@@ -62,7 +64,16 @@ sub convert_placeholders {
                 $j++;
             }
 
-            if (length($name) && exists $params->{$name}) {
+            # Only an identifier names a placeholder. A run of digits is an
+            # array slice bound, as in arr[1:3] or arr[:2], and passes
+            # through untouched.
+            if (length($name) && $name =~ /\A[a-zA-Z_]/) {
+                # Letting an unmatched name through produces SQL that
+                # PostgreSQL rejects with a syntax error pointing at the
+                # colon, which hides the real mistake.
+                die "No value supplied for placeholder ':$name'\n"
+                    unless exists $params->{$name};
+
                 if (!exists $seen{$name}) {
                     $pos++;
                     $seen{$name} = $pos;
@@ -149,6 +160,31 @@ Async::DBD::Pg::Util - Utility functions for Async::DBD::Pg
         'SELECT * FROM users WHERE id = :id',
         { id => 42 }
     );
+
+=head1 FUNCTIONS
+
+Nothing is exported by default.
+
+=head2 convert_placeholders
+
+    my ($sql, $bind) = convert_placeholders($sql, \%params);
+
+Rewrites C<:name> placeholders to the C<$1>, C<$2> positional form
+PostgreSQL expects, and returns the rewritten statement together with the
+bind values in matching order. A name used more than once is bound once and
+reuses the same position.
+
+Colons that do not introduce a placeholder are left alone: C<::> casts,
+anything inside a single or double quoted string, and array slice bounds
+such as C<arr[1:3]> or C<arr[:2]>, whose bounds are numbers rather than
+identifiers.
+
+Dies if the statement names a placeholder that C<%params> has no value for.
+Passing the name through would otherwise produce a statement PostgreSQL
+rejects with a syntax error pointing at the colon, which obscures the real
+mistake. A consequence is that an array slice written with identifier
+bounds, C<arr[lower:upper]>, cannot be used together with named
+placeholders; use positional placeholders for such a statement.
 
 =head1 AUTHOR
 

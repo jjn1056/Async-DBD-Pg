@@ -168,13 +168,26 @@ the descriptor number, which is why the stale handle looked unchanged.
 `ping` is a blocking network call. Running it from `DESTROY` during event loop teardown can
 block the reactor or trigger re-entrant async code.
 
-### 15. `convert_placeholders` silently emits broken SQL
+### 15. `convert_placeholders` silently emits broken SQL — FIXED
 
 **File:** `Util.pm:~57-75`
 
 If a `:name` appears in the SQL but the params hash has no matching key, the literal `:name`
 passes through to PostgreSQL, which will reject it with a confusing syntax error. Should die
 at conversion time with a clear message about missing placeholder names.
+
+Fixed. An unmatched placeholder now dies naming the placeholder. Two details were needed
+beyond the description:
+
+- Only an identifier is treated as a placeholder. A run of digits after a colon is an array
+  slice bound, as in `arr[1:3]` or `arr[:2]`, and still passes through. Rejecting those
+  would have broken valid SQL, and there was no test covering them.
+- The early `return ($sql, []) unless %$params` had to go. It short-circuited the empty
+  parameter hash, which is exactly the case where a named placeholder has nothing to bind.
+
+The one construct this gives up is an array slice with identifier bounds,
+`arr[lower:upper]`, in a statement using named placeholders; it is documented in the Util
+POD along with the rest of the function's contract.
 
 ---
 
