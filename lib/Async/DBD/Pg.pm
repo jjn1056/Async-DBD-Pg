@@ -295,18 +295,37 @@ async sub _complete_async_connect {
         );
     }
 
-    # Create socket wrapper for polling
-    my $socket_fd = $dbh->{pg_socket};
-    die "No PostgreSQL socket" unless defined $socket_fd;
+    # libpq may close the socket and connect again part way through the
+    # handshake, for instance when it offers GSSAPI or SSL encryption and the
+    # server declines, and DBD::Pg documents that the socket may have changed
+    # after each call to pg_continue_connect. Wrap whichever descriptor is
+    # current at each poll: a wrapper built once ends up waiting on the
+    # abandoned connection, which never becomes ready.
+    #
+    # The wrappers stay alive for the whole handshake so a closed descriptor
+    # number cannot be reused while an event loop still holds a poll
+    # registration against it. They close with @polled, including on the
+    # error paths below.
+    my @polled;
 
-    my $dup_fd = dup($socket_fd);
-    die "Cannot dup pg_socket: $!" unless defined $dup_fd;
+    my $poll_current_socket = sub {
+        my ($events) = @_;
 
-    my $sock = IO::Socket->new;
-    unless ($sock->fdopen($dup_fd, "r+")) {
-        POSIX::close($dup_fd);
-        die "Cannot fdopen pg_socket: $!";
-    }
+        my $socket_fd = $dbh->{pg_socket};
+        die "No PostgreSQL socket" unless defined $socket_fd;
+
+        my $dup_fd = dup($socket_fd);
+        die "Cannot dup pg_socket: $!" unless defined $dup_fd;
+
+        my $sock = IO::Socket->new;
+        unless ($sock->fdopen($dup_fd, "r+")) {
+            POSIX::close($dup_fd);
+            die "Cannot fdopen pg_socket: $!";
+        }
+        push @polled, $sock;
+
+        return Future::IO->poll($sock, $events);
+    };
 
     # Set up timeout
     my $timeout_future;
@@ -319,11 +338,11 @@ async sub _complete_async_connect {
         my $wait_future;
         if ($status == 1) {
             # Need to wait for read
-            $wait_future = Future::IO->poll($sock, POLLIN);
+            $wait_future = $poll_current_socket->(POLLIN);
         }
         elsif ($status == 2) {
             # Need to wait for write
-            $wait_future = Future::IO->poll($sock, POLLOUT);
+            $wait_future = $poll_current_socket->(POLLOUT);
         }
         else {
             last;  # Connected or error
