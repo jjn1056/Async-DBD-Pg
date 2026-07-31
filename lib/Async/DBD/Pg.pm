@@ -15,6 +15,7 @@ use Async::DBD::Pg::PubSub;
 use Async::DBD::Pg::Util qw(parse_dsn);
 use IO::Socket;
 use POSIX qw(dup);
+use Scalar::Util qw(weaken);
 
 our $VERSION = '0.001001';
 
@@ -130,7 +131,84 @@ async sub notify {
 
 sub is_healthy {
     my ($self) = @_;
-    return $self->total_count > 0 || $self->waiting_count < $self->{max_connections};
+
+    # True when a caller would be handed a connection straight away: one is
+    # sitting idle, or there is room to create another. A pool whose
+    # connections are all busy at max_connections reports false, because the
+    # next caller has to queue.
+    return 1 if $self->idle_count;
+    return $self->total_count < $self->{max_connections} ? 1 : 0;
+}
+
+# Close connections that have been idle longer than idle_timeout, never
+# taking the pool below min_connections. Busy connections count towards that
+# floor, since they are still part of the pool.
+sub _reap_idle_connections {
+    my ($self) = @_;
+
+    my $timeout = $self->{idle_timeout} or return;
+
+    my $now = time();
+    my (@keep, @expired);
+
+    for my $conn (@{$self->{idle}}) {
+        my $idle_for = $now - ($conn->last_used // $now);
+        push @{ $idle_for >= $timeout ? \@expired : \@keep }, $conn;
+    }
+
+    return unless @expired;
+
+    my $shortfall = $self->{min_connections} - (@keep + $self->active_count);
+    while ($shortfall > 0 && @expired) {
+        push @keep, shift @expired;
+        $shortfall--;
+    }
+
+    @{$self->{idle}} = @keep;
+    $self->_discard_connection($_) for @expired;
+}
+
+# Number of idle connections that could be reaped, ignoring their age.
+sub _reapable_count {
+    my ($self) = @_;
+
+    my $reapable = $self->total_count - $self->{min_connections};
+    $reapable = $self->idle_count if $reapable > $self->idle_count;
+
+    return $reapable > 0 ? $reapable : 0;
+}
+
+# Reaping is driven by a timer that exists only while there is something it
+# could close, so a pool sitting at min_connections does not hold the event
+# loop open.
+sub _schedule_idle_reap {
+    my ($self) = @_;
+
+    return unless $self->{idle_timeout};
+    return if $self->{_reap_timer};
+    return unless $self->_reapable_count;
+
+    my $pool = $self;
+    weaken($pool);
+
+    my $timer = Future::IO->sleep($self->{idle_timeout});
+    $self->{_reap_timer} = $timer;
+
+    $timer->on_done(sub {
+        my $live = $pool or return;
+        delete $live->{_reap_timer};
+        $live->_reap_idle_connections;
+        $live->_schedule_idle_reap;
+    });
+
+    return;
+}
+
+sub _cancel_idle_reap {
+    my ($self) = @_;
+
+    my $timer = delete $self->{_reap_timer} or return;
+    $timer->cancel unless $timer->is_ready;
 }
 
 sub _shutdown_pubsub {
@@ -142,6 +220,7 @@ sub _shutdown_pubsub {
 sub _close_all_connections {
     my ($self) = @_;
 
+    $self->_cancel_idle_reap;
     $self->_shutdown_pubsub;
 
     my @conns = (@{$self->{idle}}, @{$self->{active}});
@@ -405,26 +484,33 @@ sub _return_connection {
         return;
     }
 
-    # Run on_release callback
-    if (my $on_release = $self->{on_release}) {
-        my $cleanup = async sub {
-            eval {
-                # Reset connection state
-                await $conn->query('ROLLBACK') if $conn->{in_transaction};
-                await $on_release->($conn);
-            };
-            if ($@) {
-                $self->_log(warn => "on_release failed: $@");
-                $self->_discard_connection($conn);
-                return;
-            }
-            $self->_release_to_idle_or_waiting($conn);
-        };
-        $cleanup->()->retain;
-    }
-    else {
+    my $on_release = $self->{on_release};
+
+    # A connection carrying an open transaction must never go back into the
+    # pool: the next borrower would inherit its locks, and any cursor
+    # declared inside it stays open until that transaction ends. This reset
+    # is not conditional on an on_release callback being configured.
+    if (!$conn->{in_transaction} && !$on_release) {
         $self->_release_to_idle_or_waiting($conn);
+        return;
     }
+
+    my $cleanup = async sub {
+        eval {
+            if ($conn->{in_transaction}) {
+                await $conn->query('ROLLBACK');
+                $conn->{in_transaction} = 0;
+            }
+            await $on_release->($conn) if $on_release;
+        };
+        if ($@) {
+            $self->_log(warn => "connection reset failed: $@");
+            $self->_discard_connection($conn);
+            return;
+        }
+        $self->_release_to_idle_or_waiting($conn);
+    };
+    $cleanup->()->retain;
 }
 
 sub _release_to_idle_or_waiting {
@@ -442,6 +528,7 @@ sub _release_to_idle_or_waiting {
     # Otherwise return to idle pool
     push @{$self->{idle}}, $conn;
     $self->{stats}{released}++;
+    $self->_schedule_idle_reap;
 }
 
 sub _discard_connection {
@@ -609,6 +696,19 @@ query scheduling or pool lifecycle.
         on_release       => async sub { ... },
     );
 
+=head3 idle_timeout
+
+Seconds a connection may sit idle before it is closed and dropped from the
+pool. Defaults to 300. Pass 0 to keep idle connections open indefinitely.
+
+C<min_connections> is a floor that reaping respects, so a pool configured to
+keep connections will keep them however long they stay idle. Connections
+currently in use count towards that floor.
+
+Reaping is driven by a timer that exists only while there are connections old
+enough to be worth closing, so a pool resting at C<min_connections> does not
+hold the event loop open on its own.
+
 =head2 connection
 
     my $conn = await $pg->connection;
@@ -618,6 +718,19 @@ Get a connection from the pool. Returns a L<Async::DBD::Pg::Connection>.
 =head2 idle_count, active_count, waiting_count, total_count
 
 Pool statistics methods.
+
+=head2 is_healthy
+
+    $pg->is_healthy or warn "pool is saturated";
+
+True when a caller would be handed a connection straight away: one is sitting
+idle, or the pool is below C<max_connections> and can create another.
+
+Note what this does I<not> mean. A pool whose connections are all busy at
+C<max_connections> is working normally, but reports false, because the next
+caller has to queue. Read it as available capacity rather than as the health
+of the database. Wiring it directly to a load balancer's health check will
+take a busy service out of rotation.
 
 =head2 stats
 

@@ -64,19 +64,47 @@ Fixed together with item 47, which is the same change: the fields are now read f
 else runs on the handle, since the next statement resets them. Covered by
 t/integration/connection.t against a unique violation and a syntax error.
 
-### 4. `is_healthy` logic is always true
+### 4. `is_healthy` logic is always true — FIXED
 
 **File:** `Pg.pm:133`
 
 `waiting_count < max_connections` compares the number of waiters to the number of
 connections — these are unrelated quantities. The method is useless as a health check.
 
-### 5. `idle_timeout` is accepted but never implemented
+Fixed. `is_healthy` now reports whether a connection could be handed out without queuing:
+an idle connection exists, or the pool is below `max_connections`. It is O(1) over counts
+the pool already keeps, so there is no cost worth documenting.
+
+Two decisions worth recording. The intended definition was "not shut down and can serve
+without waiting", but there is no shutdown: no public teardown method exists,
+`_close_all_connections` is reached only from `DESTROY` and fork detection, and a pool can
+still create connections afterwards. Only the capacity half is implemented. A public
+shutdown method remains an open question.
+
+A saturated pool therefore reports false, which is deliberate. The POD says so, and warns
+against wiring it to a load balancer health check, where it would take a busy but healthy
+service out of rotation.
+
+### 5. `idle_timeout` is accepted but never implemented — FIXED
 
 **File:** `Pg.pm:59`
 
 The parameter is stored and documented but no timer or reaping logic exists. Idle
 connections are never reaped.
+
+Implemented rather than dropped. Idle eviction is standard in comparable pools and enabled
+by default in both: node-postgres `idleTimeoutMillis` defaults to 10 seconds, asyncpg
+`max_inactive_connection_lifetime` to 300, each disabled by passing 0. Our existing default
+of 300 already matched asyncpg, and the parameter was documented, so callers had reason to
+expect it to work.
+
+`min_connections` is a floor that reaping respects, following node-postgres, whose `min` is
+described as the number of clients the pool holds on to and does not destroy on idle
+timeout. Without that the reaper and `_ensure_min_connections` would fight each other.
+Connections in use count towards the floor.
+
+Reaping runs from a timer that only exists while there is something old enough to close, so
+a pool resting at `min_connections` does not hold the event loop open.
 
 ### 6. PubSub `connect` is not re-entrant
 
@@ -96,13 +124,33 @@ All subsequent LISTEN/UNLISTEN operations silently fail.
 
 ## Section 2: Resource Leaks & Data Integrity (must fix)
 
-### 8. Cursor `DESTROY` is a no-op
+### 8. Cursor `DESTROY` is a no-op — FIXED
 
 **File:** `Cursor.pm:102-110`
 
 If a cursor is garbage collected without `close()`, the server-side cursor stays open and
 the owning transaction is never committed. For long-lived pooled connections, this leaks
 server resources and holds transaction locks.
+
+Fixed, but not in `DESTROY`. Two facts decide the design: cursors are declared without
+`WITH HOLD`, so PostgreSQL drops them when their transaction ends, and asyncpg's pool takes
+the same approach, resetting a connection on release with cursors explicitly among the
+resources reset.
+
+So the cleanup belongs to the connection, not the cursor. Releasing a connection now always
+ends an open transaction, which reclaims the cursor with it. No blocking call and no attempt
+to `await` in `DESTROY`, which cannot.
+
+`DESTROY` warns when a cursor is discarded unclosed, so the mistake is visible while
+developing rather than silently costing server resources until release.
+
+**This uncovered a worse defect that was not in this document.** The `ROLLBACK` in
+`_return_connection` sat inside the `if (my $on_release = ...)` branch, so it only ran when
+an `on_release` callback happened to be configured. With the default of none, a connection
+holding an open transaction went straight back to the idle list and the next borrower
+inherited its locks. The reset is now unconditional. The synchronous fast path is kept for
+the common case of a connection with nothing to reset, so releasing an ordinary connection
+still returns it to the pool immediately.
 
 ### 9. Cursor SQL injection — FIXED
 
