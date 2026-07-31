@@ -328,10 +328,17 @@ well-structured Future::IO code.
 
 ## Section 4: CPAN Packaging (release blockers)
 
-### 58. No `Changes` file
+### 58. No `Changes` file — FIXED
 
 `[@Basic]` includes `[CheckChangesHasContent]` — `dzil release` will refuse to run
 without it. Required by CPAN convention.
+
+The stated mechanism is wrong: `[@Basic]` does not include `[CheckChangesHasContent]`, and
+`dzil build` completed without a Changes file. It was a convention gap, not a hard blocker.
+
+Added anyway, since CPAN readers expect one. `[NextRelease]` fills in the version and date
+from `{{$NEXT}}` at release time, so the entry cannot go stale the way a hand written date
+does.
 
 ### 22. `dist.ini` MetaResources point to old repo
 
@@ -349,16 +356,36 @@ nonexistent repo.
 
 Line 1: `/Future-IO-Pg-*`. Built tarballs from `dzil build` won't be ignored.
 
-### 25. `docker-compose.yml` will ship in the tarball
+### 25. `docker-compose.yml` will ship in the tarball — FIXED
 
 `[@Basic]`'s `[GatherDir]` includes everything not pruned. Need a `[PruneFiles]` rule or
 similar. Same concern for `CONTRIBUTORS.md` if that should be dev-only.
 
-### 26. No `$VERSION` in submodules
+Confirmed by building: `CLAUDE.md`, `CONTRIBUTORS.md`, `docker-compose.yml` and everything
+under `docs/` were all in the tarball.
+
+`[PruneFiles]` now drops `CLAUDE.md`, which is agent instructions of no use to anyone
+installing the module, and `docs/`, which is internal gap analysis and spike notes rather
+than user documentation.
+
+`docker-compose.yml` and `CONTRIBUTORS.md` are kept deliberately. The README tells readers
+to bring PostgreSQL up with it to run the integration suite, so pruning it would leave that
+instruction pointing at a file that is not there, and CONTRIBUTORS.md credits people.
+
+### 26. No `$VERSION` in submodules — FIXED
 
 Only `Async::DBD::Pg` declares `$VERSION`. All other modules (`Connection`, `Results`,
 `Error`, `Util`, `PubSub`, `Cursor`) have none. `perl -MAsync::DBD::Pg::Connection -e
 'print $VERSION'` returns nothing.
+
+Fixed with `[PkgVersion]`, which stamps `$VERSION` into every package at build time, rather
+than by repeating the version in seven files where they would drift apart. The hand written
+declaration in the main module was removed so there is a single source of truth in
+`dist.ini`. Every package in the built distribution now carries the version, including the
+four error subclasses that share Error.pm.
+
+The trade is that `$VERSION` is absent when running straight from a git checkout, which is
+normal for a Dist::Zilla distribution and is noted where the declaration used to be.
 
 ### 27. Stale SEE ALSO link
 
@@ -366,7 +393,7 @@ Only `Async::DBD::Pg` declares `$VERSION`. All other modules (`Connection`, `Res
 
 References `L<IO::Async::DBD::Pg>` which doesn't exist.
 
-### 28. `copyright_year = 2025` in `dist.ini`
+### 28. `copyright_year = 2025` in `dist.ini` — FIXED
 
 Should be 2026.
 

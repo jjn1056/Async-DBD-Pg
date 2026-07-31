@@ -17,7 +17,8 @@ use IO::Socket;
 use POSIX qw(dup);
 use Scalar::Util qw(weaken);
 
-our $VERSION = '0.001001';
+# $VERSION is stamped into each package at build time by Dist::Zilla, so it
+# is absent when running straight from a git checkout.
 
 sub _version_gte {
     my ($got, $want) = @_;
