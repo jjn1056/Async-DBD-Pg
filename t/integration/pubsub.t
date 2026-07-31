@@ -2,6 +2,7 @@ use strict;
 use warnings;
 use Test2::V0;
 use Time::HiRes qw(time);
+use DBI;
 
 use lib 't/lib';
 use Test::Async::DBD::Pg qw(skip_without_postgres test_dsn);
@@ -13,6 +14,7 @@ use Future::IO;
 BEGIN { Future::IO->load_best_impl; }
 
 use Async::DBD::Pg;
+use Async::DBD::Pg::Util ();
 
 sub wait_until {
     my ($code, $label, $timeout) = @_;
@@ -26,6 +28,23 @@ sub wait_until {
     }
 
     return 0;
+}
+
+# Terminate every backend on the test database except this one. The listener
+# connection cannot be asked for its own pid: querying it while its loop is
+# polling the same socket makes both wait on POLLIN forever.
+sub kill_backends {
+    my $parsed = Async::DBD::Pg::Util::parse_dsn(test_dsn());
+    my $dbh = DBI->connect(
+        $parsed->{dbi_dsn}, $parsed->{user}, $parsed->{password},
+        { RaiseError => 1, PrintError => 0 },
+    );
+    $dbh->do(q{
+        SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+         WHERE datname = current_database() AND pid <> pg_backend_pid()
+    });
+    $dbh->disconnect;
+    return;
 }
 
 subtest 'create pubsub instance' => sub {
@@ -303,6 +322,29 @@ subtest 'invalid channel name' => sub {
     like $err, qr/Invalid channel name/, 'error for invalid channel';
 
     $pg->pubsub->disconnect->get;
+};
+
+subtest 'a dead listener reports itself disconnected' => sub {
+    my @logged;
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 4,
+        on_log          => sub { push @logged, $_[1] },
+    );
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('death_reporting', sub { })->get;
+    ok $pubsub->is_connected, 'connected before the backend dies';
+
+    kill_backends();
+
+    wait_until(sub { !$pubsub->is_connected }, 'listener noticed', 5);
+
+    ok !$pubsub->is_connected, 'reports disconnected once the listener fails';
+    is $pubsub->conn, undef, 'dead connection let go';
+    is $pubsub->subscribed_channels, 1, 'subscription registry kept for replay';
+    ok scalar(grep { /listener stopped/i } @logged), 'loss reported';
 };
 
 done_testing;

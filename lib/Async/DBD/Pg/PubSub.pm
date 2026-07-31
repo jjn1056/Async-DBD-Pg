@@ -228,7 +228,16 @@ async sub _start_listener {
         my ($err) = @_;
         my $self = $weak_self or return;
         return if $self->{_stopping};
+
         $self->_log(warn => "PubSub listener stopped: $err");
+
+        # The connection is gone. Say so rather than continuing to report a
+        # connection that cannot deliver anything, and hand it back so the
+        # pool discards it instead of holding it checked out to nobody.
+        $self->{connected} = 0;
+        if (my $conn = delete $self->{conn}) {
+            $conn->release;
+        }
     });
 
     $self->{_listener_future} = $listener;
