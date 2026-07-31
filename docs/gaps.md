@@ -4,6 +4,10 @@ End-to-end review of the codebase against the goal: a CPAN-ready, production-rel
 async PostgreSQL client. Early release (0.001001) where "things might change to fix bugs"
 is acceptable, but the core must be correct and safe since this is database infrastructure.
 
+Two items previously shared a number with an earlier item. They were given the next free
+numbers (58, 59) rather than renumbering the document, so existing references to an item
+number stay valid. Numbering is therefore unique but not in document order.
+
 ---
 
 ## Section 1: Correctness Bugs (must fix)
@@ -103,12 +107,19 @@ dead future and never released — permanent pool shrinkage.
 When `pg_result` fails, the sth from `prepare`/`execute` is never `finish`-ed. Under load,
 these accumulate.
 
-### 13. `_complete_async_connect` fd leak on error
+### 13. `_complete_async_connect` fd leak on error — FIXED
 
 **File:** `Pg.pm:~277-367`
 
 When async connect fails mid-handshake, the duped socket fd is not closed on all error
 paths.
+
+Fixed. The handshake now holds its socket wrappers in a lexical that closes them on every
+exit path, including the error paths. This came out of fixing a separate defect in the same
+routine: the handshake captured `pg_socket` once and polled it for the whole exchange, but
+libpq may close the socket and connect again part way through (GSSAPI or SSL offered and
+declined), so acquiring a pooled connection blocked forever. The replacement socket reuses
+the descriptor number, which is why the stale handle looked unchanged.
 
 ### 14. `DESTROY` calls `release` which calls `ping`
 
@@ -186,7 +197,7 @@ well-structured Future::IO code.
 
 ## Section 4: CPAN Packaging (release blockers)
 
-### 21. No `Changes` file
+### 58. No `Changes` file
 
 `[@Basic]` includes `[CheckChangesHasContent]` — `dzil release` will refuse to run
 without it. Required by CPAN convention.
@@ -330,30 +341,44 @@ Cross-language analysis of asyncpg (Python), pgx (Go), tokio-postgres (Rust),
 node-postgres (Node.js), Npgsql (.NET), and Perl's Mojo::Pg / AnyEvent::Pg identified
 these as table-stakes features we're missing.
 
-### 46. COPY protocol support
+### 46. COPY protocol support — DEFERRED to 0.002
 
 Every mature async PG library has COPY support built-in or via companion package. It's the
 standard mechanism for bulk data loading/export — dramatically faster than multi-row INSERT.
 
-**COPY TO (reading out):** Fully async via DBD::Pg's `pg_getcopydata_async`. This is
-non-blocking and maps directly to our Future::IO poll pattern. Should be straightforward.
+Deliberately out of scope for 0.001001. No COPY code exists in the distribution today, so
+this is a scoping decision rather than a removal.
 
-**COPY FROM (writing in):** DBD::Pg's `pg_putcopydata` is fundamentally blocking — DBD::Pg
-never calls `PQsetnonblocking()`, does not expose `PQflush()`, and has no
-`pg_putcopydata_async`. The C implementation blocks in `PQputCopyData` when the TCP send
-buffer fills.
+**COPY TO (reading out):** Not blocked. `pg_getcopydata_async` ships in DBD::Pg 3.20.2 and
+maps directly onto our `Future::IO->poll` pattern.
 
-**Plan:** Implement as "mostly async" for the initial release — issue the COPY command
-asynchronously, accept that `pg_putcopydata` calls block per-chunk, send data in small
-chunks to minimize blocking time. Document the write-side blocking caveat clearly. For most
-real-world usage (CSV loading, ETL), individual putcopydata calls are fast (just buffering
-into libpq) and only block when the TCP buffer fills.
+**COPY FROM (writing in):** Blocked on DBD::Pg 3.21.0, which is merged upstream but not yet
+released to CPAN. See Section 10.
 
-**Upstream:** True non-blocking COPY FROM would require DBD::Pg changes: expose
-`PQsetnonblocking()`, expose `PQflush()`, add `pg_putcopydata_async` returning 0 on
-buffer-full. See Section 10 (DBD::Pg upstream spike) for details.
+**The earlier "mostly async" plan is withdrawn.** It proposed issuing the COPY command
+asynchronously while accepting that each `pg_putcopydata` call blocks, chunking writes to
+keep the stalls short, and documenting the caveat. That was the right call when no upstream
+fix existed. It no longer is: real non-blocking support is merged, so building the
+compromise would mean shipping a knowingly-blocking call inside a library whose whole
+premise is that it never blocks the reactor, then deleting that code and retracting the
+caveat one release later.
+
+**Why both halves wait.** COPY TO could be built today, but shipping export without import
+is a confusing public interface — callers expect the pair. Ship both, properly non-blocking,
+once 3.21.0 is on CPAN.
+
+With 3.21.0 the write side becomes a genuine non-blocking loop that maps onto
+`Future::IO->poll($sock, POLLOUT)`:
+
+- `pg_putcopydata_async` — 1 queued (then call `pg_flush`), 0 buffer full (wait for
+  write-ready, retry the same call)
+- `pg_flush` — 1 data still pending (wait for write-ready, call again), 0 flushed
+- `pg_putcopyend_async` — 0 retry, 1 done and the connection returns to blocking mode
 
 ### 47. Rich error diagnostics from `pg_error_field`
+
+**Not blocked on anything.** `pg_error_field` has shipped in DBD::Pg since well before
+3.20.2, so this is actionable against the current CPAN release.
 
 We have the `Error::Query` class with fields for `detail`, `hint`, `constraint`,
 `position` — but `_throw_query_error` never populates them. DBD::Pg exposes
@@ -414,6 +439,8 @@ At minimum, support:
 
 ### 52. No `pg_placeholder_dollaronly` support
 
+**Not blocked on anything.** Available in DBD::Pg 3.20.2 on CPAN.
+
 Needed for JSONB operators (`?`, `?|`, `?&`) and geometric operators (`?#`, `?-|`). Without
 this, any query using JSONB containment checks will break because `?` is treated as a
 placeholder. JSONB is extremely common in modern PostgreSQL usage.
@@ -430,6 +457,8 @@ execute it many times with different parameters. This is a significant performan
 hot loops (e.g., inserting 10,000 rows with the same statement structure).
 
 ### 55. No `pg_skip_deallocate` support
+
+**Not blocked on anything.** Available in DBD::Pg 3.20.2 on CPAN.
 
 Needed for PgBouncer compatibility. Without this, using the library behind PgBouncer (which
 many production deployments use for external connection pooling) will fail with prepared
@@ -464,7 +493,7 @@ a common misconfiguration.
 
 ## Section 9: Nice to Have (future consideration)
 
-### 56. JSON/JSONB column auto-expansion
+### 59. JSON/JSONB column auto-expansion
 
 Mojo::Pg's `expand()` auto-decodes JSON/JSONB columns to Perl hashrefs/arrayrefs on read,
 which is genuinely convenient. Questions to resolve before implementing:
@@ -478,12 +507,18 @@ Low priority for initial release but high user-experience value.
 
 ---
 
-## Section 10: DBD::Pg Upstream Spike (COPY FROM async support)
+## Section 10: DBD::Pg Upstream Spike (COPY FROM async support) — RESOLVED UPSTREAM
 
-For true non-blocking COPY FROM STDIN, DBD::Pg would need:
+This spike identified four changes DBD::Pg needed for true non-blocking COPY FROM STDIN.
+All four have been implemented and merged into `bucardo/dbdpg` master as commit `8d729c0`
+("Add non-blocking async COPY FROM support", pull request #176, Github issue #177), by John
+Napiorkowski and Ed Sabol. The spike's premise no longer holds: DBD::Pg does now call
+`PQsetnonblocking()`, and the write-side primitives are surfaced to Perl.
 
-1. **Expose `PQsetnonblocking()`** — or call it internally when entering COPY mode. Currently
-   DBD::Pg never calls this; the connection is always in blocking mode.
+The original findings, for the record:
+
+1. **Expose `PQsetnonblocking()`** — or call it internally when entering COPY mode. DBD::Pg
+   never called this; the connection was always in blocking mode.
 
 2. **Expose `PQflush()`** — needed for the non-blocking write loop. When `PQputCopyData`
    returns 0 (buffer full), the caller must: call `PQflush()`, if it returns 1 wait for
@@ -491,12 +526,24 @@ For true non-blocking COPY FROM STDIN, DBD::Pg would need:
    deadlock from server NOTICEs), then retry.
 
 3. **Add `pg_putcopydata_async`** — or modify `pg_putcopydata` to honor non-blocking mode
-   and return 0 on buffer-full instead of blocking. Currently `dbdimp.c:4537` has a
-   `copystatus == 0` branch that is dead code with a comment `/* non-blocking mode only */`.
+   and return 0 on buffer-full instead of blocking. `dbdimp.c:4537` had a `copystatus == 0`
+   branch that was dead code with a comment `/* non-blocking mode only */`.
 
 4. **Possibly expose `PQconsumeInput()`** — for the write-side flush loop. Already used
    internally for `pg_getcopydata_async`.
 
-The C changes in `dbdimp.c` appear contained: the non-blocking branches already exist as
-dead code, they just need `PQsetnonblocking()` to be called and the return values to be
-surfaced to Perl. A patch to DBD::Pg is feasible but out of scope for our initial release.
+The assessment that the C changes were contained proved correct: the dead non-blocking
+branches needed `PQsetnonblocking()` to be called and their return values surfaced.
+
+**What this means for us.** The delivered API is `pg_putcopydata_async`,
+`pg_putcopyend_async` and `pg_flush` (see item 46 for the call contract). It is slated for
+DBD::Pg **3.21.0, which is not yet on CPAN** — the current release is 3.20.2 (May 1, 2026).
+So COPY FROM is gated on someone else's release schedule, which is why item 46 defers COPY
+rather than blocking our own release on it. When 3.21.0 ships, gate COPY behind a runtime
+version check, the same way async connect is already gated on DBD::Pg 3.19.0.
+
+Nothing else we want is gated: `pg_error_field` (47), `pg_placeholder_dollaronly` (52),
+`pg_skip_deallocate` (55) and `pg_getcopydata_async` are all in 3.20.2 today.
+
+Also unmerged upstream and worth watching, though speculative: the `pipeline-mode`,
+`single-row-mode` and `native-bools` branches on `bucardo/dbdpg`.
