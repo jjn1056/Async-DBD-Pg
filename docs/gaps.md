@@ -340,7 +340,7 @@ Added anyway, since CPAN readers expect one. `[NextRelease]` fills in the versio
 from `{{$NEXT}}` at release time, so the entry cannot go stale the way a hand written date
 does.
 
-### 22. `dist.ini` MetaResources point to old repo
+### 22. `dist.ini` MetaResources point to old repo — ALREADY FIXED
 
 **File:** `dist.ini:13-17`
 
@@ -358,7 +358,7 @@ out of step, and now state Artistic 2.0 with a copyright line and a pointer to t
 file. Verified against a built distribution: metadata reports `artistic_2`, LICENSE carries
 the Artistic 2.0 text, and no file claims the Perl terms any more.
 
-### 24. `.gitignore` has old package name
+### 24. `.gitignore` has old package name — ALREADY FIXED
 
 Line 1: `/Future-IO-Pg-*`. Built tarballs from `dzil build` won't be ignored.
 
@@ -393,7 +393,7 @@ four error subclasses that share Error.pm.
 The trade is that `$VERSION` is absent when running straight from a git checkout, which is
 normal for a Dist::Zilla distribution and is noted where the declaration used to be.
 
-### 27. Stale SEE ALSO link
+### 27. Stale SEE ALSO link — ALREADY FIXED
 
 **File:** `Pg.pm:608`
 
@@ -403,9 +403,13 @@ References `L<IO::Async::DBD::Pg>` which doesn't exist.
 
 Should be 2026.
 
-### 29. Inconsistent env var naming in examples
+### 29. Inconsistent env var naming in examples — FIXED
 
 `prove_async.pl` uses `TEST_PG_DSN`; all other examples use `DATABASE_URL`.
+
+Fixed. `prove_async.pl` reads `DATABASE_URL` like the other eight examples. `TEST_PG_DSN`
+stays what the test suite reads, so the two names now divide cleanly: examples take
+`DATABASE_URL`, tests take `TEST_PG_DSN`, as the README and CLAUDE.md describe.
 
 ---
 

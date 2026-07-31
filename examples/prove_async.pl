@@ -10,7 +10,7 @@ use Async::DBD::Pg;
 
 BEGIN { Future::IO->load_best_impl; }
 
-my $dsn = $ENV{TEST_PG_DSN} // 'postgresql://postgres:test@localhost:5432/test';
+my $dsn = $ENV{DATABASE_URL} // 'postgresql://postgres:test@localhost:5432/test';
 
 print "=" x 60, "\n";
 print "Proving Async::DBD::Pg is truly async\n";
