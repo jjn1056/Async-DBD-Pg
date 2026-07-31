@@ -142,8 +142,16 @@ sub DESTROY {
     # During global destruction, don't try to close
     return if ${^GLOBAL_PHASE} eq 'DESTRUCT';
 
-    # Note: Can't await in DESTROY, so cursor cleanup may be deferred
-    # Best practice is to explicitly call close()
+    return if $self->{closed};
+
+    # Closing needs to await, which DESTROY cannot do, so the cursor is left
+    # for the connection to clean up. It was declared without WITH HOLD, so
+    # the server drops it when the surrounding transaction ends, and the pool
+    # ends that transaction when the connection is released. Say so, because
+    # until then the cursor holds server resources and the transaction holds
+    # its locks.
+    warn "Cursor '$self->{name}' was discarded without close(); "
+       . "it stays open until its connection is released\n";
 }
 
 1;

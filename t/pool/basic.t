@@ -123,6 +123,51 @@ subtest 'on_connect callback' => sub {
     $conn->release;
 };
 
+subtest 'an abandoned cursor does not outlive its connection' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 1,
+    );
+
+    my $conn = $pg->connection->get;
+
+    my $cursor = $conn->cursor(
+        'SELECT generate_series(1, 100) AS n',
+        { batch_size => 10, name => 'leak_cursor' }
+    )->get;
+    $cursor->next->get;
+
+    my $open = $conn->query(
+        "SELECT count(*) AS n FROM pg_cursors WHERE name = 'leak_cursor'"
+    )->get;
+    is $open->first->{n}, 1, 'cursor is open on the server';
+
+    # Drop the cursor without closing it. The connection is left holding an
+    # open transaction, and the cursor lives until that transaction ends.
+    my @warnings;
+    {
+        local $SIG{__WARN__} = sub { push @warnings, join '', @_ };
+        undef $cursor;
+    }
+    like \@warnings, array { item match qr/cursor/i; etc },
+        'abandoning an unclosed cursor is reported';
+
+    $conn->release;
+    Future::IO->sleep(0.2)->get;    # let the asynchronous reset finish
+
+    my $again = $pg->connection->get;
+    my $after = $again->query(
+        "SELECT count(*) AS n FROM pg_cursors WHERE name = 'leak_cursor'"
+    )->get;
+    # A cursor declared without WITH HOLD only lives as long as the
+    # transaction that declared it, so its disappearance is also proof that
+    # the transaction was ended rather than handed on to the next borrower.
+    is $after->first->{n}, 0, 'cursor reclaimed when the connection was reset';
+
+    $again->release;
+};
+
 subtest 'safe_dsn masks password' => sub {
     my $pg = Async::DBD::Pg->new(
         dsn             => 'postgresql://user:secret@localhost/db',
