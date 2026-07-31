@@ -76,10 +76,12 @@ an idle connection exists, or the pool is below `max_connections`. It is O(1) ov
 the pool already keeps, so there is no cost worth documenting.
 
 Two decisions worth recording. The intended definition was "not shut down and can serve
-without waiting", but there is no shutdown: no public teardown method exists,
-`_close_all_connections` is reached only from `DESTROY` and fork detection, and a pool can
-still create connections afterwards. Only the capacity half is implemented. A public
-shutdown method remains an open question.
+without waiting", but at the time there was no shutdown: no public teardown method existed,
+`_close_all_connections` was reached only from `DESTROY` and fork detection, and a pool
+could still create connections afterwards, so only the capacity half was implemented.
+
+That open question has since been answered by item 60, and `is_healthy` now reports false
+for a pool that is shutting down as well.
 
 A saturated pool therefore reports false, which is deliberate. The POD says so, and warns
 against wiring it to a load balancer health check, where it would take a busy but healthy
@@ -731,3 +733,42 @@ Nothing else we want is gated: `pg_error_field` (47), `pg_placeholder_dollaronly
 
 Also unmerged upstream and worth watching, though speculative: the `pipeline-mode`,
 `single-row-mode` and `native-bools` branches on `bucardo/dbdpg`.
+
+
+---
+
+## Section 11: Pool Shutdown
+
+### 60. No way to close the pool — FIXED
+
+There was no public teardown. `_close_all_connections` was private and reached only from
+`DESTROY` and fork detection, so an application had no way to say it was finished with a
+pool. Three things followed from that:
+
+- The pub/sub listener holds a connection for as long as it is subscribed, and the only way
+  to get it back was to still be holding the pub/sub object and call `disconnect` on it.
+- The idle reaper timer could keep the event loop alive for up to `idle_timeout` at exit.
+- There was no way to drain before a deploy: stop accepting work, let queries in flight
+  finish, then close.
+
+Relying on `DESTROY` is not a substitute in async code, where a future holding a connection
+keeps the pool alive and destruction order at exit is not something to depend on.
+
+**Modelled on the two pools that solved this already.** node-postgres `end()` waits for
+checked out clients to come back, then closes the clients and the pool timers, and refuses
+`connect()` afterwards. asyncpg pairs a graceful `close()`, which waits for every connection
+to be released, with `terminate()`, which does not wait at all.
+
+`shutdown` takes both: it drains by default, `force => 1` does not wait. asyncpg's own
+documentation recommends wrapping `close()` in a timeout because it can hang, so `timeout`
+is offered directly rather than left as something each caller has to remember.
+
+Queued callers are failed rather than left waiting, since no connection is coming. This is a
+deliberate difference from node-postgres, whose `_pulseQueue` returns early once the pool is
+ending, leaving anything already queued unserved.
+
+**This uncovered a leak in the existing teardown.** `PubSub::_pool_shutdown` set
+`conn = undef` without releasing the connection. The pool keeps its own reference in the
+active list, so dropping that one left the connection checked out to nobody: it was never
+closed, never reused, and a drain would have waited on it forever. It is released properly
+now.
