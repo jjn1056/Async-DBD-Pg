@@ -10,7 +10,7 @@ Async::DBD::Pg is an event-loop agnostic async PostgreSQL client for Perl, built
 
 All Perl commands must use perlbrew (see global CLAUDE.md for setup). Prefix commands with:
 ```bash
-source ~/perl5/perlbrew/etc/bashrc && perlbrew use perl-5.40.0@default
+source ~/perl5/perlbrew/etc/bashrc && perlbrew use perl-5.42.2@default
 ```
 
 ### Testing

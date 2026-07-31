@@ -284,12 +284,22 @@ who discovers it on first query.
 If the listener connection drops (network, server restart), `_listener_loop` either errors
 or spins on EOF. All subscriptions are lost silently. No callback or event to detect this.
 
-### 18. No `_wait_for_result` upper bound
+### 18. No `_wait_for_result` upper bound — EVALUATED, NO CHANGE
 
 **File:** `Connection.pm:182-190`
 
 Without a per-query timeout and without a session `statement_timeout`, the poll loop runs
 forever on a hung server.
+
+Tested by terminating the backend with `pg_terminate_backend` while a query was in flight.
+There is no busy loop: `pg_ready` goes true on end of file, `pg_result` fails, and the query
+fails with the server's own message. The pool then discards the connection when it is
+released, because the liveness check fails.
+
+The remaining behaviour is a client waiting indefinitely for a server that never answers,
+which is what any client does without a timeout. Two opt-in bounds already exist: the
+`timeout` option on a query, and `statement_timeout` on the pool. Imposing a default would
+mean guessing a number that suits every workload, so nothing changed here.
 
 ### 19. No waiter queue bound
 
