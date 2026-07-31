@@ -44,6 +44,27 @@ subtest 'create pubsub instance' => sub {
     $pubsub->disconnect->get;
 };
 
+subtest 'concurrent connect checks out a single connection' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 5,
+    );
+    my $pubsub = $pg->pubsub;
+
+    # connected is only set once a connection has been handed over, so two
+    # callers arriving together must still share one attempt. Otherwise each
+    # checks one out and only the last is kept; the rest are never released.
+    my @attempts = map { $pubsub->connect } 1 .. 3;
+    $_->get for @attempts;
+
+    ok $pubsub->is_connected, 'pub/sub connected';
+    is $pg->active_count, 1, 'exactly one connection checked out of the pool';
+
+    $pubsub->disconnect->get;
+    is $pg->active_count, 0, 'connection returned on disconnect';
+};
+
 subtest 'listen and receive notification' => sub {
     my $pg = Async::DBD::Pg->new(
         dsn             => test_dsn(),

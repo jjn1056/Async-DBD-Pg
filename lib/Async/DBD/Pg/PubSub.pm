@@ -54,7 +54,30 @@ async sub connect {
 
     return $self if $self->{connected} && $self->{conn} && $self->{conn}->dbh;
 
+    # connected is only true once a connection has been handed over, so
+    # callers arriving together would each check one out and all but the last
+    # would be dropped without ever being released. Share one attempt.
+    if (my $pending = $self->{_connecting}) {
+        await $pending;
+        return $self;
+    }
+
     my $pool = $self->{pool} or die "No pool configured";
+
+    my $attempt = $self->_establish($pool);
+    $self->{_connecting} = $attempt;
+
+    eval { await $attempt };
+    my $err = $@;
+
+    delete $self->{_connecting};
+    die $err if $err;
+
+    return $self;
+}
+
+async sub _establish {
+    my ($self, $pool) = @_;
 
     $self->{conn} = await $pool->connection;
     $self->{connected} = 1;
@@ -223,10 +246,17 @@ async sub _run_control_query {
 
     await $self->_stop_listener if $self->{_listener_future};
 
-    my $result = await $self->{conn}->query($sql, @bind);
+    # Stopping the listener set _stopping, and the listener loop refuses to
+    # run while it is set. Clearing it and restarting must happen even when
+    # the statement fails, or every later listen and unlisten quietly does
+    # nothing.
+    my $result = eval { await $self->{conn}->query($sql, @bind) };
+    my $err = $@;
 
     $self->{_stopping} = 0;
     await $self->_start_listener if $self->{connected};
+
+    die $err if $err;
 
     return $result;
 }

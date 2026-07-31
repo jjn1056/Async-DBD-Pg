@@ -2,6 +2,7 @@ use strict;
 use warnings;
 use Test2::V0;
 use Scalar::Util qw(refaddr);
+use Future;
 
 use Async::DBD::Pg;
 use Async::DBD::Pg::PubSub;
@@ -39,6 +40,59 @@ subtest 'pool returns cached pubsub instance' => sub {
 
     isa_ok $first, 'Async::DBD::Pg::PubSub';
     is refaddr($second), refaddr($first), 'cached pubsub reused';
+};
+
+{
+    package Test::Async::DBD::Pg::FlakyConn;
+
+    use Future;
+
+    sub new {
+        my ($class, %args) = @_;
+        return bless { fail_next => $args{fail_next} // 0, seen => [] }, $class;
+    }
+
+    sub dbh { 1 }
+
+    sub query {
+        my ($self, $sql, @bind) = @_;
+        push @{$self->{seen}}, $sql;
+
+        if ($self->{fail_next}) {
+            $self->{fail_next}--;
+            return Future->fail("control query failed\n");
+        }
+
+        return Future->done(1);
+    }
+
+    sub statements { shift->{seen} }
+}
+
+subtest 'a failed control query leaves pub/sub usable' => sub {
+    my $pubsub = Async::DBD::Pg::PubSub->new();
+
+    # Stand in for a live listener connection whose first statement fails.
+    # A listener future has to be present, because stopping it is what sets
+    # _stopping in the first place. connected stays false so the listener is
+    # not restarted here, which would need a real socket; restarting it is
+    # covered by t/integration/pubsub.t.
+    my $conn = Test::Async::DBD::Pg::FlakyConn->new(fail_next => 1);
+    $pubsub->{conn} = $conn;
+    $pubsub->{connected} = 0;
+    $pubsub->{_listener_future} = Future->done(1);
+
+    my $err = dies { $pubsub->_run_control_query('LISTEN failing')->get };
+    ok $err, 'the failing statement is reported to the caller';
+
+    # _stopping gates the listener loop. Left set, every later listen and
+    # unlisten silently does nothing.
+    is $pubsub->{_stopping}, 0, 'listener not left in the stopping state';
+
+    ok lives { $pubsub->_run_control_query('LISTEN working')->get },
+        'a later control query still runs';
+    like $conn->statements->[-1], qr/LISTEN working/,
+        'the later statement reached the connection';
 };
 
 done_testing;
