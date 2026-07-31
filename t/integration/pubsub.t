@@ -3,6 +3,7 @@ use warnings;
 use Test2::V0;
 use Time::HiRes qw(time);
 use DBI;
+use File::Temp qw(tempfile);
 
 use lib 't/lib';
 use Test::Async::DBD::Pg qw(skip_without_postgres test_dsn);
@@ -45,6 +46,38 @@ sub kill_backends {
     });
     $dbh->disconnect;
     return;
+}
+
+# pg_terminate_backend makes libpq print a "FATAL: terminating connection..."
+# notice straight to the process's real file descriptor 2. That bypasses
+# every layer this test could otherwise intercept (warn, $SIG{__WARN__}, a
+# scalar-backed STDERR), because none of those change what fd 2 points at.
+# Only a descriptor-level redirect sees it, so this closes and reopens
+# STDERR onto a real file for the duration of $code and hands back what
+# landed there, restoring STDERR on every path, including a die in $code.
+sub capture_stderr {
+    my ($code) = @_;
+
+    my ($fh, $path) = tempfile(UNLINK => 1);
+    close $fh;
+
+    open my $saved_stderr, '>&', \*STDERR or die "dup stderr: $!";
+    open STDERR, '>', $path or die "redirect stderr: $!";
+
+    my $ok = eval { $code->(); 1 };
+    my $err = $@;
+
+    open STDERR, '>&', $saved_stderr or die "restore stderr: $!";
+    close $saved_stderr;
+
+    die $err unless $ok;
+
+    open my $read_fh, '<', $path or die "read captured stderr: $!";
+    local $/;
+    my $captured = <$read_fh>;
+    close $read_fh;
+
+    return $captured;
 }
 
 subtest 'create pubsub instance' => sub {
@@ -337,14 +370,20 @@ subtest 'a dead listener reports itself disconnected' => sub {
     $pubsub->listen('death_reporting', sub { })->get;
     ok $pubsub->is_connected, 'connected before the backend dies';
 
-    kill_backends();
-
-    wait_until(sub { !$pubsub->is_connected }, 'listener noticed', 5);
+    # Killing the backend is expected to make libpq print a termination
+    # notice straight to stderr, bypassing our logging entirely. Captured
+    # and asserted below rather than left to leak into test output.
+    my $captured = capture_stderr(sub {
+        kill_backends();
+        wait_until(sub { !$pubsub->is_connected }, 'listener noticed', 5);
+    });
 
     ok !$pubsub->is_connected, 'reports disconnected once the listener fails';
     is $pubsub->conn, undef, 'dead connection let go';
     is $pubsub->subscribed_channels, 1, 'subscription registry kept for replay';
     ok scalar(grep { /listener stopped/i } @logged), 'loss reported';
+    like $captured, qr/FATAL:\s+terminating connection due to administrator command/,
+        'expected backend-termination notice captured on stderr';
 };
 
 done_testing;
