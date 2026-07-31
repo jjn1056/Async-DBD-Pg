@@ -487,13 +487,17 @@ async sub _complete_async_connect {
 
 # Return connection to pool (called by Connection::release)
 sub _return_connection {
-    my ($self, $conn) = @_;
+    my ($self, $conn, %opts) = @_;
+
+    # Callers that cannot afford a blocking round trip, such as DESTROY, ask
+    # for the liveness check to be skipped.
+    my $validate = exists $opts{validate} ? $opts{validate} : 1;
 
     # Remove from active list
     @{$self->{active}} = grep { $_ != $conn } @{$self->{active}};
 
     # Check if connection is still valid
-    if (!$conn->{dbh} || !$conn->{dbh}->ping) {
+    if (!$conn->{dbh} || ($validate && !$conn->{dbh}->ping)) {
         $self->_discard_connection($conn);
         return;
     }

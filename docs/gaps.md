@@ -231,12 +231,20 @@ libpq may close the socket and connect again part way through (GSSAPI or SSL off
 declined), so acquiring a pooled connection blocked forever. The replacement socket reuses
 the descriptor number, which is why the stale handle looked unchanged.
 
-### 14. `DESTROY` calls `release` which calls `ping`
+### 14. `DESTROY` calls `release` which calls `ping` — FIXED
 
 **Files:** `Connection.pm:333-341`, `Pg.pm:~377`
 
 `ping` is a blocking network call. Running it from `DESTROY` during event loop teardown can
 block the reactor or trigger re-entrant async code.
+
+Fixed. `release` takes a `validate` option and `DESTROY` passes it false, so destruction no
+longer makes a round trip. An explicit `release` still checks the connection before it is
+reused.
+
+This leans on item 16: a connection returned by `DESTROY` now reaches the idle list without
+having been checked at all, so if it died in the meantime the next borrower is the one to
+find out. Validating on checkout would close that off, and is the reason to do it.
 
 ### 15. `convert_placeholders` silently emits broken SQL — FIXED
 

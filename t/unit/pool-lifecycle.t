@@ -20,7 +20,13 @@ use Async::DBD::Pg::Connection;
     }
 
     # Connection::DESTROY releases back to the pool, which pings.
-    sub ping { 1 }
+    sub ping {
+        my ($self) = @_;
+        $self->{pings}++;
+        return 1;
+    }
+
+    sub pings { shift->{pings} // 0 }
 
     sub disconnects {
         my ($self) = @_;
@@ -112,6 +118,32 @@ sub add_idle {
 
     return $dbh;
 }
+
+subtest 'destroying a connection does not make a blocking round trip' => sub {
+    my $pg = make_pool();
+    my $dbh = Test::Async::DBD::Pg::FakeDBH->new;
+
+    {
+        my $conn = Async::DBD::Pg::Connection->new(dbh => $dbh, pool => $pg);
+    }
+
+    # ping is a network round trip. Running one from DESTROY can stall the
+    # reactor while the event loop is being torn down.
+    is $dbh->pings, 0, 'no ping issued while destroying the connection';
+    is $pg->idle_count, 1, 'connection still returned to the pool';
+    is $dbh->disconnects, 0, 'connection not closed';
+};
+
+subtest 'an explicit release still validates the connection' => sub {
+    my $pg = make_pool();
+    my $dbh = Test::Async::DBD::Pg::FakeDBH->new;
+
+    my $conn = Async::DBD::Pg::Connection->new(dbh => $dbh, pool => $pg);
+    $conn->release;
+
+    is $dbh->pings, 1, 'released connection checked before reuse';
+    is $pg->idle_count, 1, 'connection returned to the pool';
+};
 
 subtest 'is_healthy reports whether a connection can be served now' => sub {
     my $pg = make_pool(max_connections => 2);

@@ -352,12 +352,12 @@ sub _parse_cursor_args {
 
 # Release connection back to pool
 sub release {
-    my ($self) = @_;
+    my ($self, %opts) = @_;
     return if $self->{released};
     $self->{released} = 1;
 
     if (my $pool = $self->{pool}) {
-        $pool->_return_connection($self);
+        $pool->_return_connection($self, %opts);
     }
 }
 
@@ -373,7 +373,11 @@ sub DESTROY {
     my ($self) = @_;
     return if ${^GLOBAL_PHASE} eq 'DESTRUCT';
     if (!$self->{released} && $self->{pool}) {
-        $self->release;
+        # Returning to the pool normally checks the connection with a ping,
+        # which is a round trip to the server. Destruction can happen while
+        # the event loop is being torn down, where a blocking call may stall
+        # the reactor or re-enter async code, so the check is skipped here.
+        $self->release(validate => 0);
         return;
     }
     $self->_close_dbh;
