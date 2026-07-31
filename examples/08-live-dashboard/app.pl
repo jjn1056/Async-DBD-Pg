@@ -4,129 +4,179 @@ use warnings;
 
 use Future::AsyncAwait;
 use Future::IO;
+use Future::Selector;
 use JSON::PP;
 
 use Async::DBD::Pg;
 
 BEGIN { Future::IO->load_best_impl; }
 
+# A dashboard is several independent things running at the same time: each
+# metric reports on its own schedule, the display redraws on its own, and
+# notifications arrive whenever they arrive. Written as one loop these have to
+# take turns. Written as separate async subs composed with Future::Selector,
+# each simply runs at its own pace.
+
 my $dsn = $ENV{DATABASE_URL} // 'postgresql://postgres:test@localhost:5432/test';
 
 my $pg = Async::DBD::Pg->new(
     dsn             => $dsn,
     min_connections => 2,
-    max_connections => 5,
+    max_connections => 8,
 );
 
 my $json = JSON::PP->new->utf8;
-my %current_metrics;
-my $update_count = 0;
 
-sub setup_schema {
-    my $conn = $pg->connection->get;
-    $conn->query("SET client_min_messages TO warning")->get;
-    $conn->query('DROP TABLE IF EXISTS metrics')->get;
-    $conn->query(q{
+my %current;         # latest value per metric, kept by the LISTEN callback
+my $updates = 0;
+
+use constant RUN_FOR => 4;    # seconds
+
+# ----------------------------------------------------------------- schema
+
+async sub setup_schema {
+    my $conn = await $pg->connection;
+
+    await $conn->query('SET client_min_messages TO warning');
+    await $conn->query('DROP TABLE IF EXISTS metrics');
+    await $conn->query(q{
         CREATE TABLE metrics (
-            id SERIAL PRIMARY KEY,
-            name TEXT NOT NULL,
-            value NUMERIC NOT NULL,
+            id          SERIAL PRIMARY KEY,
+            name        TEXT NOT NULL,
+            value       NUMERIC NOT NULL,
             recorded_at TIMESTAMPTZ DEFAULT NOW()
         )
-    })->get;
+    });
+
     $conn->release;
 }
+
+# --------------------------------------------------------------- producing
 
 async sub record_metric {
     my ($name, $value) = @_;
 
     my $conn = await $pg->connection;
-
     await $conn->query(
-        'INSERT INTO metrics (name, value) VALUES ($1, $2)',
-        $name, $value,
+        'INSERT INTO metrics (name, value) VALUES ($1, $2)', $name, $value,
     );
-
     $conn->release;
 
-    await $pg->notify('metrics', $json->encode({ name => $name, value => $value }));
+    await $pg->notify(metrics => $json->encode({ name => $name, value => $value }));
 }
 
-sub display_dashboard {
-    print "\n", "=" x 50, "\n";
-    print "        LIVE DASHBOARD (update #$update_count)\n";
-    print "=" x 50, "\n\n";
+# Each metric is its own branch of the tree, reporting at its own interval.
+async sub report_metric {
+    my ($name, $interval, $until) = @_;
 
-    if (%current_metrics) {
-        for my $name (sort keys %current_metrics) {
-            my $value = $current_metrics{$name};
-            my $bar = "#" x int($value / 5);
-            printf "  %-15s %6.1f  %s\n", $name, $value, $bar;
-        }
-    }
-    else {
-        print "  Waiting for metrics...\n";
+    my $sent = 0;
+
+    until ($until->is_ready) {
+        await record_metric($name, 20 + rand 80);
+        $sent++;
+        await Future->wait_any($until->without_cancel, Future::IO->sleep($interval));
     }
 
-    print "\n", "-" x 50, "\n";
+    return "$name sent $sent";
 }
 
-eval {
-    setup_schema();
+# ----------------------------------------------------------------- display
 
-    print "Starting Live Dashboard Demo\n";
-    print "(Simulating 10 metric updates)\n\n";
+sub draw {
+    printf "\n== dashboard (%d updates) %s\n", $updates, '=' x 28;
 
-    $pg->listen('metrics', sub {
+    if (!%current) {
+        print "   waiting for metrics...\n";
+        return;
+    }
+
+    for my $name (sort keys %current) {
+        my $value = $current{$name};
+        printf "   %-14s %6.1f  %s\n", $name, $value, '#' x int($value / 5);
+    }
+}
+
+# The display is its own branch too, redrawing on a steady beat rather than
+# once per notification, so a burst of updates cannot cause a burst of redraws.
+async sub run_display {
+    my ($until) = @_;
+
+    until ($until->is_ready) {
+        draw();
+        await Future->wait_any($until->without_cancel, Future::IO->sleep(0.8));
+    }
+
+    return 'display';
+}
+
+# -------------------------------------------------------------------- main
+
+sub supervised {
+    my ($name, $f) = @_;
+
+    return $f->else(sub {
+        my ($err) = @_;
+        chomp $err;
+        warn "  !! $name failed: $err\n";
+        return Future->done;
+    });
+}
+
+(async sub {
+    await setup_schema();
+
+    await $pg->listen(metrics => sub {
         my ($channel, $payload) = @_;
         my $data = $json->decode($payload);
-        $current_metrics{$data->{name}} = $data->{value};
-        $update_count++;
-        display_dashboard();
-    })->get;
+        $current{ $data->{name} } = $data->{value};
+        $updates++;
+    });
 
-    print "Dashboard subscribed to 'metrics' channel.\n";
-    display_dashboard();
+    # Everything below runs until this future is ready.
+    my $until = Future::IO->sleep(RUN_FOR);
 
-    my @metric_names = qw(cpu_usage memory_pct requests_sec latency_ms disk_io);
+    my $selector = Future::Selector->new;
 
-    for my $i (1 .. 10) {
-        my $name = $metric_names[int(rand(@metric_names))];
-        my $value = 20 + rand(80);
+    $selector->add(data => 'display', f => supervised(display => run_display($until)));
 
-        record_metric($name, $value)->get;
-        Future::IO->sleep(0.25)->get;
+    my %metrics = (
+        cpu_usage    => 0.30,
+        memory_pct   => 0.55,
+        requests_sec => 0.20,
+        latency_ms   => 0.75,
+    );
+
+    for my $name (sort keys %metrics) {
+        $selector->add(
+            data => $name,
+            f    => supervised($name, report_metric($name, $metrics{$name}, $until)),
+        );
     }
 
-    print "\n=== Final Metrics Summary ===\n\n";
+    print "Reporting ", scalar(keys %metrics), " metrics for ", RUN_FOR, "s\n";
 
-    my $conn = $pg->connection->get;
-    my $result = $conn->query(q{
+    await $selector->run_until_ready($until);
+
+    draw();
+
+    print "\n== summary ", '=' x 38, "\n\n";
+
+    my $conn = await $pg->connection;
+    my $rows = await $conn->query(q{
         SELECT name, COUNT(*) AS updates, ROUND(AVG(value)::numeric, 1) AS avg_value
-        FROM metrics
-        GROUP BY name
-        ORDER BY name
-    })->get;
+          FROM metrics
+         GROUP BY name
+         ORDER BY name
+    });
 
-    printf "  %-15s %8s %10s\n", "Metric", "Updates", "Avg Value";
-    printf "  %-15s %8s %10s\n", "-" x 15, "-" x 8, "-" x 10;
-    for my $row (@{$result->rows}) {
-        printf "  %-15s %8d %10.1f\n", $row->{name}, $row->{updates}, $row->{avg_value};
-    }
+    printf "   %-14s %8s %10s\n", 'metric', 'updates', 'average';
+    printf "   %-14s %8d %10.1f\n", $_->{name}, $_->{updates}, $_->{avg_value}
+        for @{ $rows->rows };
 
-    $conn->query('DROP TABLE metrics')->get;
+    await $conn->query('DROP TABLE metrics');
     $conn->release;
 
-    $pg->unlisten_all->get;
-    $pg->pubsub->disconnect->get;
+    await $pg->shutdown;
+})->()->get;
 
-    print "\n=== How It Works ===\n\n";
-    print "1. Producer inserts metric data and sends NOTIFY\n";
-    print "2. Dashboard receives notification instantly\n";
-    print "3. Dashboard updates display in real time\n";
-};
-if (my $e = $@) {
-    die "Error: $e\n";
-}
-
-print "\nDone!\n";
+print "\nDone.\n";
