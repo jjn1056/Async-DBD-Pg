@@ -135,8 +135,79 @@ async sub notify {
     return await $self->pubsub->notify(@args);
 }
 
+# Close the pool. Idle connections go at once, connections still checked out
+# are waited for so their owners are not cut off mid-query, and anyone queued
+# is told rather than left waiting for a connection that is not coming.
+#
+# The shape follows node-postgres, whose end() waits for checked out clients
+# and then closes the clients and the pool timers, and asyncpg, which pairs a
+# graceful close() with an immediate terminate(). asyncpg's own documentation
+# recommends imposing a timeout on close, so that is offered here directly
+# rather than left to the caller.
+async sub shutdown {
+    my ($self, %opts) = @_;
+
+    return $self if $self->{_shut_down};
+
+    $self->{_shutting_down} = 1;
+    $self->_cancel_idle_reap;
+
+    my $shutting_down = sub {
+        Async::DBD::Pg::Error::PoolExhausted->new(
+            message   => 'Connection pool is shutting down',
+            pool_size => $self->{max_connections},
+        );
+    };
+
+    for my $waiter (splice @{$self->{waiting}}) {
+        next if $waiter->{future}->is_ready;
+        $waiter->{future}->fail($shutting_down->());
+    }
+
+    # The listener holds a connection for as long as it is subscribed, so it
+    # has to give it back before the pool can drain.
+    $self->_shutdown_pubsub;
+
+    $_->_close_dbh for splice @{$self->{idle}};
+
+    if (!$opts{force} && $self->active_count) {
+        my $drained = $self->{_drained} = Future->new;
+
+        if (my $timeout = $opts{timeout}) {
+            my $timer = Future::IO->sleep($timeout);
+            await Future->wait_any($drained, $timer);
+            $timer->cancel unless $timer->is_ready;
+        }
+        else {
+            await $drained;
+        }
+    }
+
+    # Whatever is still checked out is closed, whether it came back or not.
+    $_->_close_dbh for splice @{$self->{active}};
+
+    delete $self->{_drained};
+    $self->{_shut_down} = 1;
+
+    return $self;
+}
+
+sub is_shut_down { shift->{_shut_down} ? 1 : 0 }
+
+# Signal a drain once nothing is checked out any more.
+sub _check_drained {
+    my ($self) = @_;
+
+    my $drained = $self->{_drained} or return;
+    return if $self->active_count;
+
+    $drained->done unless $drained->is_ready;
+}
+
 sub is_healthy {
     my ($self) = @_;
+
+    return 0 if $self->{_shutting_down};
 
     # True when a caller would be handed a connection straight away: one is
     # sitting idle, or there is room to create another. A pool whose
@@ -252,6 +323,11 @@ sub _close_all_connections {
 # Get a connection from the pool
 async sub connection {
     my ($self) = @_;
+
+    die Async::DBD::Pg::Error::PoolExhausted->new(
+        message   => 'Connection pool has been shut down',
+        pool_size => $self->{max_connections},
+    ) if $self->{_shutting_down};
 
     $self->_check_fork;
 
@@ -493,6 +569,16 @@ sub _return_connection {
     # Callers that cannot afford a blocking round trip, such as DESTROY, ask
     # for the liveness check to be skipped.
     my $validate = exists $opts{validate} ? $opts{validate} : 1;
+
+    # A connection coming back during shutdown is closed rather than kept,
+    # and may be the one the drain is waiting for.
+    if ($self->{_shutting_down}) {
+        @{$self->{active}} = grep { $_ != $conn } @{$self->{active}};
+        $conn->_close_dbh;
+        $self->{stats}{discarded}++;
+        $self->_check_drained;
+        return;
+    }
 
     # Remove from active list
     @{$self->{active}} = grep { $_ != $conn } @{$self->{active}};
@@ -828,6 +914,50 @@ Get a connection from the pool. Returns a L<Async::DBD::Pg::Connection>.
 =head2 idle_count, active_count, waiting_count, total_count
 
 Pool statistics methods.
+
+=head2 shutdown
+
+    await $pg->shutdown;
+    await $pg->shutdown(timeout => 30);
+    await $pg->shutdown(force => 1);
+
+Closes the pool. Connections sitting idle are closed at once, anyone queued
+for a connection is failed with
+L<Async::DBD::Pg::Error/Async::DBD::Pg::Error::PoolExhausted> rather than left
+waiting for one that is not coming, the idle reaper is stopped, and the
+pub/sub listener gives back the connection it was holding.
+
+Connections still checked out are waited for, so their owners are not cut off
+part way through a query. Once they are released they are closed rather than
+returned to the pool.
+
+Asking for a connection after this fails. Calling it more than once is
+harmless.
+
+=over 4
+
+=item timeout
+
+Seconds to wait for connections still in use before closing them anyway.
+Without it the wait is indefinite, which is only safe if every connection is
+certain to be released.
+
+=item force
+
+Close everything immediately, without waiting for connections in use. Their
+owners will find the connection closed underneath them, so this is for
+shutting down in a hurry rather than in an orderly way.
+
+=back
+
+Nothing obliges you to call this. A pool that simply goes out of scope closes
+its connections too. It matters when the timing has to be yours: draining
+before a deploy, releasing the listener connection deterministically, or
+letting a process exit promptly rather than waiting on an idle timer.
+
+=head2 is_shut_down
+
+True once L</shutdown> has completed.
 
 =head2 is_healthy
 

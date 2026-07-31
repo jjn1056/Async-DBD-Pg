@@ -289,7 +289,13 @@ sub _pool_shutdown {
         $listener->cancel unless $listener->is_ready;
     }
 
-    $self->{conn} = undef;
+    # Hand the connection back rather than just forgetting it. The pool holds
+    # its own reference in the active list, so dropping this one leaves the
+    # connection checked out to nobody and a drain waiting for it forever.
+    if (my $conn = delete $self->{conn}) {
+        $conn->release;
+    }
+
     $self->{channels} = {};
     $self->{connected} = 0;
 }
