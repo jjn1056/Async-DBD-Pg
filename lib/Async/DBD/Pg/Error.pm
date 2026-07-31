@@ -61,6 +61,11 @@ sub constraint { shift->{constraint} }
 sub detail     { shift->{detail} }
 sub hint       { shift->{hint} }
 sub position   { shift->{position} }
+sub severity   { shift->{severity} }
+sub schema     { shift->{schema} }
+sub table      { shift->{table} }
+sub column     { shift->{column} }
+sub context    { shift->{context} }
 
 sub state {
     my $self = shift;
@@ -112,6 +117,93 @@ Async::DBD::Pg::Error - Error classes for Async::DBD::Pg
 =head1 DESCRIPTION
 
 This module provides a hierarchy of error classes for Async::DBD::Pg.
+
+All errors stringify to their message and are always true in boolean context,
+so C<if (my $err = $@) { warn $err }> behaves as expected.
+
+=head1 METHODS
+
+=head2 message
+
+The error message.
+
+=head1 SUBCLASSES
+
+=head2 Async::DBD::Pg::Error::Query
+
+Raised when a statement fails. Its accessors are populated from the
+diagnostics PostgreSQL returned with the error, so most are only defined when
+they apply to that particular error.
+
+=head3 code
+
+The five character SQLSTATE, for example C<23505>.
+
+=head3 state
+
+The SQLSTATE mapped to a readable name, for example C<unique_violation>.
+Returns C<unknown> for codes this module does not name.
+
+=head3 severity
+
+The severity reported by the server, normally C<ERROR>.
+
+=head3 detail
+
+The server's secondary explanation, for example which key already exists.
+
+=head3 hint
+
+The server's suggestion for resolving the error, when it offers one.
+
+=head3 constraint
+
+Name of the constraint that was violated.
+
+=head3 schema
+
+Schema containing the object the error refers to.
+
+=head3 table
+
+Table the error refers to.
+
+=head3 column
+
+Column the error refers to.
+
+=head3 position
+
+Character offset into the statement at which the error was found, counting
+from one. Reported for syntax errors.
+
+=head3 context
+
+The server's call stack context, for errors raised inside PL/pgSQL.
+
+=head2 Async::DBD::Pg::Error::Connection
+
+Raised when a connection cannot be established.
+
+=head3 dsn
+
+The DSN that was used, with the password masked.
+
+=head2 Async::DBD::Pg::Error::PoolExhausted
+
+Raised when no connection became available before C<queue_timeout> elapsed.
+
+=head3 pool_size
+
+The pool's C<max_connections> at the time of the failure.
+
+=head2 Async::DBD::Pg::Error::Timeout
+
+Raised when a query exceeds its C<timeout>.
+
+=head3 timeout
+
+The timeout, in seconds, that was exceeded.
 
 =head1 AUTHOR
 

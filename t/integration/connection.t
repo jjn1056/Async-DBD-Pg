@@ -100,6 +100,50 @@ subtest 'query error' => sub {
     $conn->_close_dbh;
 };
 
+subtest 'query errors carry PostgreSQL diagnostics' => sub {
+    my $conn = make_connection();
+
+    $conn->query(
+        'CREATE TEMP TABLE diag (
+            id    int primary key,
+            email text CONSTRAINT diag_email_unique UNIQUE
+         )'
+    )->get;
+    $conn->query("INSERT INTO diag VALUES (1, 'a\@example.com')")->get;
+
+    my $err = dies {
+        $conn->query("INSERT INTO diag VALUES (2, 'a\@example.com')")->get
+    };
+
+    isa_ok $err, 'Async::DBD::Pg::Error::Query';
+    is $err->code, '23505', 'SQLSTATE recorded';
+    is $err->state, 'unique_violation', 'SQLSTATE mapped to a state name';
+    is $err->constraint, 'diag_email_unique', 'violated constraint named';
+    like $err->detail, qr/already exists/i, 'detail carries the server explanation';
+    is $err->table, 'diag', 'offending table named';
+    ok defined $err->schema, 'schema populated';
+    like $err->severity, qr/^ERROR$/i, 'severity populated';
+
+    # detail previously came from pg_errorlevel, which is the verbosity
+    # setting rather than any error text.
+    unlike $err->detail, qr/^\d+$/, 'detail is not the verbosity setting';
+
+    $conn->_close_dbh;
+};
+
+subtest 'syntax errors report their position' => sub {
+    my $conn = make_connection();
+
+    my $err = dies { $conn->query('SELECT * FROM WHERE')->get };
+
+    isa_ok $err, 'Async::DBD::Pg::Error::Query';
+    is $err->code, '42601', 'syntax error SQLSTATE';
+    ok defined $err->position, 'statement position populated';
+    ok $err->position > 0, 'position points into the statement';
+
+    $conn->_close_dbh;
+};
+
 subtest 'query count increments' => sub {
     my $conn = make_connection();
 

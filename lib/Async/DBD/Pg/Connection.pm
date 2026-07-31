@@ -383,15 +383,31 @@ sub _throw_query_error {
     my ($self, $err, $sql) = @_;
 
     my $dbh = $self->{dbh};
-    my $state = eval { $dbh->state } // '';
+
+    # pg_error_field describes the most recent error and is reset by the next
+    # statement sent on this handle, so every field is collected here before
+    # anything else runs. Previously detail was read from pg_errorlevel, which
+    # is the verbosity setting rather than any part of the error.
+    my %diag;
+    for my $field (qw(severity detail hint constraint schema table column context)) {
+        $diag{$field} = eval { $dbh->pg_error_field($field) };
+    }
+
+    my $position = eval { $dbh->pg_error_field('statement_position') };
+    my $state    = eval { $dbh->pg_error_field('state') } || eval { $dbh->state } || '';
 
     die Async::DBD::Pg::Error::Query->new(
         message    => $err,
         code       => $state,
-        detail     => eval { $dbh->pg_errorlevel } // undef,
-        constraint => undef,
-        hint       => undef,
-        position   => undef,
+        detail     => $diag{detail},
+        hint       => $diag{hint},
+        constraint => $diag{constraint},
+        position   => $position,
+        severity   => $diag{severity},
+        schema     => $diag{schema},
+        table      => $diag{table},
+        column     => $diag{column},
+        context    => $diag{context},
     );
 }
 

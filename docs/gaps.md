@@ -51,13 +51,18 @@ successful statement that matched nothing). Zero-row UPDATE, DELETE and
 `INSERT ... ON CONFLICT DO NOTHING` are covered by t/integration/connection.t so that this
 contract is not "corrected" into a numeric test later.
 
-### 3. `_throw_query_error` uses wrong DBD::Pg attribute
+### 3. `_throw_query_error` uses wrong DBD::Pg attribute — FIXED
 
 **File:** `Connection.pm:352`
 
 `pg_errorlevel` is the verbosity setting (0/1/2), not the error detail text. Should be
 `$dbh->pg_diag_message_detail` or similar. Also, `constraint`, `hint`, and `position` are
 hardcoded to `undef` when DBD::Pg exposes all of them via `err_diag_*` attributes.
+
+Fixed together with item 47, which is the same change: the fields are now read from
+`pg_error_field`, which is the accessor DBD::Pg actually provides. Collected before anything
+else runs on the handle, since the next statement resets them. Covered by
+t/integration/connection.t against a unique violation and a syntax error.
 
 ### 4. `is_healthy` logic is always true
 
@@ -410,10 +415,14 @@ With 3.21.0 the write side becomes a genuine non-blocking loop that maps onto
 - `pg_flush` — 1 data still pending (wait for write-ready, call again), 0 flushed
 - `pg_putcopyend_async` — 0 retry, 1 done and the connection returns to blocking mode
 
-### 47. Rich error diagnostics from `pg_error_field`
+### 47. Rich error diagnostics from `pg_error_field` — FIXED
 
-**Not blocked on anything.** `pg_error_field` has shipped in DBD::Pg since well before
-3.20.2, so this is actionable against the current CPAN release.
+**Was not blocked on anything.** `pg_error_field` has shipped in DBD::Pg since well before
+3.20.2, so this was actionable against the current CPAN release all along.
+
+Fixed together with item 3. `Error::Query` gained `severity`, `schema`, `table`, `column`
+and `context` accessors alongside the existing `detail`, `hint`, `constraint` and
+`position`, all populated from `pg_error_field` and documented in the POD.
 
 We have the `Error::Query` class with fields for `detail`, `hint`, `constraint`,
 `position` — but `_throw_query_error` never populates them. DBD::Pg exposes
