@@ -72,6 +72,11 @@ sub new {
         idle    => [],
         active  => [],
         waiting => [],
+
+        # Connections whose handshake is in progress. They are in neither the
+        # idle nor the active list yet, so without counting them separately
+        # concurrent callers all see room and all create one.
+        _connecting => 0,
         pid     => $$,
 
         # Stats
@@ -143,6 +148,15 @@ sub is_healthy {
 # Close connections that have been idle longer than idle_timeout, never
 # taking the pool below min_connections. Busy connections count towards that
 # floor, since they are still part of the pool.
+# Connections the pool has committed to: those it holds plus those still
+# connecting. total_count reports only the ones that have arrived, which is
+# what callers asking for pool statistics want, but every decision about
+# whether there is room has to include the ones on their way.
+sub _committed_count {
+    my ($self) = @_;
+    return $self->total_count + $self->{_connecting};
+}
+
 sub _reap_idle_connections {
     my ($self) = @_;
 
@@ -249,8 +263,15 @@ async sub connection {
     }
 
     # 2. Create new connection if under limit
-    if ($self->total_count < $self->{max_connections}) {
-        my $conn = await $self->_create_connection;
+    if ($self->_committed_count < $self->{max_connections}) {
+        $self->{_connecting}++;
+
+        my $conn = eval { await $self->_create_connection };
+        my $err = $@;
+
+        $self->{_connecting}--;
+        die $err if $err;
+
         push @{$self->{active}}, $conn;
         return $conn;
     }
@@ -516,8 +537,13 @@ sub _return_connection {
 sub _release_to_idle_or_waiting {
     my ($self, $conn) = @_;
 
-    # If someone is waiting, give them this connection
-    if (my $waiting = shift @{$self->{waiting}}) {
+    # Give the connection to the first caller still waiting for one. A waiter
+    # whose future has already settled has timed out or been cancelled, and
+    # handing it the connection would park it on the active list with nobody
+    # left to release it, shrinking the pool for good.
+    while (my $waiting = shift @{$self->{waiting}}) {
+        next if $waiting->{future}->is_ready;
+
         push @{$self->{active}}, $conn;
         $conn->{last_used} = time();
         $conn->{released} = 0;
@@ -540,7 +566,7 @@ sub _discard_connection {
 sub _ensure_min_connections {
     my ($self) = @_;
 
-    my $needed = $self->{min_connections} - $self->total_count;
+    my $needed = $self->{min_connections} - $self->_committed_count;
     return if $needed <= 0;
 
     # Create connections in parallel (fire and forget)

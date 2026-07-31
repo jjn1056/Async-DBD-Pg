@@ -106,19 +106,22 @@ Connections in use count towards the floor.
 Reaping runs from a timer that only exists while there is something old enough to close, so
 a pool resting at `min_connections` does not hold the event loop open.
 
-### 6. PubSub `connect` is not re-entrant
+### 6. PubSub `connect` is not re-entrant — FIXED
 
 **File:** `PubSub.pm:52-66`
 
 Two concurrent callers both see `!$self->{connected}` and both check out a connection.
 The second overwrites `$self->{conn}`, leaking the first connection permanently.
 
-### 7. PubSub `_stopping` flag never resets on error
+### 7. PubSub `_stopping` flag never resets on error — FIXED
 
 **File:** `PubSub.pm:~228`
 
 If `_run_control_query` fails, `_stopping` stays true and the listener loop never restarts.
 All subsequent LISTEN/UNLISTEN operations silently fail.
+
+Fixed. `_stopping` is cleared and the listener restarted whether or not the statement
+succeeded, and the failure is still reported to the caller. Covered by t/unit/pubsub.t.
 
 ---
 
@@ -166,7 +169,7 @@ both are validated instead of parameterised: the name must be a plain identifier
 `Cursor::_validate_name` and `Cursor::_validate_batch_size`, called both from `Cursor::new`
 and from `Connection::cursor` before the DECLARE is built. Covered by t/unit/cursor.t.
 
-### 10. Pool can exceed `max_connections`
+### 10. Pool can exceed `max_connections` — FIXED
 
 **File:** `Pg.pm:~101`
 
@@ -174,7 +177,16 @@ and from `Connection::cursor` before the DECLARE is built. Covered by t/unit/cur
 connect futures). Under concurrent load, multiple callers see `total_count <
 max_connections` simultaneously and each creates a new connection.
 
-### 11. Waiter queue race
+Fixed. A `_connecting` count tracks handshakes in progress, and `_committed_count` adds it
+to `total_count` for every decision about whether there is room. `total_count` itself still
+reports only connections the pool holds, which is what the statistics accessors are for.
+`_ensure_min_connections` uses the committed count too, or it would over-create in the same
+way.
+
+Measured before the fix: six concurrent callers against `max_connections => 2` produced six
+connections. Covered by t/pool/basic.t.
+
+### 11. Waiter queue race — FIXED
 
 **Files:** `Pg.pm:~159-206, 415`
 
@@ -182,6 +194,16 @@ When a waiter times out, it removes itself from the queue and fails its future. 
 `_release_to_idle_or_waiting` does `shift @{waiting}` and calls `->done($conn)` without
 checking if the future is already failed. If timing aligns, a connection is delivered to a
 dead future and never released — permanent pool shrinkage.
+
+Fixed, though the timeout path was not the way in: that handler removes the waiter from the
+queue and already guards with `unless $future->is_ready`. The reachable case is a caller
+that cancels while queued. Nothing takes such a waiter off the queue, so it was still
+shifted and handed a connection, which went onto the active list with nobody left to
+release it.
+
+`_release_to_idle_or_waiting` now skips waiters whose future has already settled, whatever
+settled it, and falls through to the idle list when none are live. Covered by
+t/pool/basic.t.
 
 ### 12. Statement handle leak on error — FIXED
 

@@ -123,6 +123,62 @@ subtest 'on_connect callback' => sub {
     $conn->release;
 };
 
+subtest 'concurrent acquisition never exceeds max_connections' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 2,
+        queue_timeout   => 30,
+    );
+
+    # Ask for more connections than the pool may hold, all before any of them
+    # has finished connecting. Each caller must account for the connections
+    # already on their way, not just the ones that have arrived.
+    my @waiting = map { $pg->connection } 1 .. 6;
+
+    Future::IO->sleep(1)->get;    # let the handshakes finish
+
+    ok $pg->total_count <= 2,
+        'pool never grew past max_connections (got ' . $pg->total_count . ')';
+
+    my @acquired = grep { $_->is_done } @waiting;
+    is scalar @acquired, 2, 'exactly max_connections callers were served';
+
+    $_->cancel for grep { !$_->is_ready } @waiting;
+    $_->get->release for @acquired;
+};
+
+subtest 'a waiter that gives up does not consume a connection' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 1,
+        queue_timeout   => 30,
+    );
+
+    my $held = $pg->connection->get;
+    is $pg->active_count, 1, 'the only connection is in use';
+
+    # A second caller queues, then gives up before one becomes free.
+    my $queued = $pg->connection;
+    Future::IO->sleep(0.1)->get;
+    is $pg->waiting_count, 1, 'second caller queued';
+    $queued->cancel;
+
+    # Handing the connection to the abandoned waiter would lose it: it goes
+    # onto the active list and nobody is left to release it.
+    $held->release;
+    Future::IO->sleep(0.2)->get;
+
+    is $pg->active_count, 0, 'connection not parked against the abandoned waiter';
+    is $pg->idle_count, 1, 'connection returned to the pool';
+    ok $pg->is_healthy, 'pool can still serve';
+
+    my $next = $pg->connection->get;
+    ok $next, 'connection can be acquired again';
+    $next->release;
+};
+
 subtest 'an abandoned cursor does not outlive its connection' => sub {
     my $pg = Async::DBD::Pg->new(
         dsn             => test_dsn(),
