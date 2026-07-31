@@ -44,6 +44,39 @@ subtest 'create pubsub instance' => sub {
     $pubsub->disconnect->get;
 };
 
+subtest 'a callback that dies does not stop the others or the listener' => sub {
+    my @logged;
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 5,
+        on_log          => sub { push @logged, $_[1] },
+    );
+    my $pubsub = $pg->pubsub;
+
+    my (@second, @later);
+
+    $pubsub->listen('cb_error_test', sub { die "callback exploded\n" })->get;
+    $pubsub->listen('cb_error_test', sub { push @second, $_[1] })->get;
+
+    $pubsub->notify('cb_error_test', 'first')->get;
+    wait_until(sub { @second }, 'second callback ran', 3);
+
+    is \@second, ['first'], 'a callback dying does not stop the next one';
+    ok scalar(grep { /callback exploded/ } @logged),
+        'the failure is reported rather than swallowed';
+
+    # The listener has to survive, or one bad callback ends every
+    # subscription on the connection.
+    $pubsub->listen('cb_error_later', sub { push @later, $_[1] })->get;
+    $pubsub->notify('cb_error_later', 'second')->get;
+    wait_until(sub { @later }, 'listener still running', 3);
+
+    is \@later, ['second'], 'listener still delivering after the failure';
+
+    $pubsub->disconnect->get;
+};
+
 subtest 'concurrent connect checks out a single connection' => sub {
     my $pg = Async::DBD::Pg->new(
         dsn             => test_dsn(),

@@ -71,6 +71,84 @@ subtest 'timeout error' => sub {
     is $err->timeout, 30, 'timeout accessor';
 };
 
+subtest 'every mapped SQLSTATE resolves to its name' => sub {
+    # The mapping is what callers branch on, so a typo in any entry is a bug
+    # that only shows up in the one situation it names.
+    my %expected = (
+        '23505' => 'unique_violation',
+        '23503' => 'foreign_key_violation',
+        '23502' => 'not_null_violation',
+        '23514' => 'check_violation',
+        '23P01' => 'exclusion_violation',
+        '42601' => 'syntax_error',
+        '42501' => 'insufficient_privilege',
+        '42P01' => 'undefined_table',
+        '42703' => 'undefined_column',
+        '42883' => 'undefined_function',
+        '40001' => 'serialization_failure',
+        '40P01' => 'deadlock_detected',
+        '57014' => 'query_canceled',
+        '08000' => 'connection_exception',
+        '08003' => 'connection_does_not_exist',
+        '08006' => 'connection_failure',
+    );
+
+    for my $code (sort keys %expected) {
+        my $err = Async::DBD::Pg::Error::Query->new(
+            message => 'boom',
+            code    => $code,
+        );
+        is $err->state, $expected{$code}, "$code is $expected{$code}";
+    }
+};
+
+subtest 'unmapped SQLSTATE resolves to unknown' => sub {
+    for my $code ('99999', 'XX000', '') {
+        my $err = Async::DBD::Pg::Error::Query->new(
+            message => 'boom',
+            code    => $code,
+        );
+        is $err->state, 'unknown', "unmapped '$code' reports unknown";
+    }
+};
+
+subtest 'query error carries server diagnostics' => sub {
+    my $err = Async::DBD::Pg::Error::Query->new(
+        message    => 'duplicate key',
+        code       => '23505',
+        severity   => 'ERROR',
+        detail     => 'Key (email)=(a@example.com) already exists.',
+        hint       => 'try another',
+        constraint => 'users_email_key',
+        schema     => 'public',
+        table      => 'users',
+        column     => 'email',
+        position   => 42,
+        context    => 'PL/pgSQL function f() line 1',
+    );
+
+    is $err->severity, 'ERROR', 'severity';
+    is $err->detail, 'Key (email)=(a@example.com) already exists.', 'detail';
+    is $err->hint, 'try another', 'hint';
+    is $err->constraint, 'users_email_key', 'constraint';
+    is $err->schema, 'public', 'schema';
+    is $err->table, 'users', 'table';
+    is $err->column, 'email', 'column';
+    is $err->position, 42, 'position';
+    is $err->context, 'PL/pgSQL function f() line 1', 'context';
+};
+
+subtest 'diagnostics are undef when the server did not supply them' => sub {
+    my $err = Async::DBD::Pg::Error::Query->new(
+        message => 'boom',
+        code    => '42601',
+    );
+
+    is $err->$_, undef, "$_ is undef" for qw(
+        severity detail hint constraint schema table column position context
+    );
+};
+
 subtest 'errors can be thrown and caught' => sub {
     my $caught;
     eval {

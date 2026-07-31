@@ -100,6 +100,42 @@ subtest 'query error' => sub {
     $conn->_close_dbh;
 };
 
+subtest 'results built from a live statement handle' => sub {
+    my $conn = make_connection();
+
+    # The unit tests build results with new_from_data. This exercises the
+    # constructor that reads a real DBI handle: column order, row contents,
+    # and finishing the handle.
+    my $result = $conn->query(
+        q{SELECT * FROM (VALUES (1, 'one'), (2, 'two')) AS t(id, word)}
+    )->get;
+
+    isa_ok $result, 'Async::DBD::Pg::Results';
+    is $result->columns, ['id', 'word'], 'column names in the order selected';
+    is $result->count, 2, 'row count';
+    is $result->rows, [
+        { id => 1, word => 'one' },
+        { id => 2, word => 'two' },
+    ], 'rows as hashrefs keyed by column';
+    is $result->first, { id => 1, word => 'one' }, 'first row';
+    is $result->scalar, 1, 'scalar takes the first column of the first row';
+    ok !$result->is_empty, 'not empty';
+
+    # A statement returning nothing still has columns.
+    my $none = $conn->query('SELECT 1 AS n WHERE false')->get;
+    is $none->count, 0, 'no rows';
+    is $none->columns, ['n'], 'columns still reported';
+    ok $none->is_empty, 'reports empty';
+    is $none->first, undef, 'first is undef';
+    is $none->scalar, undef, 'scalar is undef';
+
+    # NULL must survive as undef rather than becoming an empty string.
+    my $null = $conn->query('SELECT NULL::text AS nothing')->get;
+    is $null->first->{nothing}, undef, 'NULL comes back as undef';
+
+    $conn->_close_dbh;
+};
+
 subtest 'query errors carry PostgreSQL diagnostics' => sub {
     my $conn = make_connection();
 

@@ -415,17 +415,17 @@ stays what the test suite reads, so the two names now divide cleanly: examples t
 
 ## Section 5: Documentation (release blockers)
 
-### 30. `Async::DBD::Pg::Results` has almost no POD
+### 30. `Async::DBD::Pg::Results` has almost no POD — FIXED
 
 Just NAME and AUTHOR. This is the object every query returns — `rows`, `columns`, `count`,
 `first`, `scalar`, `is_empty` are all undocumented. This is the single biggest doc gap.
 
-### 31. `Async::DBD::Pg::Connection` public methods undocumented
+### 31. `Async::DBD::Pg::Connection` public methods undocumented — FIXED
 
 `query`, `transaction`, `cursor`, `release`, `cancel` have no `=head2` entries. The
 `{timeout => N}` option, transaction isolation levels, savepoint nesting — none described.
 
-### 32. `Async::DBD::Pg::PubSub` methods undocumented
+### 32. `Async::DBD::Pg::PubSub` methods undocumented — FIXED
 
 `listen`, `unlisten`, `notify`, `disconnect`, `connect` have no `=head2` entries. Callback
 signature (`$channel, $payload, $pid`) is shown in SYNOPSIS but never described.
@@ -437,7 +437,7 @@ signature (`$channel, $payload, $pid`) is shown in SYNOPSIS but never described.
 `listen`, `unlisten`, `unlisten_all`, `notify`, `pubsub`, `is_healthy`, `safe_dsn` have no
 `=head2` entries.
 
-### 34. Error subclass accessors undocumented
+### 34. Error subclass accessors undocumented — FIXED
 
 **File:** `Error.pm`
 
@@ -445,11 +445,11 @@ signature (`$channel, $payload, $pid`) is shown in SYNOPSIS but never described.
 `Error::Connection::dsn`, `Error::PoolExhausted::pool_size`, `Error::Timeout::timeout` —
 none described.
 
-### 35. `Async::DBD::Pg::Util` exports undocumented
+### 35. `Async::DBD::Pg::Util` exports undocumented — FIXED
 
 `parse_dsn`, `safe_dsn`, `convert_placeholders` are exportable but have no `=head2` entries.
 
-### 36. Pool constructor parameters only partially documented
+### 36. Pool constructor parameters only partially documented — FIXED
 
 `connect_timeout`, `statement_timeout`, `max_queries`, `on_connect`, `on_release`, `on_log`
 are listed in SYNOPSIS but have no individual descriptions of types, defaults, or callback
@@ -459,7 +459,7 @@ signatures.
 
 ## Section 6: Test Coverage Gaps (needed for production confidence)
 
-### 37. Cursor module: zero tests
+### 37. Cursor module: zero tests — FIXED
 
 `next`, `each`, `all`, `close`, owns-transaction commit, exhaustion detection — the entire
 module is untested. This is the largest single gap.
@@ -469,17 +469,17 @@ module is untested. This is the largest single gap.
 The queue logic, timeout, `Error::PoolExhausted`, waiter handoff on release — the most
 complex pool path has no coverage.
 
-### 39. Per-query timeout: zero tests
+### 39. Per-query timeout: zero tests — FIXED
 
 `_query_with_timeout`, cancel-on-timeout, `Error::Timeout` — completely untested (and as
 noted in item 1, also broken).
 
-### 40. `Results::new($sth)` never tested
+### 40. `Results::new($sth)` never tested — FIXED
 
 Every unit test uses `new_from_data`. The live DBI path through
 `fetchall_arrayref`/`NAME`/`finish` is only exercised indirectly via integration tests.
 
-### 41. Error SQLSTATE mapping: 2 of 15 codes tested
+### 41. Error SQLSTATE mapping: 2 of 15 codes tested — FIXED
 
 Only `23505` and `42601` are covered. The remaining 13 entries in `%STATE_MAP` are untested.
 
@@ -492,7 +492,7 @@ Callback throwing, connection loss, `_process_notifications` error handling,
 
 The ROLLBACK-if-in-transaction path and callback failure handling.
 
-### 44. `_return_connection` edge cases: untested
+### 44. `_return_connection` edge cases: untested — FIXED
 
 `ping` failure, `max_queries` discard, waiter handoff.
 

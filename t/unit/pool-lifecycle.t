@@ -9,8 +9,11 @@ use Async::DBD::Pg::Connection;
     package Test::Async::DBD::Pg::FakeDBH;
 
     sub new {
-        my ($class) = @_;
-        return bless { disconnects => 0 }, $class;
+        my ($class, %args) = @_;
+        return bless {
+            disconnects => 0,
+            ping        => $args{ping} // 1,
+        }, $class;
     }
 
     sub disconnect {
@@ -23,7 +26,7 @@ use Async::DBD::Pg::Connection;
     sub ping {
         my ($self) = @_;
         $self->{pings}++;
-        return 1;
+        return $self->{ping};
     }
 
     sub pings { shift->{pings} // 0 }
@@ -118,6 +121,42 @@ sub add_idle {
 
     return $dbh;
 }
+
+subtest 'a connection that fails its check is discarded' => sub {
+    my $pg = make_pool();
+    my $dbh = Test::Async::DBD::Pg::FakeDBH->new(ping => 0);
+
+    my $conn = Async::DBD::Pg::Connection->new(dbh => $dbh, pool => $pg);
+    push @{$pg->{active}}, $conn;
+    $conn->release;
+
+    is $pg->idle_count, 0, 'dead connection not put back for reuse';
+    is $dbh->disconnects, 1, 'dead connection closed';
+    is $pg->stats->{discarded}, 1, 'discard recorded';
+};
+
+subtest 'a connection past max_queries is retired' => sub {
+    my $pg = make_pool(max_queries => 5);
+    my $dbh = Test::Async::DBD::Pg::FakeDBH->new;
+
+    my $conn = Async::DBD::Pg::Connection->new(dbh => $dbh, pool => $pg);
+    $conn->{query_count} = 5;
+    push @{$pg->{active}}, $conn;
+    $conn->release;
+
+    is $pg->idle_count, 0, 'worn out connection not reused';
+    is $dbh->disconnects, 1, 'worn out connection closed';
+
+    # A connection still short of the limit goes back as normal.
+    my $fresh_dbh = Test::Async::DBD::Pg::FakeDBH->new;
+    my $fresh = Async::DBD::Pg::Connection->new(dbh => $fresh_dbh, pool => $pg);
+    $fresh->{query_count} = 4;
+    push @{$pg->{active}}, $fresh;
+    $fresh->release;
+
+    is $pg->idle_count, 1, 'connection under the limit returned to the pool';
+    is $fresh_dbh->disconnects, 0, 'and left open';
+};
 
 subtest 'destroying a connection does not make a blocking round trip' => sub {
     my $pg = make_pool();
