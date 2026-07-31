@@ -1,10 +1,10 @@
-package Future::IO::Pg::Cursor;
+package Async::DBD::Pg::Cursor;
 
 use strict;
 use warnings;
 
 use Future::AsyncAwait;
-use Future::IO::Pg::Results;
+use Async::DBD::Pg::Results;
 
 my $cursor_counter = 0;
 
@@ -115,7 +115,7 @@ __END__
 
 =head1 NAME
 
-Future::IO::Pg::Cursor - Streaming cursor for large result sets
+Async::DBD::Pg::Cursor - Streaming cursor for large result sets
 
 =head1 SYNOPSIS
 

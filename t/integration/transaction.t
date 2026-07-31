@@ -4,16 +4,17 @@ use Test2::V0;
 use Future::AsyncAwait;
 
 use lib 't/lib';
-use Test::Future::IO::Pg qw(skip_without_postgres test_dsn);
+use Test::Async::DBD::Pg qw(skip_without_postgres test_dsn);
 
 # Skip if no PostgreSQL available
 my $dsn = skip_without_postgres();
 
-# Load Future::IO implementation
-use Future::IO::Impl::IOAsync;
+use Future::IO;
 
-use Future::IO::Pg::Connection;
-use Future::IO::Pg::Util qw(parse_dsn);
+BEGIN { Future::IO->load_best_impl; }
+
+use Async::DBD::Pg::Connection;
+use Async::DBD::Pg::Util qw(parse_dsn);
 use DBI;
 
 # Helper to create a connection
@@ -32,7 +33,7 @@ sub make_connection {
         }
     ) or die "Cannot connect: " . DBI->errstr;
 
-    return Future::IO::Pg::Connection->new(
+    return Async::DBD::Pg::Connection->new(
         dbh => $dbh,
     );
 }

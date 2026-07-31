@@ -2,10 +2,10 @@ use strict;
 use warnings;
 use Test2::V0;
 
-use Future::IO::Pg::Results;
+use Async::DBD::Pg::Results;
 
 subtest 'create from data (for testing)' => sub {
-    my $results = Future::IO::Pg::Results->new_from_data(
+    my $results = Async::DBD::Pg::Results->new_from_data(
         rows    => [
             { id => 1, name => 'Alice' },
             { id => 2, name => 'Bob' },
@@ -13,13 +13,13 @@ subtest 'create from data (for testing)' => sub {
         columns => ['id', 'name'],
     );
 
-    isa_ok $results, 'Future::IO::Pg::Results';
+    isa_ok $results, 'Async::DBD::Pg::Results';
     is $results->count, 2, 'count';
     is $results->columns, ['id', 'name'], 'columns';
 };
 
 subtest 'rows accessor' => sub {
-    my $results = Future::IO::Pg::Results->new_from_data(
+    my $results = Async::DBD::Pg::Results->new_from_data(
         rows    => [
             { id => 1, name => 'Alice' },
             { id => 2, name => 'Bob' },
@@ -34,7 +34,7 @@ subtest 'rows accessor' => sub {
 };
 
 subtest 'first method' => sub {
-    my $results = Future::IO::Pg::Results->new_from_data(
+    my $results = Async::DBD::Pg::Results->new_from_data(
         rows    => [
             { id => 1, name => 'Alice' },
             { id => 2, name => 'Bob' },
@@ -47,7 +47,7 @@ subtest 'first method' => sub {
 };
 
 subtest 'first on empty result' => sub {
-    my $results = Future::IO::Pg::Results->new_from_data(
+    my $results = Async::DBD::Pg::Results->new_from_data(
         rows    => [],
         columns => ['id', 'name'],
     );
@@ -58,7 +58,7 @@ subtest 'first on empty result' => sub {
 };
 
 subtest 'scalar method' => sub {
-    my $results = Future::IO::Pg::Results->new_from_data(
+    my $results = Async::DBD::Pg::Results->new_from_data(
         rows    => [{ count => 42 }],
         columns => ['count'],
     );
@@ -67,7 +67,7 @@ subtest 'scalar method' => sub {
 };
 
 subtest 'scalar with different column name' => sub {
-    my $results = Future::IO::Pg::Results->new_from_data(
+    my $results = Async::DBD::Pg::Results->new_from_data(
         rows    => [{ total => 100, other => 200 }],
         columns => ['total', 'other'],
     );
@@ -76,7 +76,7 @@ subtest 'scalar with different column name' => sub {
 };
 
 subtest 'rows_affected' => sub {
-    my $results = Future::IO::Pg::Results->new_from_data(
+    my $results = Async::DBD::Pg::Results->new_from_data(
         rows          => [],
         columns       => [],
         rows_affected => 5,
@@ -86,12 +86,12 @@ subtest 'rows_affected' => sub {
 };
 
 subtest 'is_empty' => sub {
-    my $empty = Future::IO::Pg::Results->new_from_data(
+    my $empty = Async::DBD::Pg::Results->new_from_data(
         rows    => [],
         columns => [],
     );
 
-    my $not_empty = Future::IO::Pg::Results->new_from_data(
+    my $not_empty = Async::DBD::Pg::Results->new_from_data(
         rows    => [{ id => 1 }],
         columns => ['id'],
     );
@@ -101,7 +101,7 @@ subtest 'is_empty' => sub {
 };
 
 subtest 'iterate over rows' => sub {
-    my $results = Future::IO::Pg::Results->new_from_data(
+    my $results = Async::DBD::Pg::Results->new_from_data(
         rows    => [
             { id => 1, name => 'Alice' },
             { id => 2, name => 'Bob' },

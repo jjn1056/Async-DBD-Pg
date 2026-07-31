@@ -1,4 +1,4 @@
-package Future::IO::Pg::Results;
+package Async::DBD::Pg::Results;
 
 use strict;
 use warnings;
@@ -68,7 +68,7 @@ __END__
 
 =head1 NAME
 
-Future::IO::Pg::Results - Query result wrapper
+Async::DBD::Pg::Results - Query result wrapper
 
 =head1 AUTHOR
 

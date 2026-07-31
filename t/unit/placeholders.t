@@ -2,7 +2,7 @@ use strict;
 use warnings;
 use Test2::V0;
 
-use Future::IO::Pg::Util qw(convert_placeholders);
+use Async::DBD::Pg::Util qw(convert_placeholders);
 
 subtest 'no placeholders' => sub {
     my ($sql, $bind) = convert_placeholders('SELECT * FROM users', {});

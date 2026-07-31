@@ -1,24 +1,24 @@
-package Future::IO::Pg::Connection;
+package Async::DBD::Pg::Connection;
 
 use strict;
 use warnings;
 
 use Future;
 use Future::AsyncAwait;
-use Future::IO;
+use Future::IO qw(POLLIN);
 use IO::Socket;
-use Socket qw(MSG_PEEK);
 use DBD::Pg qw(:async);
 use POSIX qw(dup);
+use Scalar::Util qw(weaken);
 
-use Future::IO::Pg::Cursor;
-use Future::IO::Pg::Error;
-use Future::IO::Pg::Results;
-use Future::IO::Pg::Util qw(convert_placeholders);
+use Async::DBD::Pg::Cursor;
+use Async::DBD::Pg::Error;
+use Async::DBD::Pg::Results;
+use Async::DBD::Pg::Util qw(convert_placeholders);
 
 sub new {
     my ($class, %args) = @_;
-    return bless {
+    my $self = bless {
         dbh             => $args{dbh},
         pool            => $args{pool},
         created_at      => $args{created_at} // time(),
@@ -28,6 +28,10 @@ sub new {
         in_transaction  => 0,
         _savepoint_depth => 0,
     }, $class;
+
+    weaken($self->{pool}) if $self->{pool};
+
+    return $self;
 }
 
 # Accessors
@@ -99,7 +103,7 @@ async sub _query_with_timeout {
         $self->cancel;
         eval { await $query_future };
 
-        die Future::IO::Pg::Error::Timeout->new(
+        die Async::DBD::Pg::Error::Timeout->new(
             message => "Query timeout after ${timeout}s",
             timeout => $timeout,
         );
@@ -141,13 +145,7 @@ async sub _execute_async {
         $self->_throw_query_error($@ || $dbh->errstr, $sql);
     }
 
-    return Future::IO::Pg::Results->new($sth);
-}
-
-# Check if Future::IO impl supports ready_for_read (more efficient)
-sub _has_ready_for_read {
-    my $impl = $Future::IO::IMPL;
-    return $impl && $impl->can('ready_for_read');
+    return Async::DBD::Pg::Results->new($sth);
 }
 
 # Get or create cached socket wrapper for async I/O
@@ -180,24 +178,14 @@ sub _get_socket {
     return $sock;
 }
 
-# Wait for PostgreSQL socket to be readable using Future::IO
+# Wait for PostgreSQL socket to be readable using Future::IO's official poll API
 async sub _wait_for_result {
     my ($self, $dbh) = @_;
 
     my $sock = $self->_get_socket;
 
-    # Use ready_for_read if available (more efficient, no data peek)
-    if (_has_ready_for_read()) {
-        my $impl = $Future::IO::IMPL;
-        while (!$dbh->pg_ready) {
-            await $impl->ready_for_read($sock);
-        }
-    }
-    else {
-        # Fallback: recv with MSG_PEEK to wait for readability
-        while (!$dbh->pg_ready) {
-            await Future::IO->recv($sock, 1, MSG_PEEK);
-        }
+    while (!$dbh->pg_ready) {
+        await Future::IO->poll($sock, POLLIN);
     }
 }
 
@@ -273,7 +261,7 @@ async sub cursor {
     }
 
     my $batch_size = delete $opts->{batch_size} // 1000;
-    my $cursor_name = delete $opts->{name} // Future::IO::Pg::Cursor::_generate_name();
+    my $cursor_name = delete $opts->{name} // Async::DBD::Pg::Cursor::_generate_name();
 
     my $was_in_transaction = $self->{in_transaction};
     if (!$was_in_transaction) {
@@ -290,7 +278,7 @@ async sub cursor {
         await $self->query($declare_sql);
     }
 
-    my $cursor = Future::IO::Pg::Cursor->new(
+    my $cursor = Async::DBD::Pg::Cursor->new(
         name       => $cursor_name,
         batch_size => $batch_size,
         conn       => $self,
@@ -345,7 +333,10 @@ sub _close_dbh {
 sub DESTROY {
     my ($self) = @_;
     return if ${^GLOBAL_PHASE} eq 'DESTRUCT';
-    $self->release unless $self->{released};
+    if (!$self->{released} && $self->{pool}) {
+        $self->release;
+        return;
+    }
     $self->_close_dbh;
 }
 
@@ -355,7 +346,7 @@ sub _throw_query_error {
     my $dbh = $self->{dbh};
     my $state = eval { $dbh->state } // '';
 
-    die Future::IO::Pg::Error::Query->new(
+    die Async::DBD::Pg::Error::Query->new(
         message    => $err,
         code       => $state,
         detail     => eval { $dbh->pg_errorlevel } // undef,
@@ -371,7 +362,7 @@ __END__
 
 =head1 NAME
 
-Future::IO::Pg::Connection - Async PostgreSQL connection using Future::IO
+Async::DBD::Pg::Connection - Async PostgreSQL connection using Future::IO
 
 =head1 SYNOPSIS
 
@@ -390,8 +381,16 @@ Future::IO::Pg::Connection - Async PostgreSQL connection using Future::IO
 
 =head1 DESCRIPTION
 
-This module provides an async PostgreSQL connection that works with any
-Future::IO implementation (IO::Async, libuv, GLib, etc.).
+This module provides a DBD::Pg-backed async PostgreSQL connection that works
+with any Future::IO implementation (IO::Async, libuv, GLib, etc.).
+
+=head1 ACCESSORS
+
+=head2 dbh
+
+Returns the underlying DBI handle. This is an advanced escape hatch for
+DBD::Pg-specific use and is not coordinated with the wrapper's async query
+lifecycle.
 
 =head1 AUTHOR
 

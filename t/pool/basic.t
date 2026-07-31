@@ -4,37 +4,38 @@ use Test2::V0;
 use Future::AsyncAwait;
 
 use lib 't/lib';
-use Test::Future::IO::Pg qw(skip_without_postgres test_dsn);
+use Test::Async::DBD::Pg qw(skip_without_postgres test_dsn);
 
 # Skip if no PostgreSQL available
 my $dsn = skip_without_postgres();
 
-# Load Future::IO implementation
-use Future::IO::Impl::IOAsync;
+use Future::IO;
 
-use Future::IO::Pg;
+BEGIN { Future::IO->load_best_impl; }
+
+use Async::DBD::Pg;
 
 subtest 'create pool' => sub {
-    my $pg = Future::IO::Pg->new(
+    my $pg = Async::DBD::Pg->new(
         dsn             => test_dsn(),
         min_connections => 1,
         max_connections => 5,
     );
 
-    isa_ok $pg, 'Future::IO::Pg';
+    isa_ok $pg, 'Async::DBD::Pg';
     is $pg->min_connections, 1, 'min_connections';
     is $pg->max_connections, 5, 'max_connections';
 };
 
 subtest 'get connection from pool' => sub {
-    my $pg = Future::IO::Pg->new(
+    my $pg = Async::DBD::Pg->new(
         dsn             => test_dsn(),
         min_connections => 0,  # Don't pre-create, we want to test explicit acquisition
         max_connections => 5,
     );
 
     my $conn = $pg->connection->get;
-    isa_ok $conn, 'Future::IO::Pg::Connection';
+    isa_ok $conn, 'Async::DBD::Pg::Connection';
 
     is $pg->active_count, 1, 'connection is active';
 
@@ -47,7 +48,7 @@ subtest 'get connection from pool' => sub {
 };
 
 subtest 'connection reuse' => sub {
-    my $pg = Future::IO::Pg->new(
+    my $pg = Async::DBD::Pg->new(
         dsn             => test_dsn(),
         min_connections => 0,
         max_connections => 5,
@@ -64,7 +65,7 @@ subtest 'connection reuse' => sub {
 };
 
 subtest 'multiple connections' => sub {
-    my $pg = Future::IO::Pg->new(
+    my $pg = Async::DBD::Pg->new(
         dsn             => test_dsn(),
         min_connections => 0,
         max_connections => 3,
@@ -86,7 +87,7 @@ subtest 'multiple connections' => sub {
 };
 
 subtest 'pool stats' => sub {
-    my $pg = Future::IO::Pg->new(
+    my $pg = Async::DBD::Pg->new(
         dsn             => test_dsn(),
         min_connections => 0,
         max_connections => 2,
@@ -102,7 +103,7 @@ subtest 'pool stats' => sub {
 subtest 'on_connect callback' => sub {
     my $connected = 0;
 
-    my $pg = Future::IO::Pg->new(
+    my $pg = Async::DBD::Pg->new(
         dsn             => test_dsn(),
         min_connections => 0,
         max_connections => 2,
@@ -123,7 +124,7 @@ subtest 'on_connect callback' => sub {
 };
 
 subtest 'safe_dsn masks password' => sub {
-    my $pg = Future::IO::Pg->new(
+    my $pg = Async::DBD::Pg->new(
         dsn             => 'postgresql://user:secret@localhost/db',
         min_connections => 0,
         max_connections => 1,

@@ -1,4 +1,4 @@
-package Future::IO::Pg::Util;
+package Async::DBD::Pg::Util;
 
 use strict;
 use warnings;
@@ -139,11 +139,11 @@ __END__
 
 =head1 NAME
 
-Future::IO::Pg::Util - Utility functions for Future::IO::Pg
+Async::DBD::Pg::Util - Utility functions for Async::DBD::Pg
 
 =head1 SYNOPSIS
 
-    use Future::IO::Pg::Util qw(convert_placeholders parse_dsn);
+    use Async::DBD::Pg::Util qw(convert_placeholders parse_dsn);
 
     my ($sql, $bind) = convert_placeholders(
         'SELECT * FROM users WHERE id = :id',

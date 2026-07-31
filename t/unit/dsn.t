@@ -2,7 +2,7 @@ use strict;
 use warnings;
 use Test2::V0;
 
-use Future::IO::Pg::Util qw(parse_dsn safe_dsn);
+use Async::DBD::Pg::Util qw(parse_dsn safe_dsn);
 
 subtest 'parse basic DSN' => sub {
     my $parsed = parse_dsn('postgresql://localhost/testdb');

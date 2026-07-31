@@ -1,18 +1,20 @@
 use strict;
 use warnings;
 use Test2::V0;
+use Future::AsyncAwait;
 
 use lib 't/lib';
-use Test::Future::IO::Pg qw(skip_without_postgres test_dsn);
+use Test::Async::DBD::Pg qw(skip_without_postgres test_dsn);
 
 # Skip if no PostgreSQL available
 my $dsn = skip_without_postgres();
 
-# Load Future::IO implementation (IO::Async for testing)
-use Future::IO::Impl::IOAsync;
+use Future::IO;
 
-use Future::IO::Pg::Connection;
-use Future::IO::Pg::Util qw(parse_dsn);
+BEGIN { Future::IO->load_best_impl; }
+
+use Async::DBD::Pg::Connection;
+use Async::DBD::Pg::Util qw(parse_dsn);
 use DBI;
 use DBD::Pg;
 
@@ -32,7 +34,7 @@ sub make_connection {
         }
     ) or die "Cannot connect: " . DBI->errstr;
 
-    return Future::IO::Pg::Connection->new(
+    return Async::DBD::Pg::Connection->new(
         dbh => $dbh,
     );
 }
@@ -92,7 +94,7 @@ subtest 'query error' => sub {
     $err = $@;
 
     ok $err, 'error thrown';
-    isa_ok $err, 'Future::IO::Pg::Error::Query';
+    isa_ok $err, 'Async::DBD::Pg::Error::Query';
     like $err->message, qr/nonexistent_table|does not exist/i, 'error mentions table';
 
     $conn->_close_dbh;
@@ -125,26 +127,18 @@ subtest 'scalar method' => sub {
 subtest 'event loop not blocked during query' => sub {
     my $conn = make_connection();
 
-    # Use a timer to verify event loop is running during query
     my $ticks = 0;
-    my $timer_id;
-
-    require IO::Async::Loop;
-    my $loop = IO::Async::Loop->new;
-
-    require IO::Async::Timer::Periodic;
-    my $timer = IO::Async::Timer::Periodic->new(
-        interval => 0.01,
-        on_tick  => sub { $ticks++ },
-    );
-    $timer->start;
-    $loop->add($timer);
+    my $ticker = async sub {
+        while (1) {
+            await Future::IO->sleep(0.01);
+            $ticks++;
+        }
+    }->();
 
     # Run a query that takes some time
     my $result = $conn->query("SELECT pg_sleep(0.1), 42 AS answer")->get;
 
-    $timer->stop;
-    $loop->remove($timer);
+    $ticker->cancel unless $ticker->is_ready;
 
     is $result->first->{answer}, 42, 'query completed';
     ok $ticks >= 3, "event loop ran during query (got $ticks ticks)";

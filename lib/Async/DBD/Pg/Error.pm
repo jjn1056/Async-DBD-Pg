@@ -1,4 +1,4 @@
-package Future::IO::Pg::Error;
+package Async::DBD::Pg::Error;
 
 use strict;
 use warnings;
@@ -46,9 +46,9 @@ sub _state_from_code {
 }
 
 
-package Future::IO::Pg::Error::Query;
+package Async::DBD::Pg::Error::Query;
 
-use parent -norequire, 'Future::IO::Pg::Error';
+use parent -norequire, 'Async::DBD::Pg::Error';
 
 sub new {
     my ($class, %args) = @_;
@@ -64,27 +64,27 @@ sub position   { shift->{position} }
 
 sub state {
     my $self = shift;
-    return Future::IO::Pg::Error::_state_from_code($self->{code});
+    return Async::DBD::Pg::Error::_state_from_code($self->{code});
 }
 
 
-package Future::IO::Pg::Error::Connection;
+package Async::DBD::Pg::Error::Connection;
 
-use parent -norequire, 'Future::IO::Pg::Error';
+use parent -norequire, 'Async::DBD::Pg::Error';
 
 sub dsn { shift->{dsn} }
 
 
-package Future::IO::Pg::Error::PoolExhausted;
+package Async::DBD::Pg::Error::PoolExhausted;
 
-use parent -norequire, 'Future::IO::Pg::Error';
+use parent -norequire, 'Async::DBD::Pg::Error';
 
 sub pool_size { shift->{pool_size} }
 
 
-package Future::IO::Pg::Error::Timeout;
+package Async::DBD::Pg::Error::Timeout;
 
-use parent -norequire, 'Future::IO::Pg::Error';
+use parent -norequire, 'Async::DBD::Pg::Error';
 
 sub timeout { shift->{timeout} }
 
@@ -95,15 +95,15 @@ __END__
 
 =head1 NAME
 
-Future::IO::Pg::Error - Error classes for Future::IO::Pg
+Async::DBD::Pg::Error - Error classes for Async::DBD::Pg
 
 =head1 SYNOPSIS
 
-    use Future::IO::Pg::Error;
+    use Async::DBD::Pg::Error;
 
     eval { await $conn->query('BAD SQL') };
     if (my $err = $@) {
-        if ($err->isa('Future::IO::Pg::Error::Query')) {
+        if ($err->isa('Async::DBD::Pg::Error::Query')) {
             warn "Query failed: " . $err->message;
             warn "SQLSTATE: " . $err->code;
         }
@@ -111,7 +111,7 @@ Future::IO::Pg::Error - Error classes for Future::IO::Pg
 
 =head1 DESCRIPTION
 
-This module provides a hierarchy of error classes for Future::IO::Pg.
+This module provides a hierarchy of error classes for Async::DBD::Pg.
 
 =head1 AUTHOR
 
