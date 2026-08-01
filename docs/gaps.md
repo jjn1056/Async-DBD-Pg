@@ -279,10 +279,19 @@ POD along with the rest of the function's contract.
 there's no staleness check. A connection that went dead while idle is handed to the caller,
 who discovers it on first query.
 
-### 17. No PubSub reconnect
+### 17. No PubSub reconnect — FIXED
 
 If the listener connection drops (network, server restart), `_listener_loop` either errors
 or spins on EOF. All subscriptions are lost silently. No callback or event to detect this.
+
+Two claims here were wrong, and testing found it. Terminating the listener's
+backend produces no spin on end of file: the loop fails cleanly with zero CPU
+use. Nor is the failure silent; it reaches `on_log`. What was actually broken
+was narrower: `is_connected` reported true while holding a dead connection, and
+delivery stopped for good.
+
+Fixed together with item 49. See
+`docs/superpowers/specs/2026-07-31-pubsub-reconnect-design.md`.
 
 ### 18. No `_wait_for_result` upper bound — EVALUATED, NO CHANGE
 
@@ -617,7 +626,7 @@ and reporting workloads.
 
 Add `readonly` and `deferrable` options to the `transaction()` method.
 
-### 49. PubSub reconnect with subscription recovery
+### 49. PubSub reconnect with subscription recovery — FIXED
 
 Mojo::Pg has `reconnect_interval` and emits disconnect/reconnect events. AnyEvent::Pg::Pool
 auto-resubscribes channels after reconnect. Our PubSub silently dies on connection loss.
@@ -627,6 +636,23 @@ on connection loss is unacceptable. Implement:
 - Configurable `reconnect_interval`
 - Automatic re-LISTEN for all registered channels on reconnect
 - `on_disconnect` / `on_reconnect` callbacks so the application knows
+
+Implemented as `reconnect`, off by default, with `reconnect_min_interval`,
+`reconnect_max_interval` and `on_reconnect`. The wait doubles from the minimum
+to the maximum and is jittered, so many listeners do not reconnect to a
+recovering server in lockstep.
+
+Two measured facts kept this small: the listener future fails when the
+connection dies, so it is already a precise trigger and no health check was
+needed, and the channel registry survives the failure, so it can be replayed
+unchanged.
+
+Scope was settled by `PAGI::Middleware::Channels`, whose Redis backend passes
+`reconnect` through to `Async::Redis` rather than implementing it. Reconnect
+belongs to the transport client. Replay of notifications missed while
+disconnected does not, and cannot be done with `LISTEN`/`NOTIFY` alone; that
+belongs to a messaging layer with its own storage, where
+`Backend::Role::History` already lives.
 
 ### 50. Connection `max_lifetime` with jitter
 
