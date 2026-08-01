@@ -578,7 +578,7 @@ subtest 'listen() during the reconnect backoff does not orphan a connection' => 
         'no orphaned connection left checked out';
 };
 
-subtest 'a failure inside the race branch does not lock reconnect out permanently' => sub {
+subtest 'a failure inside the replay is retried in place, not left to end the supervisor' => sub {
     my @logged;
     my $pg = Async::DBD::Pg->new(
         dsn                    => test_dsn(),
@@ -602,9 +602,10 @@ subtest 'a failure inside the race branch does not lock reconnect out permanentl
 
     # An ordinary listen() wins the race, same as the earlier subtest, and
     # its own control query goes through fine. The supervisor's own replay
-    # is then made to fail on its second channel, standing in for the
-    # connection dying again mid-replay -- the failure this branch did not
-    # used to survive.
+    # is then made to fail on its second channel -- standing in for any
+    # error from the query itself, without needing a real connection
+    # failure. That realistic shape, with the listener teardown genuinely
+    # happening, is covered separately below.
     $pubsub->listen('lockout_b', sub { })->get;
 
     my $orig = \&Async::DBD::Pg::PubSub::_run_control_query;
@@ -627,23 +628,21 @@ subtest 'a failure inside the race branch does not lock reconnect out permanentl
         *Async::DBD::Pg::PubSub::_run_control_query = $orig;
     }
 
-    ok wait_until(sub { !defined $pubsub->{_reconnect_future} }, 'reconnect slot released', 3),
-        'the failed attempt clears _reconnect_future rather than leaving a dead future behind';
-
-    # The actual symptom of the bug: a later, independent connection death
-    # has to be able to start a fresh supervisor, not just find the hash key
-    # gone.
-    my $captured2 = capture_stderr(sub {
-        kill_backends();
-        wait_until(sub { !$pubsub->is_connected }, 'listener noticed again', 5);
-    });
-    like $captured2, qr/FATAL:\s+terminating connection due to administrator command/,
-        'expected backend-termination notice captured on stderr';
-
+    # The failure is caught by the loop's own eval and retried in place now,
+    # not left to escape and end the supervisor's future -- it is still the
+    # same future, still running, not cleared and waiting on some other
+    # trigger to re-arm it.
+    ok $pubsub->{_reconnect_future} && !$pubsub->{_reconnect_future}->is_ready,
+        'the supervisor is still the one running, not ended by the failure';
     ok wait_until(sub {
-        $pubsub->{_reconnect_future} && !$pubsub->{_reconnect_future}->is_ready
-    }, 'a new supervisor starts after the next death', 3),
-        'reconnect re-arms rather than staying permanently dead';
+        scalar grep { /reconnect attempt \d+ failed/i } @logged
+    }, 'the failure is logged', 3),
+        'the failure is reported like any other failed attempt';
+
+    # And it recovers on its own next retry -- no independent trigger needed.
+    ok wait_until(sub { $pubsub->is_connected }, 'supervisor recovers on its own retry', 10),
+        'reconnects without needing a fresh, independent listener death';
+    is $pubsub->subscribed_channels, 2, 'both channels still registered';
 
     $pubsub->disconnect->get;
 };
@@ -684,7 +683,91 @@ subtest 'the give-up check does not fire on PostgreSQL wording alone' => sub {
     is scalar(grep { /giving up on reconnect/i } @logged), 0,
         'never gave up';
 
+    # Pins the real on_connect error reaching the supervisor rather than a
+    # generic "Died at ..." -- if $@ ever gets clobbered again before this
+    # check, the retry count and zero-give-ups assertions above would still
+    # hold, silently going back to a test that cannot tell old and new
+    # behaviour apart.
+    ok scalar(grep { /the database system is shutting down/ } @logged),
+        'the real on_connect error reaches the supervisor';
+
     $pg->shutdown(force => 1)->get;
+};
+
+subtest 'a connection dying again mid-replay does not leave the supervisor inert' => sub {
+    my @logged;
+    my $pg = Async::DBD::Pg->new(
+        dsn                    => test_dsn(),
+        min_connections        => 0,
+        max_connections        => 4,
+        reconnect              => 1,
+        reconnect_min_interval => 3,
+        reconnect_max_interval => 4,
+        on_log                 => sub { push @logged, $_[1] },
+    );
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('inert_a', sub { })->get;
+
+    my $captured1 = capture_stderr(sub {
+        kill_backends();
+        wait_until(sub { !$pubsub->is_connected }, 'listener noticed', 5);
+    });
+    like $captured1, qr/FATAL:\s+terminating connection due to administrator command/,
+        'expected backend-termination notice captured on stderr';
+
+    # An ordinary listen() wins the race, same as the earlier subtests.
+    $pubsub->listen('inert_b', sub { })->get;
+
+    # Let the supervisor's own replay run for real, but kill the backend
+    # again immediately before its first control query. The listener
+    # teardown _run_control_query does happens for real, and the query that
+    # follows then genuinely fails against a connection that just died --
+    # not a synthetic failure that never touches any of that.
+    my $orig = \&Async::DBD::Pg::PubSub::_run_control_query;
+    my $seen = 0;
+    my $captured2 = capture_stderr(sub {
+        {
+            no strict 'refs';
+            no warnings 'redefine';
+            *Async::DBD::Pg::PubSub::_run_control_query = sub {
+                $seen++;
+                kill_backends() if $seen == 1;
+                return $orig->(@_);
+            };
+        }
+        wait_until(sub { $seen >= 1 }, 'supervisor reached its own replay', 8);
+        Future::IO->sleep(2)->get;
+    });
+    {
+        no warnings 'redefine';
+        *Async::DBD::Pg::PubSub::_run_control_query = $orig;
+    }
+
+    # Unlike the other kill_backends() calls in this file, this one lands
+    # while _run_control_query is stopping the listener out from under
+    # itself, cancelling the very poll that would otherwise notice the
+    # server's notice and print it. Confirmed empty across repeated runs
+    # rather than a one-off, so the connection reliably fails later via a
+    # lower-level driver error instead -- but accept the ordinary notice too
+    # rather than pin to exactly empty, in case that timing ever shifts.
+    ok $captured2 eq '' || $captured2 =~ /FATAL:\s+terminating connection due to administrator command/,
+        'no unexpected output from the connection dying mid-replay';
+
+    # The failure this branch used to die from silently now has to be
+    # reported and retried like any other reconnect failure, not swallowed.
+    ok wait_until(sub {
+        scalar grep { /reconnect attempt \d+ failed/i } @logged
+    }, 'a failed replay is logged like any other attempt', 5),
+        'the supervisor reports the failure rather than dying silently';
+
+    # And it has to keep going: a fresh listener eventually comes back on
+    # its own, with no application intervention.
+    ok wait_until(sub { $pubsub->is_connected }, 'supervisor recovers on its own', 10),
+        'the supervisor keeps retrying rather than going inert';
+    is $pubsub->subscribed_channels, 2, 'both channels still registered';
+
+    $pubsub->disconnect->get;
 };
 
 done_testing;

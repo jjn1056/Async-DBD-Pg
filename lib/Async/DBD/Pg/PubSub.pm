@@ -319,40 +319,35 @@ async sub _reconnect_loop {
 
         last if $self->{_stopping};
 
-        if ($self->{connected} && $self->{conn}) {
-            # An ordinary connect/listen call already re-established the
-            # connection while this loop was backing off. That path only
-            # replays the channel it was called for, so replay every
-            # registered channel here too, or anything subscribed before it
-            # would stay silently orphaned. Taking a second connection of our
-            # own instead, as this loop used to, would leave the winner's
-            # connection checked out to nobody and the running listener
-            # bound to whichever connection loses the race.
-            #
-            # Issued through _run_control_query, the same idiom listen() and
-            # unlisten() use, rather than stopping and starting the listener
-            # by hand: its guard resets _stopping and restarts the listener
-            # however the query ends, including a cancellation here, which a
-            # hand-rolled stop/start would leave stuck stopped.
-            for my $channel (sort keys %{ $self->{channels} }) {
-                await $self->_run_control_query("LISTEN $channel");
+        my $ok = eval {
+            unless ($self->{connected} && $self->{conn}) {
+                my $pool = $self->{pool}
+                    or die "pool is gone\n";
+
+                $self->{conn}      = await $pool->connection;
+                $self->{connected} = 1;
             }
 
-            await $self->_start_listener;
-
-            return $self;
-        }
-
-        my $ok = eval {
-            my $pool = $self->{pool}
-                or die "pool is gone\n";
-
-            $self->{conn}      = await $pool->connection;
-            $self->{connected} = 1;
-
-            # Replay every registered channel onto the new connection.
+            # An ordinary connect/listen call may already have re-established
+            # the connection while this loop was backing off -- the branch
+            # above finds it and skips taking a second one of our own, which
+            # would otherwise leave the winner's connection checked out to
+            # nobody. Either way, replay every registered channel: that path
+            # only replays the channel it was called for, so anything
+            # subscribed before it would stay silently orphaned without this.
+            #
+            # Issued through _run_control_query, the same idiom listen() and
+            # unlisten() use, rather than querying the connection directly:
+            # a listener may already be running here (the race case above),
+            # and its guard stops and restarts the listener safely around
+            # each query, including under cancellation. Whatever this loop
+            # hits along the way -- acquiring, replaying, starting the
+            # listener -- funnels into the one failure handling below, so a
+            # connection dying again mid-replay is retried like any other
+            # failed attempt instead of escaping uncaught and leaving nothing
+            # running to notice.
             for my $channel (sort keys %{ $self->{channels} }) {
-                await $self->{conn}->query("LISTEN $channel");
+                await $self->_run_control_query("LISTEN $channel");
             }
 
             await $self->_start_listener;
