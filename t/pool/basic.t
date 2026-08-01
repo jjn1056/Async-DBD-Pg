@@ -454,6 +454,8 @@ subtest 'a connection that died while idle is repaired, not reported' => sub {
 
     my $again = $pg->connection->get;
     my $before = $again->dbh;
+    my $created_before   = $pg->stats->{created};
+    my $discarded_before = $pg->stats->{discarded};
 
     # The caller must not see the pool's problem.
     my $result = $again->query('SELECT 42 AS answer')->get;
@@ -461,6 +463,48 @@ subtest 'a connection that died while idle is repaired, not reported' => sub {
 
     isnt refaddr($again->dbh), refaddr($before), 'the handle was replaced';
     ok scalar(grep { /dead/i } @logged), 'the replacement was reported';
+
+    # The Connection never leaves the active list and _replace_dbh takes no
+    # _ConnectingGuard, so a heal should be invisible to the pool's own
+    # counts apart from the created/discarded pair it is.
+    is $pg->stats->{created}, $created_before + 1, 'the replacement is counted as created';
+    is $pg->stats->{discarded}, $discarded_before + 1, 'the dead handle is counted as discarded';
+    is $pg->active_count, 1, 'the connection never left the active list';
+    is $pg->total_count, 1, 'and the pool total is unaffected by the heal';
+
+    $again->release;
+};
+
+subtest 'a healthy connection is never pinged' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 1,
+        on_log          => sub { },
+    );
+
+    my $conn = $pg->connection->get;
+    $conn->query('SELECT 1')->get;
+    $conn->release;
+
+    my $again = $pg->connection->get;    # idle checkout, arms _check_liveness
+
+    # The free zero-timeout select is what the whole design's cost claim
+    # rests on: it is what decides whether the round trip happens at all.
+    # Spied on the real ping method rather than faked, so this exercises the
+    # actual DBI call the design depends on not making, not a stand-in for
+    # it. Scoped to just the query -- release() has its own, separate,
+    # pre-existing validation ping, unrelated to healing, that would
+    # otherwise be counted here too.
+    my $pings = 0;
+    {
+        no warnings 'redefine';
+        my $orig = \&DBD::Pg::db::ping;
+        local *DBD::Pg::db::ping = sub { $pings++; goto &$orig };
+        $again->query('SELECT 1')->get;
+    }
+
+    is $pings, 0, 'no round trip on a healthy checkout';
 
     $again->release;
 };
@@ -480,18 +524,116 @@ subtest 'healing invalidates the cached poll socket on the connection' => sub {
 
     $pg->_replace_dbh($conn)->get;
 
-    # A behavioural check here -- run a query on the healed connection and
-    # confirm the cache tracks the new fd -- would pass with or without the
-    # fix: the cache-miss path in _get_socket reaches the same state whenever
-    # the cached fd differs from the current one, which it always does here
-    # regardless of whether the old cache was cleared. Only asserting the
-    # cache was actually cleared, not merely superseded, is honest. Do not
-    # "simplify" this into a behavioural query and expect it to still mean
-    # anything.
+    # This call doesn't go through a real dead connection -- $conn was never
+    # actually killed, so its old fd is still open when _create_connection
+    # runs and the replacement is unlikely to land on the same number here.
+    # That's fine for what this checks: the two deletes run unconditionally,
+    # so whether they're doing anything on this particular call is beside the
+    # point. What they're *for* is checked below, on a connection that really
+    # was healed, where the collision is not a corner case -- see there for
+    # why a check that merely compared fd numbers would still miss it.
     ok !exists $conn->{_cached_sock}, 'the transplant invalidates the poll cache';
     ok !exists $conn->{_cached_fd}, 'and the cached fd number with it';
 
     $conn->release;
+};
+
+subtest 'a healed connection does not busy-wait on its old socket' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 1,
+        on_log          => sub { },
+    );
+
+    my $conn = $pg->connection->get;
+    $conn->query('SELECT 1')->get;    # populates _cached_sock / _cached_fd
+    $conn->release;
+
+    my $captured = capture_stderr(sub {
+        kill_all_backends();
+        Future::IO->sleep(0.2)->get;
+    });
+    is $captured, '', 'nothing is read from the idle socket during the kill';
+
+    my $again = $pg->connection->get;    # re-acquire, arms _check_liveness
+
+    # On this path -- a connection actually found dead and healed --
+    # _heal_if_dead's ping has already made libpq close the old socket before
+    # _replace_dbh runs, so the fd number is free beforehand and the
+    # replacement commonly reuses it. A check that only compared fd numbers
+    # would not catch a stale cache here, because the number is the same
+    # whether or not the entry was cleared. What differs is what a dup of
+    # that number reads as: a stale cache hands _wait_for_result a dup of the
+    # socket that was already closed, which reports readable at EOF, so the
+    # poll loop spins for the life of every query on the connection instead
+    # of waiting once. Counting the polls catches that regardless of the fd
+    # numbers, which is why it's the assertion here rather than a repeat of
+    # the identity check above.
+    my $polls = 0;
+    {
+        no warnings 'redefine';
+        my $orig = \&Future::IO::poll;
+        local *Future::IO::poll = sub { $polls++; goto &$orig };
+        $again->query('SELECT pg_sleep(0.5) AS answer')->get;
+    }
+
+    ok $polls < 200, "few poll calls on the healed connection (got $polls)";
+
+    $again->release;
+};
+
+subtest 'finding one dead connection discards its idle siblings' => sub {
+    my @logged;
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 3,
+        on_log          => sub { push @logged, $_[1] },
+    );
+
+    my $conn1 = $pg->connection->get;
+    my $conn2 = $pg->connection->get;
+    my $held  = $pg->connection->get;    # stays checked out through the heal
+    $conn1->query('SELECT 1')->get;
+    $conn2->query('SELECT 1')->get;
+    $held->query('SELECT 1')->get;
+    $conn1->release;
+    $conn2->release;
+
+    is $pg->idle_count, 2, 'both connections idle before the kill';
+    is $pg->active_count, 1, 'the third connection stays checked out';
+
+    my $captured = capture_stderr(sub {
+        kill_all_backends();
+        Future::IO->sleep(0.2)->get;
+    });
+    is $captured, '', 'nothing is read from the idle sockets during the kill';
+
+    # kill_all_backends kills every other backend, including $held's, but
+    # $held is never idle-checked-out, so nothing arms its liveness check and
+    # _discard_idle_connections only ever touches the idle list -- it should
+    # stay in the active list, dead handle and all, untouched by the discard.
+    # (It gets discarded on release the ordinary way, by the existing
+    # release-time ping, which is a different, already-tested path.)
+    #
+    # Re-acquiring takes one of the two idle connections and arms its
+    # liveness check, leaving the other sitting idle -- also dead, but not
+    # yet discovered. Querying is what triggers the heal, and with it the
+    # sibling discard.
+    my $again = $pg->connection->get;
+    $again->query('SELECT 1')->get;
+
+    is $pg->idle_count, 0,
+        'the sibling was discarded too, not left for a later caller to rediscover';
+    is $pg->active_count, 2,
+        'the checked-out connection was left alone, not touched by the discard';
+    ok scalar(grep { /discarded \d+ idle connection/ } @logged),
+        'the sibling discard was reported through on_log';
+
+    $held->release;
+
+    $again->release;
 };
 
 subtest 'a transaction whose connection dies reports the failure to the caller' => sub {
@@ -689,8 +831,13 @@ subtest 'healing can be turned off' => sub {
     is $c21, '', 'nothing is read from the idle socket during the kill';
 
     my $again = $pg->connection->get;
+    my $before = $again->dbh;
     ok dies { $again->query('SELECT 1')->get },
         'the original error propagates when healing is off';
+    is refaddr($again->dbh), refaddr($before),
+        'and the connection was not replaced -- this is the option actually being tested';
+
+    $again->release;
 };
 
 subtest 'a PostgreSQL notice is routed through on_log, not fd 2' => sub {

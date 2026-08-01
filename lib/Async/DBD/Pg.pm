@@ -544,11 +544,18 @@ async sub _replace_dbh {
     $conn->{dbh} = $dbh;
 
     # _get_socket memoises its dup()'d poll socket on the Connection, keyed by
-    # raw fd number. Clearing the cache here makes the transplant
-    # self-contained: without it, correctness would depend on _create_connection
-    # having run before _close_dbh above, so the old fd was still open and
-    # could not be reused for the new one -- an invariant that lives nowhere
-    # near the cache it protects.
+    # raw fd number. On the ordinary heal path that number is already free
+    # before this runs, not merely available for reuse on some future edit:
+    # _heal_if_dead's ping has already made libpq close the dead socket
+    # (pg_socket reads -1 by the time _replace_dbh is entered), so the
+    # replacement built by _create_connection above commonly lands on the
+    # exact same fd. Without these two deletes, _get_socket's cache-hit check
+    # only compares that number, sees no change, and hands _wait_for_result a
+    # dup of the socket that was already closed -- which reports readable at
+    # EOF, so the poll loop busy-waits for the life of every query on the
+    # connection instead of waiting once. Measured: 11 Future::IO->poll calls
+    # with these deletes, ~50,000 without, for one query. One full core,
+    # silently; on a listener loop, forever.
     delete $conn->{_cached_sock};
     delete $conn->{_cached_fd};
 
@@ -778,6 +785,15 @@ sub _discard_connection {
 # rediscovered by a later caller. Connections that are checked out are left
 # alone: their owners are mid-work, and each repairs itself on its next
 # statement.
+#
+# Unlike the other two discard paths -- max_queries retirement calls
+# _ensure_min_connections afterwards, and idle-timeout reaping deliberately
+# keeps the floor in the first place -- this one does not try to refill down
+# to min_connections. Deliberate: the server the idle set was just found dead
+# against may still be down, and reconnecting immediately to it would only
+# manufacture more connect failures rather than restore capacity. The pool
+# sits below its floor until a caller asks for a connection on demand, up to
+# max_connections; that caller pays connect latency, not a failure.
 sub _discard_idle_connections {
     my ($self) = @_;
 
@@ -1078,6 +1094,14 @@ Called with each newly established connection before it is handed to anyone,
 which is where session settings belong: C<search_path>, timezone, or the
 DBD::Pg attributes this module does not wrap. A callback that dies discards
 the connection and the failure reaches the caller who asked for it.
+
+Also called when L</heal_dead_connections> replaces a dead connection's
+handle, since the replacement is built by the same connect path. In that
+case the C<$conn> passed in is a donor: only its handle is kept, and moments
+later the wrapper itself is left with no handle and no pool. A callback that
+retains its C<$conn> beyond returning -- to register it in a table of live
+connections, say -- will find that on a heal it was handed one of these
+rather than a connection the pool will ever hand to a caller.
 
 =head3 on_release
 

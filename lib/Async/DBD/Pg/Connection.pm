@@ -156,7 +156,15 @@ async sub _heal_if_dead {
 
     my $rin = '';
     vec($rin, $fd, 1) = 1;
-    return 0 unless select(my $rout = $rin, undef, undef, 0);
+
+    # select's error return is -1 (e.g. on EINTR), which is true in boolean
+    # context; checked as a number instead so an interrupted call falls
+    # through to the round trip below rather than being read as "readable".
+    # Getting this wrong doesn't change the outcome -- a healthy connection's
+    # ping still succeeds and the heal is still skipped -- it just costs one
+    # avoidable round trip on an already-uncommon path.
+    my $ready = select(my $rout = $rin, undef, undef, 0);
+    return 0 unless defined $ready && $ready > 0;
 
     # Readable is suggestive, not conclusive: an asynchronous notification
     # would look the same if an application ran LISTEN on a pooled
@@ -197,8 +205,7 @@ async sub _heal_if_dead {
 # handler. A local avoids that by construction: its scope is one synchronous
 # call, and only one call is ever running at a time in a single-threaded
 # event loop. Wrapping the call sites individually with this rather than
-# duplicating the handler at each one keeps the recursion guard below in one
-# place.
+# duplicating the handler at each one keeps it in one place.
 sub _capture_pg_notices {
     my ($self, $code) = @_;
 
@@ -210,13 +217,27 @@ sub _capture_pg_notices {
     # it rather than swallowing it.
     return $code->() unless $pool;
 
+    # _log's own fallback, when no on_log is configured, is itself a warn()
+    # call. It does not re-enter this handler: Perl does not deliver
+    # $SIG{__WARN__} recursively to the handler currently running, so a
+    # warn() from inside this one uses the true default (print to stderr)
+    # on its own, with nothing extra needed here to arrange that. The same
+    # non-re-entrance is what lets the passed-through branch below just
+    # warn() rather than needing to juggle the handler itself.
     local $SIG{__WARN__} = sub {
         my ($message) = @_;
-        $message =~ s/\n\z//;
 
-        # _log's own fallback, when no on_log is configured, is itself a
-        # warn() -- without this it would re-enter this same handler.
-        local $SIG{__WARN__} = 'DEFAULT';
+        # Only a PostgreSQL server message is downgraded to an info-level
+        # log line. Anything else raised during one of these calls -- a DBI
+        # handle-lifecycle warning, say -- is a real problem, not chatter,
+        # and is passed through as an ordinary warning rather than relabeled
+        # and mixed in with NOTICE text.
+        unless ($message =~ /^(?:NOTICE|WARNING|INFO|LOG|DEBUG):/) {
+            warn $message;
+            return;
+        }
+
+        $message =~ s/\n\z//;
         $pool->_log(info => $message);
     };
 
