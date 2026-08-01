@@ -524,9 +524,11 @@ In `lib/Async/DBD/Pg/Connection.pm`, add `_heal_if_dead` immediately before
 `_execute_async`:
 
 ```perl
-# Decide whether a statement that failed before reaching the server failed
-# because the connection was already dead, and if so replace it. Returns true
-# when the caller should try the statement again.
+# Replace this connection if it died while it was sitting idle. Called before
+# the first statement after checkout, never after a failure: a statement on a
+# dead connection succeeds at prepare and at execute and only fails at
+# pg_result, by which point it may already have run and nothing about it can
+# safely be repeated.
 async sub _heal_if_dead {
     my ($self) = @_;
 
@@ -535,74 +537,82 @@ async sub _heal_if_dead {
     return 0 unless $pool->{heal_dead_connections};
     return 0 if $pool->{_shutting_down};
 
-    # The transaction died with the connection. Running the statement on a
-    # replacement would execute it outside the transaction the caller asked
+    # The transaction died with the connection. Continuing on a replacement
+    # would run the caller's statements outside the transaction they asked
     # for, which is worse than the failure.
     return 0 if $self->{in_transaction};
 
-    # A live connection means the statement failed on its own merits, not
-    # because the connection was gone. ping is a round trip, but this path
-    # has already failed, and it is the same check the pool makes on release.
-    my $dbh = $self->{dbh};
-    return 0 if $dbh && $dbh->ping;
+    my $dbh = $self->{dbh} or return 0;
+
+    # Free, and no round trip: a healthy idle connection has nothing waiting
+    # to be read, while one whose server has gone is readable because the
+    # peer's close is sitting there. DBI's own Active flag stays true on a
+    # dead connection and is no help.
+    my $fd = $dbh->{pg_socket};
+    return 0 unless defined $fd && $fd >= 0;
+
+    my $rin = '';
+    vec($rin, $fd, 1) = 1;
+    return 0 unless select(my $rout = $rin, undef, undef, 0);
+
+    # Readable is suggestive, not conclusive: an asynchronous notification
+    # would look the same if an application ran LISTEN on a pooled
+    # connection. Confirm before throwing the connection away. This round
+    # trip happens only when something already looks wrong.
+    return 0 if $dbh->ping;
 
     $pool->_log(warn => 'replacing a pooled connection that was already dead');
 
     await $pool->_replace_dbh($self);
 
     # Whatever killed this one has usually killed the rest.
-    $pool->_discard_idle_connections;
+    my $dropped = $pool->_discard_idle_connections;
+    $pool->_log(warn => "discarded $dropped idle connection(s) after finding one dead")
+        if $dropped;
 
     return 1;
 }
 ```
 
-Then change `_execute_async` so the two send-path failures can heal. Give it a
-fourth parameter recording whether this is already the retry, and replace the
-`prepare` failure block at lines 133-135 with:
+Then have the check run once, before the first statement on a connection taken
+from the idle list. `_execute_async` is not touched at all: no failure path
+changes, and in particular the `pg_result` block stays exactly as it is.
+
+In `lib/Async/DBD/Pg.pm`, in `connection()`, mark a connection taken from the
+idle list as needing the check. A connection just built cannot be stale, so
+only the idle branch sets it:
 
 ```perl
-    my $sth = eval { $dbh->prepare($sql, { pg_async => PG_ASYNC }) };
-    if ($@ || !$sth) {
-        my $err = $@ || $dbh->errstr;
+    if (my $conn = shift @{$self->{idle}}) {
+        push @{$self->{active}}, $conn;
+        $conn->{last_used} = time();
+        $conn->{released} = 0;
 
-        if (!$healed && await $self->_heal_if_dead) {
-            return await $self->_execute_async($sql, $bind, 1);
-        }
+        # It has been sitting unused and its server may have gone away since.
+        $conn->{_check_liveness} = 1;
 
-        $self->_throw_query_error($err, $sql);
+        return $conn;
     }
 ```
 
-and the `execute` failure block at lines 155-159 with:
+In `lib/Async/DBD/Pg/Connection.pm`, in `query`, run the check once before
+anything is dispatched. Put it immediately after the placeholder conversion
+and before `query_count` is incremented:
 
 ```perl
-    if ($@ || !defined $rv) {
-        my $err = $@ || $sth->errstr || $dbh->errstr;
-        $statement->release;
-
-        if (!$healed && await $self->_heal_if_dead) {
-            return await $self->_execute_async($sql, $bind, 1);
-        }
-
-        $self->_throw_query_error($err, $sql);
+    # Once per checkout, and only for a connection that was idle.
+    if (delete $self->{_check_liveness}) {
+        await $self->_heal_if_dead;
     }
 ```
 
-changing the signature line to:
-
-```perl
-async sub _execute_async {
-    my ($self, $sql, $bind, $healed) = @_;
-```
-
-Leave the `pg_result` failure at lines 164-168 exactly as it is. By that point
-`execute` has succeeded, the statement has been dispatched, and it may have
-run.
+For reference, the blocks that must NOT change: the `prepare` failure at lines
+133-135, the `execute` failure at lines 155-159, and above all the `pg_result`
+failure at lines 164-168. Leave all three alone.
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Same command as Step 2. Expected: PASS, all four subtests.
+Same command as Step 2. Expected: PASS, all six subtests.
 
 Then the whole suite under both implementations, with stderr checked properly:
 ```bash
