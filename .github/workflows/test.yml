@@ -1,0 +1,112 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: perl ${{ matrix.perl }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      # Never stop at the first failure. The point of the matrix is to learn
+      # which versions work, and fail-fast would hide every result after the
+      # first red one.
+      fail-fast: false
+      matrix:
+        perl:
+          - "5.18"   # the floor dist.ini claims
+          - "5.20"
+          - "5.22"
+          - "5.24"
+          - "5.26"
+          - "5.28"
+          - "5.30"
+          - "5.32"
+          - "5.34"
+          - "5.36"
+          - "5.38"
+          - "5.40"
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test
+        ports:
+          - 5432:5432
+        # Without this the suite can start before the server accepts
+        # connections, and every integration test skips rather than fails,
+        # which looks like a pass.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TEST_PG_DSN: postgresql://postgres:test@localhost:5432/test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # DBD::Pg compiles against libpq.
+      - name: Install libpq headers
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev
+
+      - name: Set up perl
+        uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: ${{ matrix.perl }}
+          install-modules-with: cpanm
+
+      - run: perl -V
+
+      - name: Install dependencies
+        run: cpanm --notest --installdeps .
+
+      # Not a dependency of the distribution: the suite runs under whichever
+      # Future::IO implementation is installed, and this second one is here so
+      # CI exercises both rather than making every installer pull IO::Async.
+      - name: Install the second Future::IO implementation
+        run: cpanm --notest Future::IO::Impl::IOAsync
+
+      - name: Confirm the database is reachable
+        run: |
+          perl -MDBI -e '
+            my $dbh = DBI->connect(
+              "dbi:Pg:dbname=test;host=localhost;port=5432",
+              "postgres", "test", { RaiseError => 1, PrintError => 0 },
+            );
+            print "connected to ", scalar($dbh->selectrow_array("SELECT version()")), "\n";
+          '
+
+      - name: Test under Future::IO::Impl::UV
+        env:
+          PERL_FUTURE_IO_IMPL: UV
+        run: prove -r -l -It/lib t/
+
+      - name: Test under Future::IO::Impl::IOAsync
+        env:
+          PERL_FUTURE_IO_IMPL: IOAsync
+        run: prove -r -l -It/lib t/
+
+      # This project treats a warning during a passing run as a failure, and a
+      # grep filter once hid a real error for exactly this reason. Compare the
+      # streams separately instead.
+      - name: Check test output is clean
+        env:
+          PERL_FUTURE_IO_IMPL: UV
+        run: |
+          prove -r -l -It/lib t/ 2>stderr.txt 1>/dev/null
+          if [ -s stderr.txt ]; then
+            echo "stderr was not empty:"
+            cat stderr.txt
+            exit 1
+          fi
+          echo "stderr clean"
