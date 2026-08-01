@@ -106,11 +106,19 @@ Triggered from the `on_fail` already attached in `_start_listener`, when
    dead connection. Release already does the right thing, since its liveness
    check fails and the pool discards it. No special case, no leak.
 2. Wait for the backoff interval.
-3. Take a fresh connection from the pool by the ordinary `connection` path, so
-   async connect, `on_connect` and pool accounting all apply unchanged.
-4. Issue `LISTEN` for every channel in the registry.
-5. Start the listener loop, then call `on_reconnect`.
-6. On failure at any step: log, lengthen the backoff, and repeat.
+3. Check whether an ordinary `connect`/`listen` already re-established the
+   connection while this loop was asleep. If so, skip taking a second
+   connection of our own -- taking one anyway would leave the winner's
+   connection checked out to nobody -- and go straight to replaying channels
+   below.
+4. Otherwise, take a fresh connection from the pool by the ordinary
+   `connection` path, so async connect, `on_connect` and pool accounting all
+   apply unchanged.
+5. Issue `LISTEN` for every channel in the registry, through
+   `_run_control_query` rather than a direct query, so a connection that dies
+   again mid-replay is retried by this loop rather than escaping uncaught.
+6. Start the listener loop, then call `on_reconnect`.
+7. On failure at any step: log, lengthen the backoff, and repeat.
 
 ### Backoff
 
@@ -134,9 +142,15 @@ that produced items 61 through 64, so each exit is explicit:
 
 - `disconnect` cancels it and does not reconnect.
 - `_pool_shutdown` cancels it.
-- If the pool shuts down mid-retry, `connection` fails with "pool has been shut
-  down". That is terminal: stop, rather than retry forever against a closed
-  pool.
+- If the pool shuts down mid-retry, the loop checks the pool's own
+  `_shutting_down` state directly rather than matching `$err`'s text against a
+  message. A message match was tried and rejected: PostgreSQL raises its own
+  `FATAL: the database system is shutting down` on a restart, which the same
+  pattern would also catch -- and give up on permanently, for the headline
+  scenario this whole feature exists to survive. Shutdown fails a queued
+  waiter before it cancels the supervisor, so a loop suspended waiting on a
+  connection still learns about the shutdown by exception, then checks the
+  flag and stops rather than retrying forever against a closed pool.
 - `_stopping` is respected, so reconnect and `_run_control_query` cannot fight
   over the connection.
 

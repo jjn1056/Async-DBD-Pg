@@ -54,6 +54,10 @@ subtest 'pool returns cached pubsub instance' => sub {
 
     sub dbh { 1 }
 
+    # No-op: _pool_shutdown releases the listener connection during global
+    # destruction, so this double needs a release to answer to as well.
+    sub release { }
+
     sub query {
         my ($self, $sql, @bind) = @_;
         push @{$self->{seen}}, $sql;
