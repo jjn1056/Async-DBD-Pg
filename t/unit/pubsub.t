@@ -114,12 +114,22 @@ subtest 'backoff delay is jittered within its ceiling' => sub {
     # listeners reconnecting at once while keeping a predictable floor.
     for my $attempt (1 .. 6) {
         my $ceiling = Async::DBD::Pg::PubSub::_backoff_ceiling($attempt, 0.5, 30);
+        my @delays;
 
-        for (1 .. 20) {
+        for (1 .. 25) {
             my $delay = Async::DBD::Pg::PubSub::_backoff_delay($attempt, 0.5, 30);
             ok $delay >= $ceiling / 2, "attempt $attempt delay at or above half the ceiling";
             ok $delay <= $ceiling,     "attempt $attempt delay at or below the ceiling";
+            push @delays, $delay;
         }
+
+        # Verify jitter actually varies. If delays were constant (e.g., all
+        # returned $ceiling), all values would be identical. With 25 draws from
+        # a continuous distribution, the chance of all values coinciding is
+        # negligible, but sufficient for the implementation to be tested.
+        my $first = $delays[0];
+        my $has_variance = grep { $_ != $first } @delays;
+        ok $has_variance, "attempt $attempt has variance in delay (not constant)";
     }
 };
 
