@@ -712,7 +712,26 @@ sub _release_to_idle_or_waiting {
 sub _discard_connection {
     my ($self, $conn) = @_;
     $conn->_close_dbh;
+
+    # Mark it released so that DESTROY, finding the dbh already gone, does
+    # not mistake this for an unreleased connection and route it back
+    # through _return_connection, which would discard it a second time.
+    $conn->{released} = 1;
     $self->{stats}{discarded}++;
+}
+
+# Whatever killed one connection has usually killed the rest, so finding a
+# dead one is reason to drop the whole idle set rather than let each be
+# rediscovered by a later caller. Connections that are checked out are left
+# alone: their owners are mid-work, and each repairs itself on its next
+# statement.
+sub _discard_idle_connections {
+    my ($self) = @_;
+
+    my @idle = splice @{$self->{idle}};
+    $self->_discard_connection($_) for @idle;
+
+    return scalar @idle;
 }
 
 sub _ensure_min_connections {
@@ -1083,6 +1102,12 @@ been sent it is never retried, because it may already have run. A statement
 inside a transaction is never retried either: the transaction died with the
 connection, and running the statement on a replacement would silently execute
 it outside the transaction the caller asked for.
+
+Finding a dead connection also discards the pool's other idle connections,
+on the reasoning that whatever killed one has usually killed the rest. This
+shows up as extra C<on_log> output and as jumps in the C<discarded> and
+C<created> statistics. Connections that are currently checked out are left
+alone.
 
 Replacing a connection is reported through L</on_log>, so a database that is
 flapping is visible rather than silently absorbed.
