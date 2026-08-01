@@ -511,6 +511,13 @@ async sub _create_connection {
 # statement_timeout all apply and there is no second copy of connect logic to
 # drift. The Connection object never leaves the active list, so no pool counts
 # move.
+#
+# This does not take a _ConnectingGuard: that guard exists so a caller waiting
+# in connection() sees room, not room-minus-one, while a connect is in flight.
+# Taking one here would count the replacement while the dead Connection is
+# still on the active list, pushing _committed_count to max_connections + 1
+# and blocking an unrelated caller for the duration of the heal -- worse than
+# transiently over-admitting the pool by one on what is already a rare path.
 async sub _replace_dbh {
     my ($self, $conn) = @_;
 
@@ -527,6 +534,15 @@ async sub _replace_dbh {
     $self->{stats}{discarded}++;
 
     $conn->{dbh} = $dbh;
+
+    # _get_socket memoises its dup()'d poll socket on the Connection, keyed by
+    # raw fd number. Clearing the cache here makes the transplant
+    # self-contained: without it, correctness would depend on _create_connection
+    # having run before _close_dbh above, so the old fd was still open and
+    # could not be reused for the new one -- an invariant that lives nowhere
+    # near the cache it protects.
+    delete $conn->{_cached_sock};
+    delete $conn->{_cached_fd};
 
     return $conn;
 }

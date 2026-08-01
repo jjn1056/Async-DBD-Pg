@@ -439,10 +439,17 @@ subtest 'a connection that died while idle is repaired, not reported' => sub {
     $conn->query('SELECT 1')->get;
     $conn->release;
 
+    # Nothing polls this connection's socket while it sits idle, so nothing
+    # reads the pending FATAL notice during this window -- it is read later,
+    # inside _heal_if_dead's ping, once the connection is checked out again.
+    # That later read does not raise a raw fd2 print either: confirmed by
+    # running the whole file with the real process stderr captured
+    # separately from this window, not just by reading this one empty.
     my $captured = capture_stderr(sub {
         kill_all_backends();
         Future::IO->sleep(0.2)->get;
     });
+    is $captured, '', 'nothing is read from the idle socket during the kill';
 
     my $again = $pg->connection->get;
     my $before = $again->dbh;
@@ -473,10 +480,14 @@ subtest 'a transaction whose connection dies reports the failure to the caller' 
             my ($tx) = @_;
             await $tx->query('SELECT 1');
 
-            capture_stderr(sub {
+            # Same as the other windows in this file: nothing polls this
+            # connection's socket during the kill, so nothing is read here.
+            # Confirmed by running.
+            my $c17 = capture_stderr(sub {
                 kill_all_backends();
                 Future::IO->sleep(0.2)->get;
             });
+            is $c17, '', 'nothing is read from the socket during the kill';
 
             # The transaction died with the connection. As the code stands, a
             # connection can never reach the liveness check with
@@ -525,20 +536,55 @@ subtest 'a connection that dies while its result is awaited fails to the caller'
     my $conn = $pg->connection->get;
     my $before = $conn->dbh;
 
+    # An error reaching the caller and the connection object staying the same
+    # are both consequences of the statement not being repeated, not
+    # observations of it -- neither would notice a repeat that itself failed,
+    # or one whose side effect landed before it failed. A probe table gives
+    # the statement a side effect that can be counted afterward from a
+    # separate connection, which observes the property the feature is
+    # organised around directly: did this run twice.
+    # Named per pid rather than guarded with IF EXISTS: the latter's harmless
+    # NOTICE still reaches DBI's PrintWarn and prints to stderr, which this
+    # suite's zero-byte requirement does not forgive just because the text
+    # is benign.
+    my $probe = 'heal_probe_' . $$;
+    $conn->query("CREATE TABLE $probe (tag text)")->get;
+
     # Kill the backend while the statement is in flight. execute already
     # succeeded, so the statement reached the server and may have run.
     # Nothing after execute is ever retried, so this is never repeated.
-    my $slow = $conn->query('SELECT pg_sleep(3)');
+    my $slow = $conn->query(
+        "INSERT INTO $probe (tag) SELECT 'already-sent' FROM pg_sleep(3)"
+    );
 
+    # Unlike the pub/sub listener, which polls pg_notifies in a loop and
+    # picks up unsolicited notices that way, the ordinary async query path
+    # (pg_ready/pg_result) surfaces the FATAL as the query's own error
+    # without a separate raw fd2 print. Confirmed by running: nothing lands
+    # here even though the failing $slow->get is inside this window.
     my $err;
-    capture_stderr(sub {
+    my $c19 = capture_stderr(sub {
         Future::IO->sleep(0.3)->get;
         kill_all_backends();
         $err = dies { $slow->get };
     });
+    is $c19, '', 'the failure is reported through the exception, not fd2';
 
     ok $err, 'the failure reaches the caller';
     is refaddr($conn->dbh), refaddr($before), 'the connection object is unchanged';
+
+    # The killed backend aborts the in-flight insert, so the honest count is
+    # 0; a re-execution on a replacement connection would commit and make it
+    # 1. Checked from a fresh connection, since $conn's own is dead.
+    my $parsed = Async::DBD::Pg::Util::parse_dsn(test_dsn());
+    my $checker = DBI->connect(
+        $parsed->{dbi_dsn}, $parsed->{user}, $parsed->{password},
+        { RaiseError => 1, PrintError => 0 },
+    );
+    my ($count) = $checker->selectrow_array("SELECT count(*) FROM $probe");
+    is $count, 0, 'the statement never ran';
+    $checker->do("DROP TABLE $probe");
+    $checker->disconnect;
 
     $conn->release;
 };
@@ -553,27 +599,28 @@ subtest 'the caller still sees the failure once the pool is marked shutting down
 
     my $conn = $pg->connection->get;
     $conn->query('SELECT 1')->get;
+    $conn->release;
 
-    capture_stderr(sub {
+    my $c20 = capture_stderr(sub {
         kill_all_backends();
         Future::IO->sleep(0.2)->get;
     });
+    is $c20, '', 'nothing is read from the idle socket during the kill';
 
-    # Shutting down means the pool will not hand out connections, so it must
-    # not try to build one to repair this either. This connection was never
-    # idle-checked-out, so the liveness check never runs here regardless of
-    # this flag -- the case that actually exercises the shutting-down guard
-    # is a connection checked out before shutdown began and used for the
-    # first time afterward, which is not what this constructs.
+    # Re-acquiring from idle is what arms the liveness check, so the guard
+    # under test is actually reached this time. The flag has to be set after
+    # acquiring rather than before: connection() refuses outright once
+    # _shutting_down is true, so setting it first would never get this far.
+    my $again = $pg->connection->get;
     $pg->{_shutting_down} = 1;
 
-    my $before = $conn->dbh;
-    ok dies { $conn->query('SELECT 1')->get },
+    my $before = $again->dbh;
+    ok dies { $again->query('SELECT 1')->get },
         'the error reaches the caller';
-    is refaddr($conn->dbh), refaddr($before), 'the connection object is unchanged';
+    is refaddr($again->dbh), refaddr($before), 'the connection object is unchanged';
 
     $pg->{_shutting_down} = 0;
-    $conn->release;
+    $again->release;
 };
 
 subtest 'healing can be turned off' => sub {
@@ -589,10 +636,11 @@ subtest 'healing can be turned off' => sub {
     $conn->query('SELECT 1')->get;
     $conn->release;
 
-    capture_stderr(sub {
+    my $c21 = capture_stderr(sub {
         kill_all_backends();
         Future::IO->sleep(0.2)->get;
     });
+    is $c21, '', 'nothing is read from the idle socket during the kill';
 
     my $again = $pg->connection->get;
     ok dies { $again->query('SELECT 1')->get },

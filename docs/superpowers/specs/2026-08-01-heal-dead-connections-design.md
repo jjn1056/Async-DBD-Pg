@@ -83,6 +83,30 @@ and therefore the one point where retrying is never safe. The boundary the
 design rested on was real but unreachable for the case the feature exists to
 handle.
 
+There is a second, independent barrier at the same measurement, worth
+recording rather than leaving to be rediscovered: once `pg_result` has failed,
+`$dbh->{pg_socket}` reads `-1`.
+
+```
+pg_socket BEFORE execute  : 3
+pg_socket AFTER execute   : 3
+pg_result                 : FAILED (as above)
+pg_socket AFTER the fatal : -1
+ping AFTER the fatal      : FALSE
+```
+
+libpq invalidates its own socket once it has finished processing a fatal
+disconnect. Any code that tried to heal from inside `_execute_async`'s
+`pg_result` failure — not just a retry of the statement, any code at all —
+would find `_heal_if_dead`'s own `return 0 unless defined $fd && $fd >= 0`
+(the fd check that guards the `select` below it) refusing to proceed, on a
+connection whose destruction it did not cause. That line exists to keep
+`vec()` off a negative descriptor, not as a deliberate second lock, but it
+behaves as one. It is not a substitute for leaving `pg_result` alone — a
+different call sequence could reach `_heal_if_dead` before the fd goes
+invalid — but it is a real, measured fact about this failure mode and belongs
+on the record next to the first one.
+
 **So the connection is checked before the statement is dispatched, not after
 it fails.** A healthy idle connection has nothing waiting to be read. One whose
 server has gone away is readable, because the peer's close is sitting there:
@@ -132,7 +156,9 @@ connection — which is why the socket is consulted directly.
   `shutdown` waits for checked-out connections rather than touching them, so
   the caller's first statement on that same connection can land after
   `_shutting_down` has gone true. The pool's own drain against a live caller
-  is exactly this race.
+  is exactly this race, and it is what the "Testing" section's shutdown
+  subtest now constructs directly rather than merely asserting the outcome
+  of.
 - **Touching the `pg_result` path.** A failure there may mean the statement
   ran. It is reported to the caller exactly as before.
 
@@ -185,7 +211,8 @@ disconnect invalidates the idle set rather than being rediscovered N times.
 
 On by default. A stale pooled connection failing a caller's first query is a
 defect in the pool, not a situation the caller should have to code around, and
-the retry only fires where the statement provably never reached the server.
+the check only ever runs before a statement is dispatched, never after one has
+been.
 
 One option on the pool constructor:
 
@@ -208,33 +235,55 @@ cases are the ones that would hurt if they were wrong.
 Two different things back these negative cases, and mutation testing — not
 just reading the code — is what tells them apart:
 
-- **Enforced by a guard, and demonstrated red by mutation.** Only
-  `heal_dead_connections` is in this category. Removing its guard in a
-  scratch copy of `_heal_if_dead`, loaded ahead of the real module, turns the
-  "healing can be turned off" test red and leaves every other test green.
-  This one is reachable, and that is what proves it, not the source reading
-  as though it should be.
+- **Enforced by a guard, and demonstrated red by mutation.**
+  `heal_dead_connections` and `_shutting_down` are both in this category now.
+  Removing either guard in a scratch copy of `_heal_if_dead`, loaded ahead of
+  the real module, turns its subtest red and leaves every other test green.
+  The shutdown case took a second pass to get here: the first version of its
+  subtest acquired a freshly built connection, so `_check_liveness` was never
+  armed and `_heal_if_dead` was never entered — the guard had zero coverage
+  and the mutation left it green like the transaction guard below. Rebuilt to
+  release-then-reacquire (arming the check for real) before setting the flag,
+  it now dies with the mutant removed and passes without it.
 - **Hold structurally, because `_check_liveness` is set only on an idle
-  checkout and consumed by the very next `query` call.** No test connection
-  that starts a transaction, has its statement already sent, or is checked
-  mid-shutdown was ever idle-checked-out first, so none of them ever arm the
-  check — `_heal_if_dead` is never called at all, guard or no guard.
-  Removing the `in_transaction` or `_shutting_down` guards in the same
-  scratch-module exercise leaves every test green, confirming this rather
-  than merely asserting it. The three structural cases are not all equally
-  structural, though:
-  - The transaction case is the strongest: it is provably unreachable as the
-    code stands (see "What is still never done" above), not merely untested.
-  - The shutting-down case is reachable in real use — a connection checked
-    out before `shutdown` is called and used for the first time after it
-    isn't — the suite just doesn't currently construct that sequence.
-  - The already-sent case has no guard to remove at all, because nothing in
-    `_execute_async` calls `_heal_if_dead`. A mutation that reintroduced such
-    a call after `pg_result` fails was tried and was not caught — not because
-    of protection, but because `pg_socket` is already invalid by the time
-    DBD::Pg has finished processing a fatal disconnect. A differently-shaped
-    reintroduction of the same mistake is not ruled out by anything visible
-    here.
+  checkout and consumed by the very next `query` call.** Only the transaction
+  case remains here. It is not merely untested: it is provably unreachable as
+  the code stands (see "What is still never done" above), and mutation
+  testing confirms it — removing the `in_transaction` guard leaves every test
+  green, because no sequence of real operations can arm the check while a
+  transaction is open.
+- **The already-sent case has no guard at all**, because nothing in
+  `_execute_async` calls `_heal_if_dead`. Its safety is architectural rather
+  than conditional, which makes it the hardest of the four to demonstrate by
+  mutation — and mutation testing here needs a second look, because the first
+  attempt drew the wrong conclusion from a correct measurement. A mutant that
+  reintroduced a call to `_heal_if_dead` after `pg_result` fails did not fire:
+  `_heal_if_dead`'s own `return 0 unless defined $fd && $fd >= 0` — code in
+  this design, not merely a libpq fact — rejects it, because `pg_socket` is
+  already `-1` by the time a fatal disconnect has been processed (see the
+  measurement above). Read as "this class of mistake can't be caught," that
+  conclusion overreaches: the mutant added a retry that provably cannot fire,
+  which mutation testing calls an *equivalent mutant* — a known limitation of
+  the technique, not evidence of a weak test. The canonical form of this
+  mistake is not hypothetical; it is the original, abandoned design: a retry
+  gated on `$dbh->ping` failing rather than on the socket probe. Traced
+  through the already-sent subtest, that version *is* caught — the retried
+  statement runs to completion on the replacement connection, so the error
+  the test expects never arrives and the connection object is no longer the
+  one the test started with. The subtest kills the mistake it was written
+  for.
+
+  What it could not do is observe the property directly. "An error reached
+  the caller" and "the connection object is unchanged" are both consequences
+  of the statement not running twice, not observations of it — neither would
+  notice a repeat that itself failed, or one whose side effect landed before
+  its failure did. The subtest now gives the statement a side effect (an
+  insert into a table created for the run) and counts it from a separate
+  connection afterward: a killed backend aborts the in-flight insert, so zero
+  is the honest count, and any re-execution — however it might be written —
+  commits and makes it one. That observes the thing the feature is organised
+  around instead of inferring it, and is robust against forms of the mistake
+  nobody has enumerated yet, which is the point of the change.
 
 With that distinction in mind, the individual cases:
 
@@ -248,13 +297,15 @@ With that distinction in mind, the individual cases:
   not currently exercise that mechanism either; it establishes the same
   observable outcome (a syntax error is reported as itself) without
   exercising `_heal_if_dead` at all.
-- A connection that dies while its result is awaited fails to the caller. That
-  statement reached the server and may have run, and nothing about it is
-  repeated. (Structural, and the weakest of the three — see above.)
+- A connection that dies while its result is awaited fails to the caller, and
+  the statement that reached the server did not run a second time — observed
+  directly via a probe table, not inferred from the error and the handle
+  alone. (Architectural rather than guarded, and demonstrated against the
+  canonical form of the mistake — see above.)
 - A healthy connection is never pinged. The free check is what decides whether
   the round trip happens at all, and on a healthy pool it never does.
-- No healing while the pool is shutting down. (Structural in the current
-  suite, but reachable in real use — see above.)
+- No healing while the pool is shutting down. (Guard-enforced and
+  mutation-confirmed — see above.)
 - The pool's counts are unchanged across a heal, and the healed connection
   works for subsequent queries.
 - Idle siblings are discarded when a dead connection is found, so a second
@@ -264,7 +315,18 @@ With that distinction in mind, the individual cases:
 
 Killing a backend makes libpq write a notice straight to file descriptor 2, so
 any test that does it captures and asserts that output, as the existing suite
-does.
+does. What actually lands in each capture window was established by running
+it, not guessed, and the answer is uniform across every window in this suite:
+none of them catch the notice. It is not that the notice never appears —
+`t/pool/shutdown.t` catches it reliably — but that the pub/sub listener gets
+it and this pool's own connections do not. The listener polls `pg_notifies`
+in a loop, which calls libpq's `PQconsumeInput` directly and triggers the
+default notice processor for an unsolicited message; the pool's own paths —
+`ping`, and the ordinary `pg_ready`/`pg_result` polling `_wait_for_result`
+does — surface the same FATAL as the query's own error instead, without a
+separate raw write to fd 2. Every capture window in this file asserts `is
+$captured, ''` for that reason, established per window rather than assumed
+uniform from one measurement.
 
 Test descriptions state the observable behavior a test establishes, not the
 mechanism believed to produce it. Several of the negative-case test names
