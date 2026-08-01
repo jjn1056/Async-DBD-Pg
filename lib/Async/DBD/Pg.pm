@@ -444,6 +444,14 @@ async sub _create_connection {
         AutoCommit        => 1,
         RaiseError        => $use_async ? 0 : 1,
         PrintError        => 0,
+        # A PostgreSQL NOTICE is delivered to DBI as a warning, and Connection
+        # routes it through the pool's on_log by wrapping the calls that can
+        # raise one in a $SIG{__WARN__} handler. That only works if DBI still
+        # calls warn() for it: PrintWarn => 0 drops the notice text entirely
+        # (errstr goes undef, there's nothing left to route), so this is set
+        # explicitly rather than left to default, which depends on the
+        # caller's own $^W and is not something to depend on here.
+        PrintWarn         => 1,
         pg_enable_utf8    => 1,
         pg_server_prepare => 1,
     );
@@ -1090,6 +1098,13 @@ that dies causes the connection to be discarded rather than reused.
     },
 
 Receives the pool's own diagnostics. Without it they go to C<warn>.
+
+Also receives PostgreSQL server notices, at level C<info> -- the C<NOTICE> a
+statement such as C<DROP TABLE IF EXISTS> on a table that does not exist, or
+an explicit C<RAISE NOTICE>, produces. Without this option those notices
+still reach C<warn> the same way the pool's own diagnostics do; what changes
+is that they no longer bypass C<on_log> and print straight to file
+descriptor 2 regardless of whether a handler is configured.
 
 =head3 reconnect
 

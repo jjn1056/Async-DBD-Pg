@@ -351,3 +351,115 @@ coverage the tests do not have.
   repeat, which cannot be inferred reliably from SQL.
 - Healing a connection that is inside a transaction, which would require
   replaying the transaction and is a different feature.
+
+---
+
+## Addendum: a hard-won constraint, confirmed by crash, from a related task
+
+Not part of this feature. Recorded here because this document is where this
+branch's hard-won measurements already live, and there is nowhere else on
+this branch that captures Future::AsyncAwait's own limitations as directly
+as this one does.
+
+Every task brief on this branch repeats the rule that a `local` cannot be
+stretched across an `await`, because it unwinds with its frame and a caller
+may cancel while a sub is suspended, running nothing after that point. Task 5
+(routing PostgreSQL notices through `on_log` instead of letting DBI print
+them to fd 2) is the first place on this branch where breaking that rule was
+tried, by accident, and caught before it shipped rather than discovered
+after.
+
+`Connection.pm`'s `_wait_for_result` polls in a loop:
+
+```perl
+while (!$dbh->pg_ready) {
+    await Future::IO->poll($sock, POLLIN);
+}
+```
+
+Measurement showed that under `pg_async`, a statement's own NOTICE surfaces
+here, during the synchronous `pg_ready` call, not during `execute` or
+`pg_result` as a synchronous-DBI measurement would suggest (`execute` under
+`pg_async` only dispatches and returns; it never waits for or processes a
+response, which is the same fact the design above rests on). The first
+attempt at capturing it wrapped the whole loop in one `local $SIG{__WARN__}`,
+spanning the `await` inside it. That does not merely fail to route the
+notice. It aborts the process:
+
+```
+Future::AsyncAwait panic: TODO: Unsure how to handle savestack entry of SAVEt_HELEM=52
+```
+
+`SAVEt_HELEM` is Perl's internal record of a localized hash element --
+`%SIG` is a hash, and `local $SIG{__WARN__}` is exactly that. `await` has to
+save and restore the interpreter's save stack across a suspension point, and
+this is a save-stack entry type `Future::AsyncAwait` does not know how to
+carry across one. Confirmed with a standalone script instrumenting each
+phase (`execute`, the `pg_ready` loop, `pg_result`) separately, run three
+times, identical every time; a second engineer reproduced the same panic
+independently.
+
+The fix wraps each synchronous call individually -- `execute`, `pg_ready`
+(once per loop iteration), and `pg_result` -- through a small helper that
+`local`s `$SIG{__WARN__}` around exactly one call and returns. None of those
+`local`s ever spans an `await`, so the save-stack entry this panics on is
+never present when a suspension happens. The same reasoning that rules out
+`local` here also rules out a guard object holding the assignment for a
+whole query: a plain `$SIG{__WARN__} = ...` in a constructor, restored in
+`DESTROY`, is a global assignment that would be held across every `await`
+the query makes, and two connections' queries running concurrently would
+have the first one to finish restore whatever it saved -- potentially
+clobbering the second one's still-active handler if the two do not happen to
+unwind in the same order they were built. `t/pool/basic.t`'s `'concurrent
+notices on different connections all reach on_log'` subtest is built
+specifically to break that ordering (the first-constructed query is made the
+faster one, so its guard would destroy first, before the second, still
+in-flight one's) and pins the choice of `local` over a guard by demonstration
+rather than by argument: it fails, with the predicted leak, against a
+guard-based mutant, and passes against the shipped code.
+
+### A second constraint, found writing the test for the first fix
+
+Getting `_capture_pg_notices` right surfaced a second, unrelated crash in the
+test written to prove it, worth recording for the same reason: it was found
+because a change made the exact interleaving that triggers it likely for the
+first time, not because the pattern itself is new.
+
+`t/pool/basic.t`'s transaction-notice subtest originally nested a
+`capture_stderr(sub { $tx->query(...)->get })` inside `$conn->transaction(async
+sub { ... })`, mirroring the shape an earlier subtest in the same file already
+used successfully for `Future::IO->sleep(...)->get`. Under
+`PERL_FUTURE_IO_IMPL=IOAsync` specifically (`UV` was unaffected), this aborted
+the process:
+
+```
+IO::Async::Future=HASH(0x...) is already done and cannot be ->done at
+Future/IO/Impl/IOAsync.pm line 88.
+```
+
+Bisected with a series of standalone scripts, isolating one variable at a
+time: two plain queries in a transaction, `->get`'d the same way, do not
+crash; a notice-producing query does, but only once `_capture_pg_notices`
+wraps the synchronous `pg_ready` call the notice fires inside -- the same
+change that fixes the routing bug this task exists to fix. The crash needs a
+`->get` on a future built from multiple internal `await`s (a query's, not a
+`Future::IO->sleep`'s simpler one) called from code that is itself already
+running inside an async sub resumed by `IOAsync`'s own reactor. That nested,
+blocking wait re-enters the reactor from inside one of its own callbacks,
+and something in that reentry marks a `Future::IO::Impl::IOAsync` future
+done twice.
+
+The fix was to the test, not to `Connection.pm`: `capture_stderr` now wraps
+`$conn->transaction(async sub { ... await $tx->query(...) ... })->get` as a
+single call at the outermost, synchronous level, rather than nesting a
+second capture (with its own `->get`) inside the already-suspended async
+body. A single top-level `->get` is the pattern used throughout this whole
+suite and is not what triggers the crash; a `->get` nested inside an
+already-running async sub, on a multi-`await` future, is. `await` does not
+have this problem -- only a blocking `->get` does -- so the rule this earns
+is narrower than "never nest": nest `await`, never nest `->get`, under
+`IOAsync`, on anything more than a single-`await` future.
+
+This was not reachable through `UV`, which makes it easy to miss if a branch
+is only ever run under one implementation locally. It is why this project's
+own constraint says both.

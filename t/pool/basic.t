@@ -1,6 +1,7 @@
 use strict;
 use warnings;
 use Test2::V0;
+use Future;
 use Future::AsyncAwait;
 use DBI;
 use File::Temp ();
@@ -690,6 +691,116 @@ subtest 'healing can be turned off' => sub {
     my $again = $pg->connection->get;
     ok dies { $again->query('SELECT 1')->get },
         'the original error propagates when healing is off';
+};
+
+subtest 'a PostgreSQL notice is routed through on_log, not fd 2' => sub {
+    my @logged;
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 1,
+        on_log          => sub { push @logged, [$_[0], $_[1]] },
+    );
+
+    my $conn = $pg->connection->get;
+
+    my $captured = capture_stderr(sub {
+        $conn->query(
+            q{DO $$ BEGIN RAISE NOTICE 'plain_notice_marker'; END $$}
+        )->get;
+    });
+
+    is $captured, '', 'nothing reaches fd 2';
+    ok scalar(grep { $_->[0] eq 'info' && $_->[1] =~ /plain_notice_marker/ } @logged),
+        'on_log received the notice text at info level';
+
+    $conn->release;
+};
+
+subtest 'a notice raised inside a transaction still reaches on_log' => sub {
+    my @logged;
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 1,
+        on_log          => sub { push @logged, [$_[0], $_[1]] },
+    );
+
+    my $conn = $pg->connection->get;
+
+    # transaction() takes a different path through query than a bare call
+    # does, so the notice has to be shown to reach on_log from inside it too,
+    # not just assumed to because the bare case does.
+    #
+    # capture_stderr wraps the whole transaction here, at the top level,
+    # rather than nesting a second capture_stderr (with its own ->get) inside
+    # the async transaction body. A ->get nested inside an already-running
+    # async sub, on a future built from several awaits the way a query's is,
+    # crashes under Future::IO::Impl::IOAsync -- "IO::Async::Future=HASH(...)
+    # is already done and cannot be ->done" -- because it re-enters IOAsync's
+    # reactor from inside one of its own callbacks. await does not have this
+    # problem; a nested ->get does. See the design doc addendum.
+    my $captured = capture_stderr(sub {
+        $conn->transaction(async sub {
+            my ($tx) = @_;
+            await $tx->query(
+                q{DO $$ BEGIN RAISE NOTICE 'tx_notice_marker'; END $$}
+            );
+        })->get;
+    });
+
+    is $captured, '', 'nothing reaches fd 2 from inside the transaction';
+    ok scalar(grep { $_->[0] eq 'info' && $_->[1] =~ /tx_notice_marker/ } @logged),
+        'on_log received the notice text from inside the transaction';
+
+    $conn->release;
+};
+
+subtest 'concurrent notices on different connections all reach on_log' => sub {
+    my @logged;
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 2,
+        on_log          => sub { push @logged, [$_[0], $_[1]] },
+    );
+
+    my $conn_a = $pg->connection->get;
+    my $conn_b = $pg->connection->get;
+
+    # This is the case a query-lifetime guard object would get wrong: its
+    # constructor/destructor pair would be a global $SIG{__WARN__}
+    # assignment held across every await the query makes, and two overlapping
+    # queries would give nested guards. Guards nest correctly by pure luck
+    # whenever they unwind in the same order they were built -- the bug needs
+    # the *first*-built guard to finish, and so destroy, before the *second*
+    # one does, breaking that stack discipline and restoring the wrong saved
+    # value over the still-in-flight second guard's handler. So conn_a, whose
+    # query starts first, is given the fast statement here, and conn_b the
+    # slow one -- deliberately the pairing a guard gets wrong, not the one
+    # that happens to still work. Wrapping only the one synchronous call that
+    # can raise a notice, per _capture_pg_notices, never leaves a handler
+    # installed across an await in the first place, so this holds regardless
+    # of which one finishes first.
+    my $fast = $conn_a->query(
+        q{DO $$ BEGIN RAISE NOTICE 'concurrent_marker_fast'; END $$}
+    );
+    my $slow = $conn_b->query(
+        q{DO $$ BEGIN PERFORM pg_sleep(0.3); RAISE NOTICE 'concurrent_marker_slow'; END $$}
+    );
+
+    my $captured = capture_stderr(sub {
+        Future->wait_all($slow, $fast)->get;
+    });
+
+    is $captured, '', 'nothing reaches fd 2 from either connection';
+    ok scalar(grep { $_->[1] =~ /concurrent_marker_slow/ } @logged),
+        'the slower notice reached on_log';
+    ok scalar(grep { $_->[1] =~ /concurrent_marker_fast/ } @logged),
+        'the faster notice reached on_log';
+
+    $conn_a->release;
+    $conn_b->release;
 };
 
 done_testing;

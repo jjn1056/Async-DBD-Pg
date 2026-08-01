@@ -176,6 +176,53 @@ async sub _heal_if_dead {
     return 1;
 }
 
+# Route a PostgreSQL NOTICE (or any other warning DBI's PrintWarn would
+# otherwise print straight to fd 2) through the pool's own logging. DBD::Pg
+# raises it as an ordinary Perl warning while reading from the socket, and
+# measurement is what says where: under pg_async, a statement's own notice
+# surfaces during the pg_ready poll in _wait_for_result, not during execute
+# or pg_result, because execute only dispatches and returns without waiting.
+# All three are wrapped anyway -- it costs nothing on a call that raises
+# nothing, and it stops the interception being tied to which phase a notice
+# happens to arrive in today. prepare is not wrapped; it never touches the
+# network under pg_async.
+#
+# $SIG{__WARN__} is global, so it is localised strictly around the one
+# synchronous call it wraps, never across an await: a local unwinds with its
+# frame, and a caller can cancel while a sub is suspended, running nothing
+# after that point. That also rules out a guard object living for the whole
+# query -- its constructor/DESTROY pair would be a global assignment held
+# across every await the query makes, and two connections' queries running
+# concurrently would have one's DESTROY clobber the other's still-active
+# handler. A local avoids that by construction: its scope is one synchronous
+# call, and only one call is ever running at a time in a single-threaded
+# event loop. Wrapping the call sites individually with this rather than
+# duplicating the handler at each one keeps the recursion guard below in one
+# place.
+sub _capture_pg_notices {
+    my ($self, $code) = @_;
+
+    my $pool = $self->{pool};
+
+    # No pool to log through. Leaving $SIG{__WARN__} untouched lets the
+    # notice behave exactly as it would without this wrapper -- printed, or
+    # caught by whatever handler is already in effect -- which is re-raising
+    # it rather than swallowing it.
+    return $code->() unless $pool;
+
+    local $SIG{__WARN__} = sub {
+        my ($message) = @_;
+        $message =~ s/\n\z//;
+
+        # _log's own fallback, when no on_log is configured, is itself a
+        # warn() -- without this it would re-enter this same handler.
+        local $SIG{__WARN__} = 'DEFAULT';
+        $pool->_log(info => $message);
+    };
+
+    return $code->();
+}
+
 # Core async query execution using DBD::Pg async support
 async sub _execute_async {
     my ($self, $sql, $bind) = @_;
@@ -198,12 +245,14 @@ async sub _execute_async {
     my $statement = Async::DBD::Pg::Connection::_StatementGuard->new($self, $sth);
 
     my $rv = eval {
-        if (ref $bind eq 'ARRAY' && @$bind) {
-            $sth->execute(@$bind);
-        }
-        else {
-            $sth->execute;
-        }
+        $self->_capture_pg_notices(sub {
+            if (ref $bind eq 'ARRAY' && @$bind) {
+                $sth->execute(@$bind);
+            }
+            else {
+                $sth->execute;
+            }
+        });
     };
 
     if ($@ || !defined $rv) {
@@ -215,7 +264,7 @@ async sub _execute_async {
     # Wait for async result using Future::IO
     await $self->_wait_for_result($dbh);
 
-    my $result = eval { $dbh->pg_result };
+    my $result = eval { $self->_capture_pg_notices(sub { $dbh->pg_result }) };
     if ($@ || !$result) {
         my $err = $@ || $dbh->errstr;
         $statement->release;
@@ -264,7 +313,10 @@ async sub _wait_for_result {
 
     my $sock = $self->_get_socket;
 
-    while (!$dbh->pg_ready) {
+    # A statement's own NOTICE is delivered here, while pg_ready reads the
+    # socket -- see _capture_pg_notices. The wrap is per iteration, around
+    # only the synchronous pg_ready call, never across the await below.
+    while (!$self->_capture_pg_notices(sub { $dbh->pg_ready })) {
         await Future::IO->poll($sock, POLLIN);
     }
 }
