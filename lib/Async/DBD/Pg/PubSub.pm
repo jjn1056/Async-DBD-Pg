@@ -270,9 +270,91 @@ async sub _start_listener {
         if (my $conn = delete $self->{conn}) {
             $conn->release;
         }
+
+        return unless $self->{reconnect};
+        return if $self->{_reconnect_future};
+
+        # Held on the object rather than retained, so disconnect and pool
+        # shutdown can stop it.
+        $self->{_reconnect_future} = $self->_reconnect_loop;
     });
 
     $self->{_listener_future} = $listener;
+
+    return $self;
+}
+
+# Re-establish a listener that failed, replaying its subscriptions. Runs until
+# it succeeds, or until something cancels it.
+async sub _reconnect_loop {
+    my ($self) = @_;
+
+    my $attempt = 0;
+
+    while (!$self->{_stopping}) {
+        $attempt++;
+
+        my $delay = _backoff_delay(
+            $attempt,
+            $self->{reconnect_min_interval},
+            $self->{reconnect_max_interval},
+        );
+
+        await Future::IO->sleep($delay);
+
+        last if $self->{_stopping};
+
+        my $ok = eval {
+            my $pool = $self->{pool}
+                or die "pool is gone\n";
+
+            $self->{conn}      = await $pool->connection;
+            $self->{connected} = 1;
+
+            # Replay every registered channel onto the new connection.
+            for my $channel (sort keys %{ $self->{channels} }) {
+                await $self->{conn}->query("LISTEN $channel");
+            }
+
+            await $self->_start_listener;
+            1;
+        };
+        my $err = $@;
+
+        if ($ok) {
+            delete $self->{_reconnect_future};
+
+            # Success is reported through on_reconnect, not through _log. With
+            # no on_log configured _log falls back to warn, and a recovery that
+            # worked should not print to STDERR.
+            if (my $cb = $self->{on_reconnect}) {
+                eval { $cb->($self) };
+                $self->_log(warn => "on_reconnect callback failed: $@") if $@;
+            }
+
+            return $self;
+        }
+
+        # Hand back anything acquired before the failure, so a half-built
+        # attempt does not keep a connection checked out.
+        $self->{connected} = 0;
+        if (my $conn = delete $self->{conn}) {
+            $conn->release;
+        }
+
+        # A pool that has shut down is never going to give us a connection.
+        # The pool raises "has been shut down" for a fresh request and "is
+        # shutting down" for one already queued; match both.
+        if ($err =~ /shut(?:ting)? down/i) {
+            $self->_log(warn => "PubSub giving up on reconnect: $err");
+            delete $self->{_reconnect_future};
+            return $self;
+        }
+
+        $self->_log(warn => "PubSub reconnect attempt $attempt failed: $err");
+    }
+
+    delete $self->{_reconnect_future};
 
     return $self;
 }
@@ -315,6 +397,13 @@ async sub _run_control_query {
 async sub disconnect {
     my ($self) = @_;
 
+    # Stop trying to come back before tearing down; otherwise a reconnect in
+    # flight would re-establish the listener behind us.
+    $self->{_stopping} = 1;
+    if (my $reconnecting = delete $self->{_reconnect_future}) {
+        $reconnecting->cancel unless $reconnecting->is_ready;
+    }
+
     return $self unless $self->{connected} || $self->{conn};
 
     await $self->_stop_listener if $self->{_listener_future};
@@ -335,6 +424,10 @@ sub _pool_shutdown {
     my ($self) = @_;
 
     $self->{_stopping} = 1;
+
+    if (my $reconnecting = delete $self->{_reconnect_future}) {
+        $reconnecting->cancel unless $reconnecting->is_ready;
+    }
 
     if (my $listener = delete $self->{_listener_future}) {
         $listener->cancel unless $listener->is_ready;

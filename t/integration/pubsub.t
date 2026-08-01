@@ -386,4 +386,72 @@ subtest 'a dead listener reports itself disconnected' => sub {
         'expected backend-termination notice captured on stderr';
 };
 
+subtest 'the listener comes back after the connection dies' => sub {
+    my @reconnected;
+    my $pg = Async::DBD::Pg->new(
+        dsn                    => test_dsn(),
+        min_connections        => 0,
+        max_connections        => 4,
+        reconnect              => 1,
+        reconnect_min_interval => 0.1,
+        reconnect_max_interval => 0.5,
+        on_reconnect           => sub { push @reconnected, $_[0] },
+        on_log                 => sub { },
+    );
+    my $pubsub = $pg->pubsub;
+
+    my @got;
+    $pubsub->listen('revival', sub { push @got, $_[1] })->get;
+
+    $pubsub->notify('revival', 'before')->get;
+    wait_until(sub { @got }, 'delivery before the kill', 3);
+    is \@got, ['before'], 'delivering before the connection dies';
+
+    # Killing the backend is expected to make libpq print a termination
+    # notice straight to stderr, bypassing our logging entirely. Captured
+    # and asserted below rather than left to leak into test output.
+    my $captured = capture_stderr(sub {
+        kill_backends();
+        wait_until(sub { @reconnected }, 'reconnected', 15);
+    });
+
+    ok scalar @reconnected, 'on_reconnect fired';
+    ok $pubsub->is_connected, 'connected again';
+    is $pubsub->subscribed_channels, 1, 'channel still subscribed';
+    like $captured, qr/FATAL:\s+terminating connection due to administrator command/,
+        'expected backend-termination notice captured on stderr';
+
+    # The assertion that matters. Everything above could pass while nothing
+    # was actually being delivered any more.
+    $pubsub->notify('revival', 'after')->get;
+    wait_until(sub { @got > 1 }, 'delivery after the reconnect', 5);
+    is \@got, ['before', 'after'], 'notifications flow again';
+
+    $pubsub->disconnect->get;
+};
+
+subtest 'without reconnect the listener stays down' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 4,
+        on_log          => sub { },
+    );
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('stays_down', sub { })->get;
+
+    my $captured = capture_stderr(sub {
+        kill_backends();
+        wait_until(sub { !$pubsub->is_connected }, 'listener noticed', 5);
+    });
+    like $captured, qr/FATAL:\s+terminating connection due to administrator command/,
+        'expected backend-termination notice captured on stderr';
+
+    # Give a reconnect long enough to have happened, had one been asked for.
+    Future::IO->sleep(1)->get;
+
+    ok !$pubsub->is_connected, 'stays disconnected when reconnect is off';
+};
+
 done_testing;
