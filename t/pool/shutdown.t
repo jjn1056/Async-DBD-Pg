@@ -221,8 +221,8 @@ subtest 'shutdown completes while a listener is trying to reconnect' => sub {
         min_connections        => 0,
         max_connections        => 4,
         reconnect              => 1,
-        reconnect_min_interval => 0.2,
-        reconnect_max_interval => 1,
+        reconnect_min_interval => 1,
+        reconnect_max_interval => 2,
         on_log                 => sub { },
     );
     my $pubsub = $pg->pubsub;
@@ -254,6 +254,18 @@ subtest 'shutdown completes while a listener is trying to reconnect' => sub {
 
     ok $pg->is_shut_down, 'shutdown completed';
     is $pg->total_count, 0, 'pool empty';
+
+    # The backoff drawn above is [0.5, 1.0)s and shutdown lands 0.3s in, so a
+    # supervisor left to wake up on its own would still be sleeping here --
+    # only Task 4's cancel in _pool_shutdown settles it this promptly. Total
+    # connection count alone cannot tell cancelled apart from merely
+    # outlived, because the other two guards (the loop's own _stopping check
+    # and connection()'s refusal once the pool is shutting down) keep the
+    # symptom off the pool's stats regardless of whether the supervisor was
+    # ever actually stopped. This checks the mechanism itself, not just the
+    # invariant it protects.
+    is $pubsub->{_reconnect_future}, undef,
+        'the supervisor is cancelled promptly rather than left to expire on its own';
 
     # Nothing may reconnect afterwards and put a connection back.
     Future::IO->sleep(1.5)->get;
