@@ -380,6 +380,10 @@ async sub connection {
         push @{$self->{active}}, $conn;
         $conn->{last_used} = time();
         $conn->{released} = 0;
+
+        # It has been sitting unused and its server may have gone away since.
+        $conn->{_check_liveness} = 1;
+
         return $conn;
     }
 
@@ -499,6 +503,31 @@ async sub _create_connection {
     }
 
     $self->{stats}{created}++;
+    return $conn;
+}
+
+# Give a connection a working handle in place of a dead one. The replacement
+# is built by the ordinary connect path, so async connect, on_connect and
+# statement_timeout all apply and there is no second copy of connect logic to
+# drift. The Connection object never leaves the active list, so no pool counts
+# move.
+async sub _replace_dbh {
+    my ($self, $conn) = @_;
+
+    my $fresh = await $self->_create_connection;
+
+    # Take the handle and neutralise the wrapper it arrived in: it was never
+    # added to any pool list, and its destructor would otherwise release a
+    # connection the pool is not tracking.
+    my $dbh = delete $fresh->{dbh};
+    $fresh->{released} = 1;
+    $fresh->{pool}     = undef;
+
+    $conn->_close_dbh;
+    $self->{stats}{discarded}++;
+
+    $conn->{dbh} = $dbh;
+
     return $conn;
 }
 
@@ -1086,22 +1115,29 @@ if that matters to you.
 
 =head3 heal_dead_connections
 
-Replace a pooled connection that turns out to be dead and run the caller's
-statement again, instead of failing. On by default; set to 0 to have the
-original error propagate untouched.
+Replace a pooled connection that turns out to be dead before running the
+caller's statement on it, instead of failing. On by default; set to 0 to have
+the original error propagate untouched.
 
 A connection can die while sitting idle in the pool, most often because the
 server restarted or an administrator ended the session. The caller who is
 handed it next has done nothing wrong, so the pool repairs itself rather than
 reporting a fault of its own making.
 
-The retry is deliberately narrow. It happens only when the statement provably
-never reached the server, which is the case when C<prepare> or C<execute>
-fails, since it is C<execute> that dispatches a statement. Once a statement has
-been sent it is never retried, because it may already have run. A statement
-inside a transaction is never retried either: the transaction died with the
-connection, and running the statement on a replacement would silently execute
-it outside the transaction the caller asked for.
+The check runs once, before the first statement on a connection that came
+from the idle list; a connection the pool just built cannot be stale, so
+freshly created connections skip it. It costs nothing on the common path: a
+healthy idle connection has nothing waiting to be read, so a non-blocking
+check of the socket is enough to tell it apart from one whose server has
+gone, which is readable because the peer's close is already sitting there. A
+connection that looks wrong this way is confirmed dead with a ping before
+being condemned, since a channel notification delivered to a pooled
+connection would look the same and is not a fault. Only a connection
+confirmed dead is replaced, and only before its statement is ever sent, so
+nothing is retried and no statement can run twice. A statement inside a
+transaction is never healed either: the transaction died with the connection,
+and running the statement on a replacement would silently execute it outside
+the transaction the caller asked for.
 
 Finding a dead connection also discards the pool's other idle connections,
 on the reasoning that whatever killed one has usually killed the rest. This

@@ -2,6 +2,9 @@ use strict;
 use warnings;
 use Test2::V0;
 use Future::AsyncAwait;
+use DBI;
+use File::Temp ();
+use Scalar::Util qw(refaddr);
 
 use lib 't/lib';
 use Test::Async::DBD::Pg qw(skip_without_postgres test_dsn);
@@ -14,6 +17,7 @@ use Future::IO;
 BEGIN { Future::IO->load_best_impl; }
 
 use Async::DBD::Pg;
+use Async::DBD::Pg::Util ();
 
 subtest 'create pool' => sub {
     my $pg = Async::DBD::Pg->new(
@@ -381,6 +385,208 @@ subtest 'safe_dsn masks password' => sub {
     );
 
     is $pg->safe_dsn, 'postgresql://user:***@localhost/db', 'password masked';
+};
+
+sub capture_stderr {
+    my ($code) = @_;
+
+    my ($fh, $path) = File::Temp::tempfile(UNLINK => 1);
+    close $fh;
+
+    open my $saved, '>&', \*STDERR or die "dup stderr: $!";
+    open STDERR, '>', $path or die "redirect stderr: $!";
+
+    my $ok = eval { $code->(); 1 };
+    my $err = $@;
+
+    open STDERR, '>&', $saved or die "restore stderr: $!";
+    close $saved;
+
+    die $err unless $ok;
+
+    open my $read, '<', $path or die "read captured stderr: $!";
+    local $/;
+    my $captured = <$read>;
+    close $read;
+
+    return $captured;
+}
+
+sub kill_all_backends {
+    my $parsed = Async::DBD::Pg::Util::parse_dsn(test_dsn());
+    my $dbh = DBI->connect(
+        $parsed->{dbi_dsn}, $parsed->{user}, $parsed->{password},
+        { RaiseError => 1, PrintError => 0 },
+    );
+    $dbh->do(q{
+        SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+         WHERE datname = current_database() AND pid <> pg_backend_pid()
+    });
+    $dbh->disconnect;
+    return;
+}
+
+subtest 'a connection that died while idle is repaired, not reported' => sub {
+    my @logged;
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 3,
+        on_log          => sub { push @logged, $_[1] },
+    );
+
+    my $conn = $pg->connection->get;
+    $conn->query('SELECT 1')->get;
+    $conn->release;
+
+    my $captured = capture_stderr(sub {
+        kill_all_backends();
+        Future::IO->sleep(0.2)->get;
+    });
+
+    my $again = $pg->connection->get;
+    my $before = $again->dbh;
+
+    # The caller must not see the pool's problem.
+    my $result = $again->query('SELECT 42 AS answer')->get;
+    is $result->first->{answer}, 42, 'statement ran despite the dead connection';
+
+    isnt refaddr($again->dbh), refaddr($before), 'the handle was replaced';
+    ok scalar(grep { /dead/i } @logged), 'the replacement was reported';
+
+    $again->release;
+};
+
+subtest 'a statement inside a transaction is never retried' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 3,
+        on_log          => sub { },
+    );
+
+    my $conn = $pg->connection->get;
+    $conn->query('SELECT 1')->get;
+
+    my $err = dies {
+        $conn->transaction(async sub {
+            my ($tx) = @_;
+            await $tx->query('SELECT 1');
+
+            capture_stderr(sub {
+                kill_all_backends();
+                Future::IO->sleep(0.2)->get;
+            });
+
+            # The transaction died with the connection. Running this on a
+            # replacement would execute it outside the caller's transaction.
+            await $tx->query('SELECT 2');
+        })->get;
+    };
+
+    ok $err, 'the failure reaches the caller rather than being papered over';
+
+    $conn->release;
+};
+
+subtest 'a real SQL error is not treated as a dead connection' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 2,
+        on_log          => sub { },
+    );
+
+    my $conn = $pg->connection->get;
+    my $before = $conn->dbh;
+
+    my $err = dies { $conn->query('SELECT * FROM no_such_table_here')->get };
+
+    isa_ok $err, 'Async::DBD::Pg::Error::Query';
+    is $conn->dbh, $before, 'the connection was not replaced';
+
+    $conn->release;
+};
+
+subtest 'a statement that was already sent is never retried' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 3,
+        on_log          => sub { },
+    );
+
+    my $conn = $pg->connection->get;
+    my $before = $conn->dbh;
+
+    # Kill the backend while the statement is in flight. execute already
+    # succeeded, so the statement reached the server and may have run.
+    # Repeating it is exactly what must not happen.
+    my $slow = $conn->query('SELECT pg_sleep(3)');
+
+    my $err;
+    capture_stderr(sub {
+        Future::IO->sleep(0.3)->get;
+        kill_all_backends();
+        $err = dies { $slow->get };
+    });
+
+    ok $err, 'the failure reaches the caller';
+    is $conn->dbh, $before, 'the connection was not replaced and nothing rerun';
+
+    $conn->release;
+};
+
+subtest 'nothing is healed while the pool is shutting down' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 3,
+        on_log          => sub { },
+    );
+
+    my $conn = $pg->connection->get;
+    $conn->query('SELECT 1')->get;
+
+    capture_stderr(sub {
+        kill_all_backends();
+        Future::IO->sleep(0.2)->get;
+    });
+
+    # Shutting down means the pool will not hand out connections, so it must
+    # not try to build one to repair this either.
+    $pg->{_shutting_down} = 1;
+
+    my $before = $conn->dbh;
+    ok dies { $conn->query('SELECT 1')->get },
+        'the error propagates rather than being healed';
+    is $conn->dbh, $before, 'no replacement was built during shutdown';
+
+    $pg->{_shutting_down} = 0;
+    $conn->release;
+};
+
+subtest 'healing can be turned off' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn                   => test_dsn(),
+        min_connections       => 0,
+        max_connections       => 3,
+        heal_dead_connections => 0,
+        on_log                => sub { },
+    );
+
+    my $conn = $pg->connection->get;
+    $conn->query('SELECT 1')->get;
+    $conn->release;
+
+    capture_stderr(sub {
+        kill_all_backends();
+        Future::IO->sleep(0.2)->get;
+    });
+
+    my $again = $pg->connection->get;
+    ok dies { $again->query('SELECT 1')->get },
+        'the original error propagates when healing is off';
 };
 
 done_testing;

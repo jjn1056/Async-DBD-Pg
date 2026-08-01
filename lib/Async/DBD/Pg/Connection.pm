@@ -53,6 +53,11 @@ async sub query {
         ($sql, $bind) = convert_placeholders($sql, $bind);
     }
 
+    # Once per checkout, and only for a connection that was idle.
+    if (delete $self->{_check_liveness}) {
+        await $self->_heal_if_dead;
+    }
+
     $self->{query_count}++;
     $self->{last_used} = time();
 
@@ -120,6 +125,55 @@ async sub _query_with_timeout {
     }
 
     die $failure;
+}
+
+# Replace this connection if it died while it was sitting idle. Called before
+# the first statement after checkout, never after a failure: a statement on a
+# dead connection succeeds at prepare and at execute and only fails at
+# pg_result, by which point it may already have run and nothing about it can
+# safely be repeated.
+async sub _heal_if_dead {
+    my ($self) = @_;
+
+    my $pool = $self->{pool} or return 0;
+
+    return 0 unless $pool->{heal_dead_connections};
+    return 0 if $pool->{_shutting_down};
+
+    # The transaction died with the connection. Continuing on a replacement
+    # would run the caller's statements outside the transaction they asked
+    # for, which is worse than the failure.
+    return 0 if $self->{in_transaction};
+
+    my $dbh = $self->{dbh} or return 0;
+
+    # Free, and no round trip: a healthy idle connection has nothing waiting
+    # to be read, while one whose server has gone is readable because the
+    # peer's close is sitting there. DBI's own Active flag stays true on a
+    # dead connection and is no help.
+    my $fd = $dbh->{pg_socket};
+    return 0 unless defined $fd && $fd >= 0;
+
+    my $rin = '';
+    vec($rin, $fd, 1) = 1;
+    return 0 unless select(my $rout = $rin, undef, undef, 0);
+
+    # Readable is suggestive, not conclusive: an asynchronous notification
+    # would look the same if an application ran LISTEN on a pooled
+    # connection. Confirm before throwing the connection away. This round
+    # trip happens only when something already looks wrong.
+    return 0 if $dbh->ping;
+
+    $pool->_log(warn => 'replacing a pooled connection that was already dead');
+
+    await $pool->_replace_dbh($self);
+
+    # Whatever killed this one has usually killed the rest.
+    my $dropped = $pool->_discard_idle_connections;
+    $pool->_log(warn => "discarded $dropped idle connection(s) after finding one dead")
+        if $dropped;
+
+    return 1;
 }
 
 # Core async query execution using DBD::Pg async support
