@@ -683,12 +683,14 @@ subtest 'the give-up check does not fire on PostgreSQL wording alone' => sub {
     is scalar(grep { /giving up on reconnect/i } @logged), 0,
         'never gave up';
 
-    # Pins the real on_connect error reaching the supervisor rather than a
-    # generic "Died at ..." -- if $@ ever gets clobbered again before this
-    # check, the retry count and zero-give-ups assertions above would still
-    # hold, silently going back to a test that cannot tell old and new
-    # behaviour apart.
-    ok scalar(grep { /the database system is shutting down/ } @logged),
+    # Pins the real on_connect error reaching the supervisor's own log line
+    # specifically, rather than a generic "Died at ...". Matching anywhere in
+    # @logged is not enough: the pool's own "on_connect failed: ..." line
+    # carries the correct text even under the $@-clobbering bug, since it
+    # interpolates $@ before _close_dbh gets a chance to clear it -- only the
+    # value that travels through the die (into the supervisor's own
+    # "reconnect attempt N failed" line) was ever wrong.
+    ok scalar(grep { /reconnect attempt \d+ failed:.*the database system is shutting down/s } @logged),
         'the real on_connect error reaches the supervisor';
 
     $pg->shutdown(force => 1)->get;
@@ -766,6 +768,73 @@ subtest 'a connection dying again mid-replay does not leave the supervisor inert
     ok wait_until(sub { $pubsub->is_connected }, 'supervisor recovers on its own', 10),
         'the supervisor keeps retrying rather than going inert';
     is $pubsub->subscribed_channels, 2, 'both channels still registered';
+
+    $pubsub->disconnect->get;
+};
+
+subtest 'a failure that escapes through on_log still clears the reconnect slot' => sub {
+    my @logged;
+    my $connect_attempts = 0;
+    my $pg = Async::DBD::Pg->new(
+        dsn                    => test_dsn(),
+        min_connections        => 0,
+        max_connections        => 4,
+        reconnect              => 1,
+        reconnect_min_interval => 0.2,
+        reconnect_max_interval => 0.4,
+        on_log                 => sub {
+            push @logged, $_[1];
+            die "boom\n" if $_[1] =~ /reconnect attempt \d+ failed/;
+        },
+    );
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('on_ready_guard', sub { })->get;
+
+    # The merged eval added in round 3 catches a failure anywhere inside an
+    # attempt, but the failure handling after it -- $conn->release and
+    # _log -- sits outside that eval, same as it always has. Making the
+    # very next connect attempt fail drives the supervisor's own first
+    # attempt to a genuine "reconnect attempt N failed" log call, and the
+    # on_log above turns that into a die. That escapes _reconnect_loop's
+    # async sub entirely, failing its future for real: the exact route
+    # round 2's on_ready cleanup exists for, which the round-3 test does not
+    # exercise at all now that its stubbed failure is caught and retried in
+    # place instead of escaping.
+    $pg->{on_connect} = sub {
+        $connect_attempts++;
+        die "simulated: first reconnect attempt fails\n" if $connect_attempts == 1;
+        return Future->done;
+    };
+
+    my $captured1 = capture_stderr(sub {
+        kill_backends();
+        wait_until(sub { !$pubsub->is_connected }, 'listener noticed', 5);
+    });
+    like $captured1, qr/FATAL:\s+terminating connection due to administrator command/,
+        'expected backend-termination notice captured on stderr';
+
+    ok wait_until(sub { !defined $pubsub->{_reconnect_future} }, 'reconnect slot released', 5),
+        'the escaping die still clears _reconnect_future rather than leaving a dead future behind';
+
+    # Nothing is left running to notice on its own -- the escaping die took
+    # the whole supervisor down with it, same as any uncaught exception
+    # always would. Reconnect normally (the on_connect stub above only
+    # fails the very first attempt) so there is a listener to kill again.
+    $pubsub->connect->get;
+    ok $pubsub->is_connected, 'reconnected normally afterward';
+
+    my $captured2 = capture_stderr(sub {
+        kill_backends();
+        wait_until(sub { !$pubsub->is_connected }, 'listener noticed again', 5);
+    });
+    like $captured2, qr/FATAL:\s+terminating connection due to administrator command/,
+        'expected backend-termination notice captured on stderr';
+
+    ok wait_until(sub {
+        $pubsub->{_reconnect_future} && !$pubsub->{_reconnect_future}->is_ready
+    }, 'a new supervisor starts after the next death', 5),
+        'reconnect re-arms rather than staying permanently dead';
 
     $pubsub->disconnect->get;
 };
