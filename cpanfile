@@ -4,10 +4,18 @@
 # [Prereqs::FromCPANfile], so the released metadata and anything that
 # installs from a checkout cannot drift apart.
 
-# 5.20 rather than 5.18: DBI 1.651 and later require 5.020, so a fresh
-# install on 5.18 cannot resolve a current DBI at all. Declaring a floor the
-# dependency set cannot actually meet is a promise that breaks on contact.
-requires 'perl', '5.020';
+# 5.24 is a hard floor, established by testing rather than chosen.
+#
+# Future::AsyncAwait implements cancellation propagation only on 5.24 and
+# above: below that an async sub stops when cancelled but does not propagate
+# the request into the future it is awaiting. This distribution depends on
+# that propagation throughout — every guard that releases a resource when a
+# caller cancels mid-await relies on it — so on 5.20 and 5.22 the suite fails
+# wholesale, not marginally.
+#
+# 5.18 is additionally impossible: DBI 1.651 and later require 5.020, so a
+# fresh install cannot resolve a current DBI at all.
+requires 'perl', '5.024';
 
 # Three components, deliberately. DBD::Pg declares its version with qv(),
 # so a single-decimal '3.18' is read as v3.180.0 — a release that will never
