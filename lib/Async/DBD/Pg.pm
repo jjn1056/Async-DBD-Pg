@@ -858,8 +858,8 @@ on.
 A connection pool is largely a story about work being abandoned: a caller
 gives up on a query, a listener is told to stop, an application shuts the pool
 down while a connection is still being established. Each of those paths has to
-release something — a connection slot, a statement handle, a paused listener —
-and each relies on the cancellation reaching the operation actually being
+release something: a connection slot, a statement handle, a paused
+listener. Each relies on the cancellation reaching the operation actually being
 awaited. Without that the resource is never released, and the pool degrades
 quietly rather than failing visibly.
 
