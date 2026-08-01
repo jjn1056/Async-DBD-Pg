@@ -69,6 +69,13 @@ sub new {
         on_release => delete $args{on_release},
         on_log     => delete $args{on_log},
 
+        # Pub/sub reconnect. Set on the pool because that is what an
+        # application constructs; pubsub takes no arguments.
+        reconnect              => delete $args{reconnect}              // 0,
+        reconnect_min_interval => delete $args{reconnect_min_interval} // 0.5,
+        reconnect_max_interval => delete $args{reconnect_max_interval} // 30,
+        on_reconnect           => delete $args{on_reconnect},
+
         # Pool state
         idle    => [],
         active  => [],
@@ -985,6 +992,44 @@ that dies causes the connection to be discarded rather than reused.
     },
 
 Receives the pool's own diagnostics. Without it they go to C<warn>.
+
+=head3 reconnect
+
+Re-establish the pub/sub listener when its connection fails, re-subscribing
+every channel that was registered. Off by default.
+
+A listener is long lived, so the connection it holds will eventually be lost to
+a network fault, a failover or a server restart. Without this, the subscription
+is gone and nothing arrives again.
+
+Notifications sent while the listener was down are not recovered.
+C<LISTEN>/C<NOTIFY> keeps no history, so there is nothing to replay. What this
+gives you is a listener that comes back and tells you it did; if you need to
+know what you missed, resynchronise from your own tables when L</on_reconnect>
+fires.
+
+=head3 reconnect_min_interval
+
+Seconds to wait before the first reconnect attempt. Defaults to 0.5.
+
+=head3 reconnect_max_interval
+
+Longest the wait between attempts may grow to. Defaults to 30.
+
+The wait doubles from the minimum towards this ceiling and is then jittered, so
+many listeners reconnecting to the same server do not arrive together. Attempts
+continue indefinitely; each one is reported through L</on_log>.
+
+=head3 on_reconnect
+
+    on_reconnect => sub {
+        my ($pubsub) = @_;
+        ...
+    },
+
+Called after the listener has been re-established and every channel
+re-subscribed. Read it as "you may have missed notifications", and resynchronise
+if that matters to you.
 
 =head2 connection
 

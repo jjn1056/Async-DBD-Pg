@@ -10,13 +10,23 @@ use Scalar::Util qw(refaddr weaken);
 sub new {
     my ($class, %args) = @_;
 
+    my $pool = $args{pool};
+
     my $self = bless {
-        pool             => $args{pool},
+        pool             => $pool,
         conn             => undef,
         channels         => {},
         connected        => 0,
         _listener_future => undef,
         _stopping        => 0,
+
+        # Read from the pool, which is where an application sets them.
+        reconnect              => $pool ? $pool->{reconnect}              : 0,
+        reconnect_min_interval => $pool ? $pool->{reconnect_min_interval} : 0.5,
+        reconnect_max_interval => $pool ? $pool->{reconnect_max_interval} : 30,
+        on_reconnect           => $pool ? $pool->{on_reconnect}           : undef,
+
+        _reconnect_future => undef,
     }, $class;
 
     weaken($self->{pool}) if $self->{pool};

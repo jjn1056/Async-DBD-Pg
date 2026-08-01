@@ -133,4 +133,33 @@ subtest 'backoff delay is jittered within its ceiling' => sub {
     }
 };
 
+subtest 'reconnect settings are taken from the pool' => sub {
+    my $off = Async::DBD::Pg->new(
+        dsn             => 'postgresql://user:secret@localhost/test',
+        min_connections => 0,
+        max_connections => 1,
+    )->pubsub;
+
+    is $off->{reconnect}, 0, 'reconnect is off unless asked for';
+    is $off->{reconnect_min_interval}, 0.5, 'default minimum interval';
+    is $off->{reconnect_max_interval}, 30, 'default maximum interval';
+    is $off->{on_reconnect}, undef, 'no reconnect callback by default';
+
+    my $cb = sub { };
+    my $on = Async::DBD::Pg->new(
+        dsn                    => 'postgresql://user:secret@localhost/test',
+        min_connections        => 0,
+        max_connections        => 1,
+        reconnect              => 1,
+        reconnect_min_interval => 2,
+        reconnect_max_interval => 60,
+        on_reconnect           => $cb,
+    )->pubsub;
+
+    is $on->{reconnect}, 1, 'reconnect enabled';
+    is $on->{reconnect_min_interval}, 2, 'minimum interval carried across';
+    is $on->{reconnect_max_interval}, 60, 'maximum interval carried across';
+    is $on->{on_reconnect}, $cb, 'callback carried across';
+};
+
 done_testing;
