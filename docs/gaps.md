@@ -294,8 +294,8 @@ The premise the original fix was built on was disproved by testing, and that is 
 recording because it is the interesting part: a statement on a dead connection succeeds at
 `prepare` and at `execute`, and fails only at `pg_result` — by which point it may already
 have run, so retrying after a failure is never safe. That is why the check happens before
-dispatch rather than after a failure. Both the implementer and an independent reviewer
-measured this.
+dispatch rather than after a failure. This was measured directly, and reproduced
+independently before the design was changed to rely on it.
 
 Finding one dead connection also discards the idle ones, since whatever killed it has
 usually killed them too.
