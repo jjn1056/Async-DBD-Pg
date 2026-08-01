@@ -290,13 +290,16 @@ With that distinction in mind, the individual cases:
 - No healing inside a transaction. The error propagates, and no statement runs
   on a replacement connection. (Structural, and provably unreachable — see
   above.)
-- A syntax error on a live connection is reported as itself. The socket is not
-  readable, so the check costs nothing and concludes nothing — that is the
-  mechanism when this connection has been idle-checked-out. The test for it
-  in the current suite uses a freshly built connection instead, so it does
-  not currently exercise that mechanism either; it establishes the same
-  observable outcome (a syntax error is reported as itself) without
-  exercising `_heal_if_dead` at all.
+- A real SQL error on a live connection is reported as itself (an earlier
+  pass at this document and the test it describes both called this a syntax
+  error; the test's own query is an undefined-table error, SQLSTATE 42P01,
+  which is a different error class, so both were renamed rather than only
+  one). The socket is not readable, so the check costs nothing and concludes
+  nothing — that is the mechanism when this connection has been
+  idle-checked-out. The test for it in the current suite uses a freshly
+  built connection instead, so it does not currently exercise that mechanism
+  either; it establishes the same observable outcome (a real SQL error is
+  reported as itself) without exercising `_heal_if_dead` at all.
 - A connection that dies while its result is awaited fails to the caller, and
   the statement that reached the server did not run a second time — observed
   directly via a probe table, not inferred from the error and the handle
@@ -313,9 +316,14 @@ With that distinction in mind, the individual cases:
   discovering another dead one. Connections checked out by other callers are
   left in place.
 
-Killing a backend makes libpq write a notice straight to file descriptor 2, so
-any test that does it captures and asserts that output, as the existing suite
-does. What actually lands in each capture window was established by running
+Killing a backend makes libpq write a notice straight to file descriptor 2
+only when something actively polls the connection afterward with
+`PQconsumeInput`, as the pub/sub listener's `pg_notifies` loop does — not
+unconditionally, whatever the sentence used to say here implied. Whether or
+not that condition holds for a given test, any test that kills a backend
+captures stderr at the descriptor level and asserts on what it finds there,
+as the existing suite does. What actually lands in each capture window was
+established by running
 it, not guessed, and the answer is uniform across every window in this suite:
 none of them catch the notice. It is not that the notice never appears —
 `t/pool/shutdown.t` catches it reliably — but that the pub/sub listener gets

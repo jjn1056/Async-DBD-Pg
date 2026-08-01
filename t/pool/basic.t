@@ -464,6 +464,35 @@ subtest 'a connection that died while idle is repaired, not reported' => sub {
     $again->release;
 };
 
+subtest 'healing invalidates the cached poll socket on the connection' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 1,
+        on_log          => sub { },
+    );
+
+    my $conn = $pg->connection->get;
+    $conn->query('SELECT 1')->get;    # populates _cached_sock / _cached_fd
+
+    ok exists $conn->{_cached_sock}, 'the poll cache is populated before healing';
+
+    $pg->_replace_dbh($conn)->get;
+
+    # A behavioural check here -- run a query on the healed connection and
+    # confirm the cache tracks the new fd -- would pass with or without the
+    # fix: the cache-miss path in _get_socket reaches the same state whenever
+    # the cached fd differs from the current one, which it always does here
+    # regardless of whether the old cache was cleared. Only asserting the
+    # cache was actually cleared, not merely superseded, is honest. Do not
+    # "simplify" this into a behavioural query and expect it to still mean
+    # anything.
+    ok !exists $conn->{_cached_sock}, 'the transplant invalidates the poll cache';
+    ok !exists $conn->{_cached_fd}, 'and the cached fd number with it';
+
+    $conn->release;
+};
+
 subtest 'a transaction whose connection dies reports the failure to the caller' => sub {
     my $pg = Async::DBD::Pg->new(
         dsn             => test_dsn(),
@@ -506,7 +535,7 @@ subtest 'a transaction whose connection dies reports the failure to the caller' 
     $conn->release;
 };
 
-subtest 'a syntax error on a live connection is reported as itself' => sub {
+subtest 'a real SQL error on a live connection is reported as itself' => sub {
     my $pg = Async::DBD::Pg->new(
         dsn             => test_dsn(),
         min_connections => 0,
@@ -543,11 +572,27 @@ subtest 'a connection that dies while its result is awaited fails to the caller'
     # the statement a side effect that can be counted afterward from a
     # separate connection, which observes the property the feature is
     # organised around directly: did this run twice.
-    # Named per pid rather than guarded with IF EXISTS: the latter's harmless
-    # NOTICE still reaches DBI's PrintWarn and prints to stderr, which this
-    # suite's zero-byte requirement does not forgive just because the text
-    # is benign.
-    my $probe = 'heal_probe_' . $$;
+    #
+    # Cleanup uses DROP TABLE IF EXISTS on a connection with PrintWarn off:
+    # the NOTICE that statement emits on a table that doesn't exist yet
+    # otherwise reaches DBI's PrintWarn and prints to stderr regardless of
+    # $^W, which this suite's zero-byte requirement does not forgive just
+    # because the text is benign. Cleaned up before creating too, not only
+    # after, so a table a previous run's throw left behind under the same
+    # reused pid doesn't fail this run's CREATE TABLE.
+    my $parsed = Async::DBD::Pg::Util::parse_dsn(test_dsn());
+    my $probe  = 'heal_probe_' . $$;
+    my $connect_quiet = sub {
+        return DBI->connect(
+            $parsed->{dbi_dsn}, $parsed->{user}, $parsed->{password},
+            { RaiseError => 1, PrintError => 0, PrintWarn => 0 },
+        );
+    };
+
+    my $pre = $connect_quiet->();
+    $pre->do("DROP TABLE IF EXISTS $probe");
+    $pre->disconnect;
+
     $conn->query("CREATE TABLE $probe (tag text)")->get;
 
     # Kill the backend while the statement is in flight. execute already
@@ -570,20 +615,20 @@ subtest 'a connection that dies while its result is awaited fails to the caller'
     });
     is $c19, '', 'the failure is reported through the exception, not fd2';
 
-    ok $err, 'the failure reaches the caller';
+    # A bare ok $err would also pass if the statement were never dispatched
+    # at all, so it does not confirm its own premise -- that this failure
+    # arrived while awaiting the result of a statement already on the wire.
+    like $err, qr/terminating connection|server closed/i,
+        'the failure is the connection dying while its result was awaited';
     is refaddr($conn->dbh), refaddr($before), 'the connection object is unchanged';
 
     # The killed backend aborts the in-flight insert, so the honest count is
     # 0; a re-execution on a replacement connection would commit and make it
     # 1. Checked from a fresh connection, since $conn's own is dead.
-    my $parsed = Async::DBD::Pg::Util::parse_dsn(test_dsn());
-    my $checker = DBI->connect(
-        $parsed->{dbi_dsn}, $parsed->{user}, $parsed->{password},
-        { RaiseError => 1, PrintError => 0 },
-    );
+    my $checker = $connect_quiet->();
     my ($count) = $checker->selectrow_array("SELECT count(*) FROM $probe");
     is $count, 0, 'the statement never ran';
-    $checker->do("DROP TABLE $probe");
+    $checker->do("DROP TABLE IF EXISTS $probe");
     $checker->disconnect;
 
     $conn->release;
