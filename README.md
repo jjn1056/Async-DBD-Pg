@@ -37,10 +37,35 @@ my $pg = Async::DBD::Pg->new(
 
 ## Requirements
 
-- Perl 5.24+ (Future::AsyncAwait propagates cancellation only from 5.24)
+- Perl 5.24+
 - Future::IO 0.23
 - Future::AsyncAwait 0.66+
 - DBD::Pg 3.18+ (3.19.0+ for async connect)
+
+### Why Perl 5.24
+
+The floor is set by a dependency, not by preference, and it is not movable
+without giving up correctness.
+
+`Future::AsyncAwait` implements **cancellation propagation only on Perl 5.24
+and later**. On an older Perl an `async sub` still stops running when it is
+cancelled, but the cancellation is not passed into the future it was waiting
+on.
+
+That matters here because a connection pool is largely a story about work
+being abandoned: a caller gives up on a query, a listener is told to stop, an
+application shuts the pool down while a connection is still being
+established. Every one of those paths releases something — a connection slot,
+a statement handle, a paused listener — and every one of them relies on the
+cancellation actually reaching the operation being awaited. Without that, the
+resource is never released and the pool quietly degrades.
+
+Tested rather than assumed: on 5.24 through 5.40 the suite passes, and on
+5.20 and 5.22 it fails outright, taking the cursor and transaction tests with
+it.
+
+Perl 5.18 is doubly excluded — DBI 1.651 and later require 5.20, so a fresh
+install cannot resolve a current DBI at all.
 
 ## How It Works
 

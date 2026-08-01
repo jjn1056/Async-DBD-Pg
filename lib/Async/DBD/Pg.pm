@@ -845,6 +845,31 @@ abstraction layer. Features include:
 
 =back
 
+=head2 Why Perl 5.24 Is Required
+
+The floor is set by a dependency rather than by preference, and it cannot be
+lowered without giving up correctness.
+
+L<Future::AsyncAwait> implements cancellation propagation only on Perl 5.24
+and later. On an older Perl an C<async sub> still stops running when it is
+cancelled, but the cancellation is not passed into the future it was waiting
+on.
+
+A connection pool is largely a story about work being abandoned: a caller
+gives up on a query, a listener is told to stop, an application shuts the pool
+down while a connection is still being established. Each of those paths has to
+release something — a connection slot, a statement handle, a paused listener —
+and each relies on the cancellation reaching the operation actually being
+awaited. Without that the resource is never released, and the pool degrades
+quietly rather than failing visibly.
+
+This was established by testing, not by reading. The suite passes on Perl 5.24
+through 5.40 and fails outright on 5.20 and 5.22, taking the cursor and
+transaction tests with it.
+
+Perl 5.18 is excluded twice over: L<DBI> 1.651 and later require Perl 5.20, so
+a fresh install cannot resolve a current DBI on it at all.
+
 =head2 Event Loop Independence
 
 This module is intentionally DBD::Pg-backed rather than backend-pluggable.
