@@ -4,7 +4,10 @@
 # [Prereqs::FromCPANfile], so the released metadata and anything that
 # installs from a checkout cannot drift apart.
 
-requires 'perl', '5.018';
+# 5.20 rather than 5.18: DBI 1.651 and later require 5.020, so a fresh
+# install on 5.18 cannot resolve a current DBI at all. Declaring a floor the
+# dependency set cannot actually meet is a promise that breaks on contact.
+requires 'perl', '5.020';
 
 # Three components, deliberately. DBD::Pg declares its version with qv(),
 # so a single-decimal '3.18' is read as v3.180.0 — a release that will never

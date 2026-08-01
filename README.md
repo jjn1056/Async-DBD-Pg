@@ -37,7 +37,7 @@ my $pg = Async::DBD::Pg->new(
 
 ## Requirements
 
-- Perl 5.18+
+- Perl 5.20+
 - Future::IO 0.23
 - Future::AsyncAwait 0.66+
 - DBD::Pg 3.18+ (3.19.0+ for async connect)
