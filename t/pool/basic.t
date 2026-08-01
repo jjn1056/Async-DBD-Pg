@@ -503,7 +503,7 @@ subtest 'a real SQL error is not treated as a dead connection' => sub {
     my $err = dies { $conn->query('SELECT * FROM no_such_table_here')->get };
 
     isa_ok $err, 'Async::DBD::Pg::Error::Query';
-    is $conn->dbh, $before, 'the connection was not replaced';
+    is refaddr($conn->dbh), refaddr($before), 'the connection was not replaced';
 
     $conn->release;
 };
@@ -532,7 +532,7 @@ subtest 'a statement that was already sent is never retried' => sub {
     });
 
     ok $err, 'the failure reaches the caller';
-    is $conn->dbh, $before, 'the connection was not replaced and nothing rerun';
+    is refaddr($conn->dbh), refaddr($before), 'the connection was not replaced and nothing rerun';
 
     $conn->release;
 };
@@ -560,7 +560,7 @@ subtest 'nothing is healed while the pool is shutting down' => sub {
     my $before = $conn->dbh;
     ok dies { $conn->query('SELECT 1')->get },
         'the error propagates rather than being healed';
-    is $conn->dbh, $before, 'no replacement was built during shutdown';
+    is refaddr($conn->dbh), refaddr($before), 'no replacement was built during shutdown';
 
     $pg->{_shutting_down} = 0;
     $conn->release;
