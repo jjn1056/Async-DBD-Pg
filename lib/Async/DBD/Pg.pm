@@ -76,6 +76,11 @@ sub new {
         reconnect_max_interval => delete $args{reconnect_max_interval} // 30,
         on_reconnect           => delete $args{on_reconnect},
 
+        # A connection that died while idle is replaced and the caller's
+        # statement run again, rather than the caller being handed a failure
+        # the pool caused.
+        heal_dead_connections => delete $args{heal_dead_connections} // 1,
+
         # Pool state
         idle    => [],
         active  => [],
@@ -1059,6 +1064,28 @@ continue indefinitely; each one is reported through L</on_log>.
 Called after the listener has been re-established and every channel
 re-subscribed. Read it as "you may have missed notifications", and resynchronise
 if that matters to you.
+
+=head3 heal_dead_connections
+
+Replace a pooled connection that turns out to be dead and run the caller's
+statement again, instead of failing. On by default; set to 0 to have the
+original error propagate untouched.
+
+A connection can die while sitting idle in the pool, most often because the
+server restarted or an administrator ended the session. The caller who is
+handed it next has done nothing wrong, so the pool repairs itself rather than
+reporting a fault of its own making.
+
+The retry is deliberately narrow. It happens only when the statement provably
+never reached the server, which is the case when C<prepare> or C<execute>
+fails, since it is C<execute> that dispatches a statement. Once a statement has
+been sent it is never retried, because it may already have run. A statement
+inside a transaction is never retried either: the transaction died with the
+connection, and running the statement on a replacement would silently execute
+it outside the transaction the caller asked for.
+
+Replacing a connection is reported through L</on_log>, so a database that is
+flapping is visible rather than silently absorbed.
 
 =head2 connection
 

@@ -262,4 +262,12 @@ subtest 'idle_timeout of 0 disables reaping' => sub {
     is $stale->disconnects, 0, 'connection left open';
 };
 
+subtest 'healing dead connections is on unless turned off' => sub {
+    my $on = make_pool();
+    is $on->{heal_dead_connections}, 1, 'on by default';
+
+    my $off = make_pool(heal_dead_connections => 0);
+    is $off->{heal_dead_connections}, 0, 'can be turned off';
+};
+
 done_testing;
