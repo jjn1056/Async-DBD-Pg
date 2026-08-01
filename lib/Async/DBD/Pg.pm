@@ -481,11 +481,15 @@ async sub _create_connection {
     # Run on_connect callback
     if (my $on_connect = $self->{on_connect}) {
         eval { await $on_connect->($conn) };
-        if ($@) {
-            $self->_log(warn => "on_connect failed: $@");
+        if (my $on_connect_err = $@) {
+            # Captured before _close_dbh runs: it disconnects through its own
+            # eval, which clears $@ on success, so dying with $@ directly
+            # here would report a bare "Died at ..." instead of the actual
+            # on_connect failure.
+            $self->_log(warn => "on_connect failed: $on_connect_err");
             $conn->_close_dbh;
             $self->{stats}{connect_failures}++;
-            die $@;
+            die $on_connect_err;
         }
     }
 

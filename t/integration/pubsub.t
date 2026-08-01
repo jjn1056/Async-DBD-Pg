@@ -10,6 +10,7 @@ use Test::Async::DBD::Pg qw(skip_without_postgres test_dsn);
 
 my $dsn = skip_without_postgres();
 
+use Future;
 use Future::IO;
 
 BEGIN { Future::IO->load_best_impl; }
@@ -575,6 +576,115 @@ subtest 'listen() during the reconnect backoff does not orphan a connection' => 
     $pubsub->disconnect->get;
     ok wait_until(sub { $pg->active_count == 0 }, 'pool drained after disconnect', 3),
         'no orphaned connection left checked out';
+};
+
+subtest 'a failure inside the race branch does not lock reconnect out permanently' => sub {
+    my @logged;
+    my $pg = Async::DBD::Pg->new(
+        dsn                    => test_dsn(),
+        min_connections        => 0,
+        max_connections        => 4,
+        reconnect              => 1,
+        reconnect_min_interval => 3,
+        reconnect_max_interval => 4,
+        on_log                 => sub { push @logged, $_[1] },
+    );
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('lockout_a', sub { })->get;
+
+    my $captured1 = capture_stderr(sub {
+        kill_backends();
+        wait_until(sub { !$pubsub->is_connected }, 'listener noticed', 5);
+    });
+    like $captured1, qr/FATAL:\s+terminating connection due to administrator command/,
+        'expected backend-termination notice captured on stderr';
+
+    # An ordinary listen() wins the race, same as the earlier subtest, and
+    # its own control query goes through fine. The supervisor's own replay
+    # is then made to fail on its second channel, standing in for the
+    # connection dying again mid-replay -- the failure this branch did not
+    # used to survive.
+    $pubsub->listen('lockout_b', sub { })->get;
+
+    my $orig = \&Async::DBD::Pg::PubSub::_run_control_query;
+    my $seen = 0;
+    {
+        no strict 'refs';
+        no warnings 'redefine';
+        *Async::DBD::Pg::PubSub::_run_control_query = sub {
+            $seen++;
+            return Future->fail("simulated: connection died mid-replay\n") if $seen > 1;
+            return $orig->(@_);
+        };
+    }
+
+    ok wait_until(sub { $seen > 1 }, 'supervisor reached the stubbed replay', 8),
+        'the supervisor woke into the race branch and started replaying';
+
+    {
+        no warnings 'redefine';
+        *Async::DBD::Pg::PubSub::_run_control_query = $orig;
+    }
+
+    ok wait_until(sub { !defined $pubsub->{_reconnect_future} }, 'reconnect slot released', 3),
+        'the failed attempt clears _reconnect_future rather than leaving a dead future behind';
+
+    # The actual symptom of the bug: a later, independent connection death
+    # has to be able to start a fresh supervisor, not just find the hash key
+    # gone.
+    my $captured2 = capture_stderr(sub {
+        kill_backends();
+        wait_until(sub { !$pubsub->is_connected }, 'listener noticed again', 5);
+    });
+    like $captured2, qr/FATAL:\s+terminating connection due to administrator command/,
+        'expected backend-termination notice captured on stderr';
+
+    ok wait_until(sub {
+        $pubsub->{_reconnect_future} && !$pubsub->{_reconnect_future}->is_ready
+    }, 'a new supervisor starts after the next death', 3),
+        'reconnect re-arms rather than staying permanently dead';
+
+    $pubsub->disconnect->get;
+};
+
+subtest 'the give-up check does not fire on PostgreSQL wording alone' => sub {
+    my @logged;
+    my $pg = Async::DBD::Pg->new(
+        dsn                    => test_dsn(),
+        min_connections        => 0,
+        max_connections        => 4,
+        reconnect              => 1,
+        reconnect_min_interval => 0.4,
+        reconnect_max_interval => 0.6,
+        on_log                 => sub { push @logged, $_[1] },
+    );
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('false_positive', sub { })->get;
+
+    # From now on every fresh connection attempt fails with PostgreSQL's own
+    # restart wording. The pool itself stays healthy -- _shutting_down is
+    # never set -- so this must not trip the give-up check the way matching
+    # $err's text against "shut...down" would have.
+    $pg->{on_connect} = sub { die "FATAL:  the database system is shutting down\n" };
+
+    my $captured = capture_stderr(sub {
+        kill_backends();
+        wait_until(sub { !$pubsub->is_connected }, 'listener noticed', 5);
+    });
+    like $captured, qr/FATAL:\s+terminating connection due to administrator command/,
+        'expected backend-termination notice captured on stderr';
+
+    Future::IO->sleep(3)->get;    # several backoff cycles
+
+    is $pg->{_shutting_down}, undef, 'the pool itself never entered shutdown';
+    ok scalar(grep { /reconnect attempt \d+ failed/i } @logged) >= 2,
+        'kept retrying rather than giving up on the first attempt';
+    is scalar(grep { /giving up on reconnect/i } @logged), 0,
+        'never gave up';
+
+    $pg->shutdown(force => 1)->get;
 };
 
 done_testing;

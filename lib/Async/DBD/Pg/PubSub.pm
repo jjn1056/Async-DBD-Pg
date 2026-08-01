@@ -276,7 +276,22 @@ async sub _start_listener {
 
         # Held on the object rather than retained, so disconnect and pool
         # shutdown can stop it.
-        $self->{_reconnect_future} = $self->_reconnect_loop;
+        my $reconnecting = $self->_reconnect_loop;
+        $self->{_reconnect_future} = $reconnecting;
+
+        # Cleared here, once, on however this ends -- success, failure or
+        # cancellation -- rather than at each exit inside the loop. An
+        # exception the loop doesn't catch would otherwise leave a ready,
+        # failed future sitting in this slot, and "return if
+        # $self->{_reconnect_future}" above would then refuse to start a new
+        # supervisor for every listener death after it. Same pattern connect
+        # uses for _connecting.
+        my $weak = $self;
+        weaken($weak);
+        $reconnecting->on_ready(sub {
+            my $live = $weak or return;
+            delete $live->{_reconnect_future};
+        });
     });
 
     $self->{_listener_future} = $listener;
@@ -324,7 +339,6 @@ async sub _reconnect_loop {
             }
 
             await $self->_start_listener;
-            delete $self->{_reconnect_future};
 
             return $self;
         }
@@ -347,8 +361,6 @@ async sub _reconnect_loop {
         my $err = $@;
 
         if ($ok) {
-            delete $self->{_reconnect_future};
-
             # Success is reported through on_reconnect, not through _log. With
             # no on_log configured _log falls back to warn, and a recovery that
             # worked should not print to STDERR.
@@ -377,14 +389,11 @@ async sub _reconnect_loop {
         # really does learn about it by exception, not by cancellation.
         if ($self->{pool} && $self->{pool}{_shutting_down}) {
             $self->_log(warn => "PubSub giving up on reconnect: $err");
-            delete $self->{_reconnect_future};
             return $self;
         }
 
         $self->_log(warn => "PubSub reconnect attempt $attempt failed: $err");
     }
-
-    delete $self->{_reconnect_future};
 
     return $self;
 }
