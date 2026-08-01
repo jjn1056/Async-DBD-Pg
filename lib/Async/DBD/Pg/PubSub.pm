@@ -304,6 +304,31 @@ async sub _reconnect_loop {
 
         last if $self->{_stopping};
 
+        if ($self->{connected} && $self->{conn}) {
+            # An ordinary connect/listen call already re-established the
+            # connection while this loop was backing off. That path only
+            # replays the channel it was called for, so replay every
+            # registered channel here too, or anything subscribed before it
+            # would stay silently orphaned. Taking a second connection of our
+            # own instead, as this loop used to, would leave the winner's
+            # connection checked out to nobody and the running listener
+            # bound to whichever connection loses the race.
+            #
+            # Issued through _run_control_query, the same idiom listen() and
+            # unlisten() use, rather than stopping and starting the listener
+            # by hand: its guard resets _stopping and restarts the listener
+            # however the query ends, including a cancellation here, which a
+            # hand-rolled stop/start would leave stuck stopped.
+            for my $channel (sort keys %{ $self->{channels} }) {
+                await $self->_run_control_query("LISTEN $channel");
+            }
+
+            await $self->_start_listener;
+            delete $self->{_reconnect_future};
+
+            return $self;
+        }
+
         my $ok = eval {
             my $pool = $self->{pool}
                 or die "pool is gone\n";
@@ -343,9 +368,14 @@ async sub _reconnect_loop {
         }
 
         # A pool that has shut down is never going to give us a connection.
-        # The pool raises "has been shut down" for a fresh request and "is
-        # shutting down" for one already queued; match both.
-        if ($err =~ /shut(?:ting)? down/i) {
+        # Checked on the pool's own state rather than matched against $err's
+        # text, because PostgreSQL raises its own "the database system is
+        # shutting down" on a restart, which a message match would also
+        # catch and give up on permanently for a condition that will clear
+        # on its own. Shutdown fails a queued waiter before it cancels this
+        # loop, so a supervisor suspended in the connection request above
+        # really does learn about it by exception, not by cancellation.
+        if ($self->{pool} && $self->{pool}{_shutting_down}) {
             $self->_log(warn => "PubSub giving up on reconnect: $err");
             delete $self->{_reconnect_future};
             return $self;
@@ -404,7 +434,11 @@ async sub disconnect {
         $reconnecting->cancel unless $reconnecting->is_ready;
     }
 
-    return $self unless $self->{connected} || $self->{conn};
+    unless ($self->{connected} || $self->{conn}) {
+        $self->{channels}  = {};
+        $self->{_stopping} = 0;
+        return $self;
+    }
 
     await $self->_stop_listener if $self->{_listener_future};
 

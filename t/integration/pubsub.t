@@ -454,4 +454,127 @@ subtest 'without reconnect the listener stays down' => sub {
     ok !$pubsub->is_connected, 'stays disconnected when reconnect is off';
 };
 
+subtest 'disconnect during the backoff window forgets subscriptions too' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn                    => test_dsn(),
+        min_connections        => 0,
+        max_connections        => 4,
+        reconnect              => 1,
+        reconnect_min_interval => 2,
+        reconnect_max_interval => 3,
+        on_log                 => sub { },
+    );
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('minor_disconnect', sub { })->get;
+
+    # Right after the connection dies, and until the supervisor's first
+    # attempt completes, connected and conn are both false while the
+    # supervisor sleeps its backoff. disconnect called in that window used
+    # to return early before clearing channels or resetting _stopping.
+    my $captured = capture_stderr(sub {
+        kill_backends();
+        wait_until(sub { !$pubsub->is_connected }, 'listener noticed', 5);
+    });
+    like $captured, qr/FATAL:\s+terminating connection due to administrator command/,
+        'expected backend-termination notice captured on stderr';
+
+    ok !$pubsub->{connected} && !$pubsub->{conn}, 'caught in the backoff window';
+
+    $pubsub->disconnect->get;
+
+    is $pubsub->subscribed_channels, 0, 'subscriptions forgotten even from the early-return path';
+    is $pubsub->{_stopping}, 0, '_stopping reset even from the early-return path';
+};
+
+subtest 'a pool shutdown while queued for reconnect makes the supervisor give up' => sub {
+    my @logged;
+    my $pg = Async::DBD::Pg->new(
+        dsn                    => test_dsn(),
+        min_connections        => 0,
+        max_connections        => 1,
+        reconnect              => 1,
+        reconnect_min_interval => 1,
+        reconnect_max_interval => 1.5,
+        on_log                 => sub { push @logged, $_[1] },
+    );
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('shutdown_race', sub { })->get;
+
+    my $captured = capture_stderr(sub {
+        kill_backends();
+        wait_until(sub { !$pubsub->is_connected }, 'listener noticed', 5);
+    });
+    like $captured, qr/FATAL:\s+terminating connection due to administrator command/,
+        'expected backend-termination notice captured on stderr';
+
+    # With only one connection allowed in this pool, holding one ourselves
+    # forces the supervisor's next attempt to queue instead of succeeding,
+    # so it learns about the coming shutdown by exception, not by
+    # cancellation, exercising the branch this test is here to cover.
+    my $held = $pg->connection->get;
+
+    ok wait_until(sub { $pg->waiting_count }, 'supervisor queued for a connection', 5),
+        'supervisor is queued behind the held connection';
+
+    $pg->shutdown(force => 1)->get;
+
+    ok scalar(grep { /giving up on reconnect/i } @logged),
+        'supervisor reports giving up';
+    is $pubsub->{_reconnect_future}, undef, 'supervisor stopped, not merely cancelled mid-flight';
+
+    # Long enough for several more backoff cycles, had it kept looping
+    # instead of stopping.
+    Future::IO->sleep(2)->get;
+
+    is scalar(grep { /reconnect attempt \d+ failed/i } @logged), 0,
+        'no further reconnect attempts after shutdown';
+};
+
+subtest 'listen() during the reconnect backoff does not orphan a connection' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn                    => test_dsn(),
+        min_connections        => 0,
+        max_connections        => 4,
+        reconnect              => 1,
+        reconnect_min_interval => 2,
+        reconnect_max_interval => 3,
+        on_log                 => sub { },
+    );
+    my $pubsub = $pg->pubsub;
+
+    my (@got_a, @got_b);
+    $pubsub->listen('orphan_a', sub { push @got_a, $_[1] })->get;
+
+    my $captured = capture_stderr(sub {
+        kill_backends();
+        wait_until(sub { !$pubsub->is_connected }, 'listener noticed', 5);
+    });
+    like $captured, qr/FATAL:\s+terminating connection due to administrator command/,
+        'expected backend-termination notice captured on stderr';
+
+    # Call listen() for a second channel while the supervisor is still
+    # backing off (the long min interval above makes this land inside the
+    # window reliably rather than by luck).
+    $pubsub->listen('orphan_b', sub { push @got_b, $_[1] })->get;
+
+    ok $pubsub->is_connected, 'ordinary listen() reconnected on its own';
+
+    # Give the supervisor time to wake up and discover it lost the race.
+    Future::IO->sleep(3)->get;
+
+    $pubsub->notify('orphan_a', 'still here')->get;
+    $pubsub->notify('orphan_b', 'also here')->get;
+
+    wait_until(sub { @got_a && @got_b }, 'delivery after the race', 5);
+
+    is \@got_a, ['still here'], 'channel registered before the race still delivers';
+    is \@got_b, ['also here'], 'channel registered during the race delivers';
+
+    $pubsub->disconnect->get;
+    ok wait_until(sub { $pg->active_count == 0 }, 'pool drained after disconnect', 3),
+        'no orphaned connection left checked out';
+};
+
 done_testing;
