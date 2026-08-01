@@ -34,6 +34,35 @@ recoverable. The caller never sees it, and the race that validation cannot
 close is closed, because the recovery happens at the moment of use rather than
 before it.
 
+## What other pools do
+
+Checked before settling the defaults, because retrying a statement is not a
+common choice and it would be worth knowing if everyone else had rejected it.
+
+| pool | on checkout | on finding a dead connection |
+| --- | --- | --- |
+| SQLAlchemy | `pool_pre_ping`, off by default | the active request fails; that connection and **every other idle connection** are invalidated |
+| HikariCP | validates by default, `isValid()` | evicts and replaces; retrying the statement is an open feature request, not a feature |
+| node-postgres | does not validate | does not retry |
+| asyncpg | does not validate | does not retry |
+| EF Core | not applicable | `EnableRetryOnFailure`, opt in, documented with idempotency warnings |
+
+Two conclusions, and they point in different directions.
+
+**Nobody retries the statement**, and where retrying exists at all it is opt
+in. That is a real argument against doing it. The counter is that our boundary
+is narrower than any of theirs: we retry only where the statement provably
+never reached the server, which EF Core cannot promise, and the result is that
+no caller fails rather than one caller failing. Retained, on by default, on
+that basis.
+
+**Everyone invalidates more than the connection they found.** SQLAlchemy is
+explicit: a disconnect invalidates the whole idle set. This design originally
+missed that, and it matters. A server restart kills every pooled connection at
+once, so healing them one at a time means the second caller reconnects, and the
+third, and so on, when a single sweep would have dealt with all of them. Added
+below.
+
 ## What is retried, and what is never retried
 
 The pivot is whether the statement could have reached the server.
@@ -93,6 +122,26 @@ It is reported through `_log`. A pool that silently heals is a pool that hides
 a flapping database, and the point of `on_log` is that operators can see this
 sort of thing.
 
+## Invalidating the connections we did not touch
+
+Whatever killed the connection we found — a restart, a failover, an
+administrator — almost certainly killed the rest of the pool with it. Healing
+only the one in hand leaves every other idle connection dead and waiting to be
+discovered the same way, one caller at a time.
+
+So on detecting a dead connection, the pool also discards its **idle**
+connections. They are closed and counted as discarded, and the pool refills
+towards `min_connections` as usual, so the next caller gets a fresh connection
+rather than repeating this discovery.
+
+Connections currently checked out are left alone. Their owners are mid-work,
+the pool cannot know whether they are usable, and each will heal itself on its
+next statement by exactly the path above. Reaching into a connection somebody
+else is holding to close it underneath them would be worse than the problem.
+
+This is the part of SQLAlchemy's optimistic handling worth copying: one
+disconnect invalidates the idle set rather than being rediscovered N times.
+
 ## Public interface
 
 On by default. A stale pooled connection failing a caller's first query is a
@@ -127,6 +176,10 @@ cases are the ones that would hurt if they were wrong:
 - No healing while the pool is shutting down.
 - The pool's counts are unchanged across a heal, and the healed connection
   works for subsequent queries.
+- Idle siblings are discarded when a dead connection is found, so a second
+  caller after a server restart is served a fresh connection rather than
+  discovering another dead one. Connections checked out by other callers are
+  left in place.
 
 Killing a backend makes libpq write a notice straight to file descriptor 2, so
 any test that does it captures and asserts that output, as the existing suite
