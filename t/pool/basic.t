@@ -63,7 +63,7 @@ subtest 'connection reuse' => sub {
     $conn1->release;
 
     my $conn2 = $pg->connection->get;
-    is $conn2->dbh, $conn1_dbh, 'same connection reused';
+    is refaddr($conn2->dbh), refaddr($conn1_dbh), 'same connection reused';
 
     $conn2->release;
 };
@@ -457,7 +457,7 @@ subtest 'a connection that died while idle is repaired, not reported' => sub {
     $again->release;
 };
 
-subtest 'a statement inside a transaction is never retried' => sub {
+subtest 'a transaction whose connection dies reports the failure to the caller' => sub {
     my $pg = Async::DBD::Pg->new(
         dsn             => test_dsn(),
         min_connections => 0,
@@ -478,18 +478,24 @@ subtest 'a statement inside a transaction is never retried' => sub {
                 Future::IO->sleep(0.2)->get;
             });
 
-            # The transaction died with the connection. Running this on a
-            # replacement would execute it outside the caller's transaction.
+            # The transaction died with the connection. As the code stands, a
+            # connection can never reach the liveness check with
+            # in_transaction true: the check fires only once, on the first
+            # statement after an idle checkout, and that first statement is
+            # always BEGIN, which runs before in_transaction is set. This
+            # asserts the failure still reaches the caller regardless -- a
+            # future change that armed the check more than once per checkout
+            # would need this to keep holding.
             await $tx->query('SELECT 2');
         })->get;
     };
 
-    ok $err, 'the failure reaches the caller rather than being papered over';
+    ok $err, 'the failure reaches the caller';
 
     $conn->release;
 };
 
-subtest 'a real SQL error is not treated as a dead connection' => sub {
+subtest 'a syntax error on a live connection is reported as itself' => sub {
     my $pg = Async::DBD::Pg->new(
         dsn             => test_dsn(),
         min_connections => 0,
@@ -508,7 +514,7 @@ subtest 'a real SQL error is not treated as a dead connection' => sub {
     $conn->release;
 };
 
-subtest 'a statement that was already sent is never retried' => sub {
+subtest 'a connection that dies while its result is awaited fails to the caller' => sub {
     my $pg = Async::DBD::Pg->new(
         dsn             => test_dsn(),
         min_connections => 0,
@@ -521,7 +527,7 @@ subtest 'a statement that was already sent is never retried' => sub {
 
     # Kill the backend while the statement is in flight. execute already
     # succeeded, so the statement reached the server and may have run.
-    # Repeating it is exactly what must not happen.
+    # Nothing after execute is ever retried, so this is never repeated.
     my $slow = $conn->query('SELECT pg_sleep(3)');
 
     my $err;
@@ -532,12 +538,12 @@ subtest 'a statement that was already sent is never retried' => sub {
     });
 
     ok $err, 'the failure reaches the caller';
-    is refaddr($conn->dbh), refaddr($before), 'the connection was not replaced and nothing rerun';
+    is refaddr($conn->dbh), refaddr($before), 'the connection object is unchanged';
 
     $conn->release;
 };
 
-subtest 'nothing is healed while the pool is shutting down' => sub {
+subtest 'the caller still sees the failure once the pool is marked shutting down' => sub {
     my $pg = Async::DBD::Pg->new(
         dsn             => test_dsn(),
         min_connections => 0,
@@ -554,13 +560,17 @@ subtest 'nothing is healed while the pool is shutting down' => sub {
     });
 
     # Shutting down means the pool will not hand out connections, so it must
-    # not try to build one to repair this either.
+    # not try to build one to repair this either. This connection was never
+    # idle-checked-out, so the liveness check never runs here regardless of
+    # this flag -- the case that actually exercises the shutting-down guard
+    # is a connection checked out before shutdown began and used for the
+    # first time afterward, which is not what this constructs.
     $pg->{_shutting_down} = 1;
 
     my $before = $conn->dbh;
     ok dies { $conn->query('SELECT 1')->get },
-        'the error propagates rather than being healed';
-    is refaddr($conn->dbh), refaddr($before), 'no replacement was built during shutdown';
+        'the error reaches the caller';
+    is refaddr($conn->dbh), refaddr($before), 'the connection object is unchanged';
 
     $pg->{_shutting_down} = 0;
     $conn->release;

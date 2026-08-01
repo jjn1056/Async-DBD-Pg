@@ -113,10 +113,26 @@ connection — which is why the socket is consulted directly.
 - **Healing a connection inside a transaction.** The transaction died with the
   connection, and continuing on a replacement would run the caller's
   statements outside the transaction they asked for. The check is skipped and
-  the failure reaches the caller. In practice a freshly checked-out connection
-  is not in a transaction, so this guards a case that should not arise rather
-  than one that routinely does — which is the right way round.
-- **Healing while the pool is shutting down.**
+  the failure reaches the caller. As the code stands, this guards a case that
+  cannot arise rather than one that merely shouldn't: the check is armed only
+  by an idle checkout and consumed by the very next `query` call, whatever it
+  is. If that call is the `BEGIN` a transaction issues, it runs before
+  `in_transaction` is set, so the flag is never true while the check is still
+  armed — and a connection already in a transaction is never returned to the
+  idle list in the first place, closing the only other route. Confirmed by
+  removing the guard in a scratch copy of the module and finding no test's
+  behavior changes. It stays, because the reasoning above depends on how
+  `_check_liveness` happens to be scoped today, and a later change to arm the
+  check more than once per checkout would make this guard load-bearing
+  without necessarily updating this note.
+- **Healing while the pool is shutting down.** Unlike the transaction case,
+  this one is reachable in real use, not just guarded defensively: a
+  connection can be checked out from idle (arming the check) while the pool
+  is healthy, and then have `shutdown` start while it is still held —
+  `shutdown` waits for checked-out connections rather than touching them, so
+  the caller's first statement on that same connection can land after
+  `_shutting_down` has gone true. The pool's own drain against a live caller
+  is exactly this race.
 - **Touching the `pg_result` path.** A failure there may mean the statement
   ran. It is reported to the caller exactly as before.
 
@@ -187,18 +203,58 @@ encounters a dead connection cannot tell this exists.
 The assertion that matters is that the caller never sees the failure: check a
 connection out, kill its backend from a separate connection, run a query, and
 get a result. Everything else is the negative space around it, and the negative
-cases are the ones that would hurt if they were wrong:
+cases are the ones that would hurt if they were wrong.
+
+Two different things back these negative cases, and mutation testing — not
+just reading the code — is what tells them apart:
+
+- **Enforced by a guard, and demonstrated red by mutation.** Only
+  `heal_dead_connections` is in this category. Removing its guard in a
+  scratch copy of `_heal_if_dead`, loaded ahead of the real module, turns the
+  "healing can be turned off" test red and leaves every other test green.
+  This one is reachable, and that is what proves it, not the source reading
+  as though it should be.
+- **Hold structurally, because `_check_liveness` is set only on an idle
+  checkout and consumed by the very next `query` call.** No test connection
+  that starts a transaction, has its statement already sent, or is checked
+  mid-shutdown was ever idle-checked-out first, so none of them ever arm the
+  check — `_heal_if_dead` is never called at all, guard or no guard.
+  Removing the `in_transaction` or `_shutting_down` guards in the same
+  scratch-module exercise leaves every test green, confirming this rather
+  than merely asserting it. The three structural cases are not all equally
+  structural, though:
+  - The transaction case is the strongest: it is provably unreachable as the
+    code stands (see "What is still never done" above), not merely untested.
+  - The shutting-down case is reachable in real use — a connection checked
+    out before `shutdown` is called and used for the first time after it
+    isn't — the suite just doesn't currently construct that sequence.
+  - The already-sent case has no guard to remove at all, because nothing in
+    `_execute_async` calls `_heal_if_dead`. A mutation that reintroduced such
+    a call after `pg_result` fails was tried and was not caught — not because
+    of protection, but because `pg_socket` is already invalid by the time
+    DBD::Pg has finished processing a fatal disconnect. A differently-shaped
+    reintroduction of the same mistake is not ruled out by anything visible
+    here.
+
+With that distinction in mind, the individual cases:
 
 - No healing inside a transaction. The error propagates, and no statement runs
-  on a replacement connection.
+  on a replacement connection. (Structural, and provably unreachable — see
+  above.)
 - A syntax error on a live connection is reported as itself. The socket is not
-  readable, so the check costs nothing and concludes nothing.
+  readable, so the check costs nothing and concludes nothing — that is the
+  mechanism when this connection has been idle-checked-out. The test for it
+  in the current suite uses a freshly built connection instead, so it does
+  not currently exercise that mechanism either; it establishes the same
+  observable outcome (a syntax error is reported as itself) without
+  exercising `_heal_if_dead` at all.
 - A connection that dies while its result is awaited fails to the caller. That
   statement reached the server and may have run, and nothing about it is
-  repeated.
+  repeated. (Structural, and the weakest of the three — see above.)
 - A healthy connection is never pinged. The free check is what decides whether
   the round trip happens at all, and on a healthy pool it never does.
-- No healing while the pool is shutting down.
+- No healing while the pool is shutting down. (Structural in the current
+  suite, but reachable in real use — see above.)
 - The pool's counts are unchanged across a heal, and the healed connection
   works for subsequent queries.
 - Idle siblings are discarded when a dead connection is found, so a second
@@ -209,6 +265,13 @@ cases are the ones that would hurt if they were wrong:
 Killing a backend makes libpq write a notice straight to file descriptor 2, so
 any test that does it captures and asserts that output, as the existing suite
 does.
+
+Test descriptions state the observable behavior a test establishes, not the
+mechanism believed to produce it. Several of the negative-case test names
+originally implied a guard was exercised when the connection in question was
+never idle-checked-out at all, so the guard was never reached; the descriptions
+were corrected once mutation testing surfaced this, rather than left to imply
+coverage the tests do not have.
 
 ## Out of scope
 
