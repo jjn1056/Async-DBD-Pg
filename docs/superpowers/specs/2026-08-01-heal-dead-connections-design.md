@@ -316,25 +316,29 @@ With that distinction in mind, the individual cases:
   discovering another dead one. Connections checked out by other callers are
   left in place.
 
-Killing a backend makes libpq write a notice straight to file descriptor 2
-only when something actively polls the connection afterward with
-`PQconsumeInput`, as the pub/sub listener's `pg_notifies` loop does — not
-unconditionally, whatever the sentence used to say here implied. Whether or
-not that condition holds for a given test, any test that kills a backend
-captures stderr at the descriptor level and asserts on what it finds there,
-as the existing suite does. What actually lands in each capture window was
-established by running
-it, not guessed, and the answer is uniform across every window in this suite:
-none of them catch the notice. It is not that the notice never appears —
-`t/pool/shutdown.t` catches it reliably — but that the pub/sub listener gets
-it and this pool's own connections do not. The listener polls `pg_notifies`
-in a loop, which calls libpq's `PQconsumeInput` directly and triggers the
-default notice processor for an unsolicited message; the pool's own paths —
-`ping`, and the ordinary `pg_ready`/`pg_result` polling `_wait_for_result`
-does — surface the same FATAL as the query's own error instead, without a
-separate raw write to fd 2. Every capture window in this file asserts `is
-$captured, ''` for that reason, established per window rather than assumed
-uniform from one measurement.
+Killing a backend makes the FATAL arrive through DBI's own `PrintWarn`
+calling Perl's `warn()`, not a raw libpq write to file descriptor 2 that
+bypasses `warn()` and `$SIG{__WARN__}` entirely — measured directly:
+`PrintWarn => 0` makes the notice vanish completely, which a raw write could
+not do, since libpq's own notice processor has no way to know about a DBI
+attribute. Earlier revisions of this document claimed the opposite for the
+pub/sub listener specifically, on the theory that its `pg_notifies` loop
+calls libpq's `PQconsumeInput` directly and so triggers some lower-level,
+uninterceptable notice path; that theory was never tested against the actual
+code and was wrong. `pg_notifies` warns exactly like every other DBI call
+that surfaces a server message — `_capture_pg_notices` was simply not
+wrapped around it yet, so its `warn()` reached the real `$SIG{__WARN__}` (or
+its absence) instead of the pool's `on_log`, the one call site among
+`ping`, `pg_ready`/`pg_result`, and `pg_notifies` where that gap existed.
+Closing it (wrapping the `pg_notifies` call in the listener loop the same
+way the others already were) makes every one of those paths route through
+`on_log` uniformly. Every capture window in this suite asserts `is
+$captured, ''` for that reason now, including the pub/sub listener's —
+established by running it, not guessed, and confirmed uniform across every
+window rather than assumed from one measurement. The descriptor-level
+`capture_stderr` helper stays regardless: it is what proves fd 2 stays
+empty, catching anything that lands there regardless of source, rather than
+assuming it does because the mechanism is understood.
 
 Test descriptions state the observable behavior a test establishes, not the
 mechanism believed to produce it. Several of the negative-case test names

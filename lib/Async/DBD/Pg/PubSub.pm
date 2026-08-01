@@ -215,7 +215,16 @@ sub _process_notifications {
 
     my $count = 0;
 
-    while (my $notification = $dbh->pg_notifies) {
+    # pg_notifies is the one synchronous call on this connection that reads
+    # the socket outside _execute_async, and it can surface a server message
+    # the same way execute/pg_ready/pg_result can -- wrapped here for the
+    # same reason. Only the call is wrapped, not the loop body: the body runs
+    # user callbacks below, which must reach the user's own $SIG{__WARN__} if
+    # they warn, not have a warning of theirs relabelled as a server notice.
+    # $conn always has a pool here (it comes from $pool->connection in
+    # _establish), and nothing in this loop awaits, so the plain, synchronous
+    # form of _capture_pg_notices applies with no changes.
+    while (my $notification = $conn->_capture_pg_notices(sub { $dbh->pg_notifies })) {
         my ($channel, $pid, $payload) = @$notification;
         my $callbacks = $self->{channels}{$channel} || [];
 

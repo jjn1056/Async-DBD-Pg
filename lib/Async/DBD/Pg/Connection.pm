@@ -227,18 +227,31 @@ sub _capture_pg_notices {
     local $SIG{__WARN__} = sub {
         my ($message) = @_;
 
-        # Only a PostgreSQL server message is downgraded to an info-level
-        # log line. Anything else raised during one of these calls -- a DBI
-        # handle-lifecycle warning, say -- is a real problem, not chatter,
-        # and is passed through as an ordinary warning rather than relabeled
-        # and mixed in with NOTICE text.
-        unless ($message =~ /^(?:NOTICE|WARNING|INFO|LOG|DEBUG):/) {
-            warn $message;
+        # ERROR, FATAL and PANIC mean the connection itself may be gone, not
+        # merely something the statement noticed along the way -- logged at
+        # warn to match how the rest of this module reports a dead
+        # connection (_heal_if_dead's own "replacing a pooled connection
+        # that was already dead"), rather than at the same level as routine
+        # chatter.
+        if ($message =~ /^(?:ERROR|FATAL|PANIC):/) {
+            $message =~ s/\n\z//;
+            $pool->_log(warn => $message);
             return;
         }
 
-        $message =~ s/\n\z//;
-        $pool->_log(info => $message);
+        # The rest of PostgreSQL's severities are routine and downgraded to
+        # an info-level log line.
+        if ($message =~ /^(?:NOTICE|WARNING|INFO|LOG|DEBUG):/) {
+            $message =~ s/\n\z//;
+            $pool->_log(info => $message);
+            return;
+        }
+
+        # Not a PostgreSQL message at all -- a DBI handle-lifecycle warning,
+        # say -- is a real problem, not chatter, and is passed through as an
+        # ordinary warning instead of being relabeled and mixed in with
+        # server message text.
+        warn $message;
     };
 
     return $code->();
