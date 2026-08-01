@@ -3,6 +3,8 @@ use warnings;
 use Test2::V0;
 use Future::AsyncAwait;
 use Time::HiRes qw(time);
+use DBI;
+use File::Temp qw(tempfile);
 
 use lib 't/lib';
 use Test::Async::DBD::Pg qw(skip_without_postgres test_dsn);
@@ -14,6 +16,7 @@ use Future::IO;
 BEGIN { Future::IO->load_best_impl; }
 
 use Async::DBD::Pg;
+use Async::DBD::Pg::Util ();
 
 sub make_pool {
     my (%args) = @_;
@@ -38,6 +41,38 @@ sub settle {
     }
 
     return $f;
+}
+
+# pg_terminate_backend makes libpq print a "FATAL: terminating connection..."
+# notice straight to the process's real file descriptor 2. That bypasses
+# every layer this test could otherwise intercept (warn, $SIG{__WARN__}, a
+# scalar-backed STDERR), because none of those change what fd 2 points at.
+# Only a descriptor-level redirect sees it, so this closes and reopens
+# STDERR onto a real file for the duration of $code and hands back what
+# landed there, restoring STDERR on every path, including a die in $code.
+sub capture_stderr {
+    my ($code) = @_;
+
+    my ($fh, $path) = tempfile(UNLINK => 1);
+    close $fh;
+
+    open my $saved_stderr, '>&', \*STDERR or die "dup stderr: $!";
+    open STDERR, '>', $path or die "redirect stderr: $!";
+
+    my $ok = eval { $code->(); 1 };
+    my $err = $@;
+
+    open STDERR, '>&', $saved_stderr or die "restore stderr: $!";
+    close $saved_stderr;
+
+    die $err unless $ok;
+
+    open my $read_fh, '<', $path or die "read captured stderr: $!";
+    local $/;
+    my $captured = <$read_fh>;
+    close $read_fh;
+
+    return $captured;
 }
 
 subtest 'shutdown closes idle connections' => sub {
@@ -178,6 +213,51 @@ subtest 'shutdown gives back the pub/sub listener connection' => sub {
     is $pg->active_count, 0, 'listener connection accounted for';
     is $pg->total_count, 0, 'pool empty';
     ok !$pubsub->is_connected, 'pub/sub reports disconnected';
+};
+
+subtest 'shutdown completes while a listener is trying to reconnect' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn                    => test_dsn(),
+        min_connections        => 0,
+        max_connections        => 4,
+        reconnect              => 1,
+        reconnect_min_interval => 0.2,
+        reconnect_max_interval => 1,
+        on_log                 => sub { },
+    );
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('shutdown_while_reconnecting', sub { })->get;
+
+    # Kill the listener's connection, then shut down while the supervisor is
+    # asleep between attempts. The FATAL notice libpq prints for the killed
+    # backend lands during the sleep below, when the listener's poll notices
+    # the connection died, so both are captured together.
+    my $parsed = Async::DBD::Pg::Util::parse_dsn(test_dsn());
+    my $captured = capture_stderr(sub {
+        my $dbh = DBI->connect(
+            $parsed->{dbi_dsn}, $parsed->{user}, $parsed->{password},
+            { RaiseError => 1, PrintError => 0 },
+        );
+        $dbh->do(q{
+            SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+             WHERE datname = current_database() AND pid <> pg_backend_pid()
+        });
+        $dbh->disconnect;
+
+        Future::IO->sleep(0.3)->get;    # let it fail and start backing off
+    });
+    like $captured, qr/FATAL:\s+terminating connection due to administrator command/,
+        'expected backend-termination notice captured on stderr';
+
+    settle($pg->shutdown, 10);
+
+    ok $pg->is_shut_down, 'shutdown completed';
+    is $pg->total_count, 0, 'pool empty';
+
+    # Nothing may reconnect afterwards and put a connection back.
+    Future::IO->sleep(1.5)->get;
+    is $pg->total_count, 0, 'still empty once the backoff would have elapsed';
 };
 
 done_testing;
