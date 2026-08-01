@@ -273,11 +273,35 @@ POD along with the rest of the function's contract.
 
 ## Section 3: Missing Functionality (needed for production confidence)
 
-### 16. No connection validation on checkout
+### 16. No connection validation on checkout — FIXED, DIFFERENTLY
 
 `_return_connection` pings on release, but when a connection is taken from the idle pool,
 there's no staleness check. A connection that went dead while idle is handed to the caller,
 who discovers it on first query.
+
+The item's instinct was right; its proposed mechanism was the expensive one. What it asked
+for was validation on checkout, meaning a `ping` every time a connection is handed out. That
+was rejected: `ping` is a real round trip on the pool's hottest path, and item 14 removed
+exactly that round trip from `DESTROY`, a far colder path. Neither node-postgres nor asyncpg
+validates on acquire either.
+
+What shipped instead checks, but without asking the server: a zero-timeout `select` on a
+descriptor already to hand, only on the first statement after a connection comes off the
+idle list. A readable idle socket means the peer closed. That gates a `ping`, so the round
+trip happens only when something is already known to be wrong.
+
+The premise the original fix was built on was disproved by testing, and that is worth
+recording because it is the interesting part: a statement on a dead connection succeeds at
+`prepare` and at `execute`, and fails only at `pg_result` — by which point it may already
+have run, so retrying after a failure is never safe. That is why the check happens before
+dispatch rather than after a failure. Both the implementer and an independent reviewer
+measured this.
+
+Finding one dead connection also discards the idle ones, since whatever killed it has
+usually killed them too.
+
+Controlled by `heal_dead_connections`, on by default. See
+`docs/superpowers/specs/2026-08-01-heal-dead-connections-design.md`.
 
 ### 17. No PubSub reconnect — FIXED
 
