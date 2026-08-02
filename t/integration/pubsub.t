@@ -245,14 +245,22 @@ subtest 'disconnecting during a connect does not leave it running' => sub {
     my $connecting = $pubsub->connect;
     $pubsub->disconnect->get;
 
+    # Give the abandoned attempt real wall-clock time to reach a terminal
+    # state before checking anything downstream of it. disconnect() never
+    # pumps the event loop here, so checking active_count/is_connected right
+    # away would pass whether or not the attempt was ever actually
+    # cancelled -- the leak this subtest is named for hasn't had a chance to
+    # happen yet in either universe.
+    ok wait_until(sub { $connecting->is_ready }, 'connect settled', 3),
+        'the waiting caller was told';
+
     ok wait_until(sub { $pg->active_count == 0 }, 'checkout released', 3),
         'no connection is left checked out after disconnect';
     ok !$pubsub->is_connected, 'and the object is not connected';
 
-    # The caller is still waiting on that connect. A cancelled future surfaces
-    # as "Future=HASH(0x...) was cancelled", which tells them nothing about
-    # what happened or whether it was their fault.
-    ok $connecting->is_ready, 'the waiting caller was told';
+    # A cancelled future surfaces as "Future=HASH(0x...) was cancelled",
+    # which tells them nothing about what happened or whether it was their
+    # fault.
     like $connecting->failure, qr/PubSub connect was cancelled/,
         'and told something that explains it';
 
