@@ -86,32 +86,44 @@ async sub connect {
 
     return $self if $self->{connected} && $self->{conn} && $self->{conn}->dbh;
 
-    # connected is only true once a connection has been handed over, so
-    # callers arriving together would each check one out and all but the last
-    # would be dropped without ever being released. Share one attempt.
-    if (my $pending = $self->{_connecting}) {
-        await $pending;
-        return $self;
+    # One attempt, shared by everyone who needs a connection -- explicit
+    # callers and the reconnect supervisor alike. Callers arriving together
+    # would otherwise each check one out and all but the last would be dropped
+    # without ever being released.
+    #
+    # Reading this slot and assigning it are not separated by an await: calling
+    # an async sub returns a future without suspending us, so no second caller
+    # can slip in between. That is what makes this the only place in the class
+    # allowed to decide a new connection is needed.
+    my $attempt = $self->{_connecting};
+
+    unless ($attempt) {
+        my $pool = $self->{pool} or die "No pool configured";
+
+        $attempt = $self->_establish($pool);
+        $self->{_connecting}         = $attempt;
+        $self->{_connecting_waiters} = 0;
+
+        # Clear the shared attempt however it ends. Doing it after the await
+        # would be skipped when a caller gives up, because cancelling tears
+        # this sub down where it is suspended, and every later connect would
+        # then wait on an attempt that had already been cancelled.
+        my $pubsub = $self;
+        weaken($pubsub);
+
+        $attempt->on_ready(sub {
+            my $live = $pubsub or return;
+            delete $live->{_connecting};
+            delete $live->{_connecting_waiters};
+        });
     }
 
-    my $pool = $self->{pool} or die "No pool configured";
+    # Held for the duration of the await. See _AwaiterGuard: the view keeps one
+    # caller's cancellation from failing the others, and the guard makes sure
+    # the attempt is still cancelled once the last caller has gone.
+    my $guard = Async::DBD::Pg::PubSub::_AwaiterGuard->new($self);
 
-    my $attempt = $self->_establish($pool);
-    $self->{_connecting} = $attempt;
-
-    # Clear the shared attempt however it ends. Doing it after the await
-    # would be skipped when a caller gives up, because cancelling tears this
-    # sub down where it is suspended, and every later connect would then wait
-    # on an attempt that had already been cancelled.
-    my $pubsub = $self;
-    weaken($pubsub);
-
-    $attempt->on_ready(sub {
-        my $live = $pubsub or return;
-        delete $live->{_connecting};
-    });
-
-    await $attempt;
+    await $attempt->without_cancel;
 
     return $self;
 }
@@ -545,6 +557,46 @@ sub restore {
 }
 
 sub DESTROY { shift->restore }
+
+# Counts the callers waiting on one shared connect attempt. Every awaiter holds
+# one of these, including the caller that started the attempt.
+#
+# A caller that gives up must not cancel the attempt out from under the others,
+# so awaiters wait on a without_cancel view instead of the attempt itself. That
+# alone would leave an attempt running for callers who have all gone away, and
+# a connection checked out to nobody -- so the last guard to go cancels it.
+#
+# The count is dropped in a destructor rather than after the await: a cancelled
+# sub never resumes, so anything written after the await would be skipped in
+# exactly the case this exists for.
+package Async::DBD::Pg::PubSub::_AwaiterGuard;
+
+use strict;
+use warnings;
+use Scalar::Util qw(weaken);
+
+sub new {
+    my ($class, $pubsub) = @_;
+
+    $pubsub->{_connecting_waiters}++;
+
+    my $self = bless { pubsub => $pubsub }, $class;
+    weaken($self->{pubsub});
+
+    return $self;
+}
+
+sub DESTROY {
+    my ($self) = @_;
+
+    my $pubsub = $self->{pubsub} or return;
+    return unless $pubsub->{_connecting};
+    return if --$pubsub->{_connecting_waiters} > 0;
+
+    my $attempt = delete $pubsub->{_connecting};
+    delete $pubsub->{_connecting_waiters};
+    $attempt->cancel unless $attempt->is_ready;
+}
 
 package Async::DBD::Pg::PubSub;
 

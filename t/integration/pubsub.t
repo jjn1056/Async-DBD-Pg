@@ -187,6 +187,92 @@ subtest 'giving up on connect leaves pub/sub usable' => sub {
     $pubsub->disconnect->get;
 };
 
+subtest 'a caller giving up does not fail another caller' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 3,
+    );
+    my $pubsub = $pg->pubsub;
+
+    # Both arrive before either finishes, so they share one attempt. The
+    # second gives up. The first never did, and must not be punished for it.
+    my $first  = $pubsub->connect;
+    my $second = $pubsub->connect;
+    $second->cancel;
+
+    my $err;
+    my $ok = eval { $first->get; 1 };
+    $err = $@ unless $ok;
+
+    ok $ok, 'the caller that waited still connected'
+        or diag "first caller failed with: $err";
+    ok $pubsub->is_connected, 'and the object is connected';
+
+    $pubsub->disconnect->get;
+};
+
+subtest 'abandoning the only connect releases everything' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 3,
+    );
+    my $pubsub = $pg->pubsub;
+
+    # The last awaiter leaving must cancel the attempt, or the connection is
+    # checked out for a caller that no longer exists.
+    my $abandoned = $pubsub->connect;
+    $abandoned->cancel;
+
+    ok wait_until(sub { $pg->active_count == 0 }, 'checkout released', 3),
+        'no connection is left checked out';
+    ok !$pubsub->is_connected, 'and the object is not left connected';
+
+    $pubsub->disconnect->get;
+};
+
+subtest 'abandoning a queued connect does not leave a waiter behind' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 1,
+    );
+    my $pubsub = $pg->pubsub;
+
+    # With the only slot held, connect() has to queue behind it in the
+    # pool rather than create a second connection -- this is the branch the
+    # single-attempt version of this test above never reaches, where the
+    # pool's own {waiting} array holds a reference to the queued future
+    # independent of anything connect() itself is holding. Cancelling the
+    # top-level future alone cannot free that entry; only the guard's
+    # explicit ->cancel, propagating back through _establish and
+    # connection(), reaches it.
+    my $held = $pg->connection->get;
+
+    my $queued = $pubsub->connect;
+    ok wait_until(sub { $pg->waiting_count == 1 }, 'connect queued', 3),
+        'connect actually queued behind the held connection';
+
+    $queued->cancel;
+    ok !$pubsub->is_connected, 'not left connected';
+
+    # A cancelled waiter is only spliced out of {waiting} the next time the
+    # pool has a connection to hand out -- _return_connection skips settled
+    # entries lazily rather than the cancellation itself editing the array.
+    # Releasing the held connection is what proves the guard's cancellation
+    # actually reached the queued future, not just this object's own state.
+    $held->release;
+
+    ok wait_until(sub { $pg->waiting_count == 0 }, 'stale waiter cleared', 3),
+        'no waiter left behind for the abandoned caller';
+    ok wait_until(sub { $pg->active_count == 0 }, 'not handed to a ghost', 3),
+        'the connection was not checked out to nobody';
+    is $pg->idle_count, 1, 'the connection went back to idle instead';
+
+    $pubsub->disconnect->get;
+};
+
 subtest 'concurrent connect checks out a single connection' => sub {
     my $pg = Async::DBD::Pg->new(
         dsn             => test_dsn(),
