@@ -128,10 +128,10 @@ subtest 'on_connect callback' => sub {
     $conn->release;
 };
 
-# A queued caller's future is safe to ->get directly now (see
-# pending_future in Async::DBD::Pg::Util), but several tests below still
-# want to observe a future settle without blocking on it, so this stays as
-# a convenience wrapper rather than the workaround it once was.
+# Drives the loop until a future settles, without propagating its result
+# the way ->get would. Several tests below want to observe that a queued
+# future has become ready -- for example to assert on the pool's state at
+# that exact point -- before going on to read the value themselves.
 sub settle {
     my ($f, $timeout) = @_;
 
@@ -212,14 +212,12 @@ subtest 'a queued caller can ->get its future directly, without settling first' 
     my $held = $pg->connection->get;
 
     # Release from a timer, so the request below is still queued -- not yet
-    # ready -- at the moment ->get is called on it directly. Before
-    # pending_future, a queued caller's future was a bare Future->new with
-    # no event loop of its own: calling ->get while it was not yet ready
-    # would croak "is not yet complete and does not provide ->await" rather
-    # than block, which is the only reason settle() above exists. This is
-    # the documented, synchronous way every other example in this file
-    # acquires a connection, and it was broken for the one caller who
-    # actually has to wait.
+    # ready -- at the moment ->get is called on it directly. This is the
+    # documented, synchronous way every other example in this file acquires
+    # a connection; a caller genuinely queued behind another needs to be
+    # able to use it too, blocking on pending_future's reactor-aware ->await
+    # (see Async::DBD::Pg::Util) rather than only succeeding when the future
+    # happens to already be ready.
     my $releaser = Future::IO->sleep(0.1);
     $releaser->on_done(sub { $held->release });
 

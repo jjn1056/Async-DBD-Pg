@@ -151,16 +151,37 @@ subtest 'cancelling a listen leaves the listener running' => sub {
     my $abandoned = $pubsub->listen('cancel_listen_b', sub { });
     $abandoned->cancel;
 
-    is $pubsub->{_control_query}, undef, 'the cancelled control query freed its slot';
-    ok $pubsub->listen('cancel_listen_c', sub { })->get,
-        'a control query queued behind a cancelled one still runs';
-
     is $pubsub->{_stopping}, 0, 'listener not left in the stopping state';
+
+    # Checked after the assertion above rather than before it: a further
+    # control query here would complete and restore {_stopping} through its
+    # own guard, masking a broken _ListenerGuard on the cancelled one.
+    is $pubsub->{_control_query}, undef, 'the cancelled control query freed its slot';
 
     $pubsub->notify('cancel_listen_a', 'still here')->get;
     wait_until(sub { @got }, 'notification after the cancelled listen', 3);
 
     is \@got, ['still here'], 'existing subscription still delivering';
+
+    $pubsub->disconnect->get;
+};
+
+subtest 'a control query queued behind a cancelled one is woken, not stranded' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 3,
+    );
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('slot_seed', sub { })->get;
+
+    my $holder = $pubsub->listen('slot_holder', sub { });   # claims the slot, suspends in its query
+    my $queued = $pubsub->listen('slot_queued', sub { });   # parks in the mutex loop
+    $holder->cancel;
+
+    ok $queued->get, 'a control query parked behind a cancelled one is woken';
+    is $pubsub->{_control_query}, undef, 'and the slot is free afterwards';
 
     $pubsub->disconnect->get;
 };
