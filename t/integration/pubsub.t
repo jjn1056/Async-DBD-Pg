@@ -857,4 +857,34 @@ subtest 'a failure that escapes through on_log still clears the reconnect slot' 
     $pubsub->disconnect->get;
 };
 
+subtest 'the listener keeps reading the connection it is polling' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 4,
+    );
+    my $pubsub = $pg->pubsub;
+
+    my @got;
+    $pubsub->listen('stale_conn_test', sub { push @got, $_[1] })->get;
+
+    # Simulate what a reconnect does: replace the tracked connection while a
+    # listener loop is already running against the original one. The loop
+    # polls the original socket, so it must also read notifications from the
+    # original connection, not from whatever {conn} happens to hold now.
+    my $original = $pubsub->conn;
+    my $usurper  = $pg->connection->get;
+    $pubsub->{conn} = $usurper;
+
+    $pubsub->notify('stale_conn_test', 'delivered')->get;
+    wait_until(sub { @got }, 'notification arrived', 3);
+
+    is \@got, ['delivered'],
+        'a notification on the polled connection is still delivered';
+
+    $pubsub->{conn} = $original;
+    $usurper->release;
+    $pubsub->disconnect->get;
+};
+
 done_testing;

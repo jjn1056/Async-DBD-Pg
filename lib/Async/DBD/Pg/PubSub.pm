@@ -207,10 +207,15 @@ async sub notify {
     return $result;
 }
 
+# The connection is passed in rather than read from $self. The listener loop
+# polls one specific socket for its whole life, so it must read notifications
+# from that same connection: if {conn} is replaced underneath it, re-reading
+# here would poll one connection and ask a different one what arrived, and the
+# notification would be dropped with no error and no log line.
 sub _process_notifications {
-    my ($self) = @_;
+    my ($self, $conn) = @_;
 
-    my $conn = $self->{conn} or return 0;
+    $conn or return 0;
     my $dbh = $conn->dbh or return 0;
 
     my $count = 0;
@@ -249,7 +254,7 @@ async sub _listener_loop {
     while (!$self->{_stopping}) {
         await Future::IO->poll($sock, POLLIN);
         last if $self->{_stopping};
-        $self->_process_notifications;
+        $self->_process_notifications($conn);
     }
 
     return;
