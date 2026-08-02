@@ -454,6 +454,11 @@ async sub _run_control_query {
     # replay can both arrive here the moment a shared connect resolves. Loop
     # rather than check once -- everyone waiting on the same predecessor wakes
     # together, so a single check would let them all through behind it.
+    #
+    # Not Future::Mutex, which ships with the already-required Future: its
+    # first entrant is built from Future->done, the same plain Future class
+    # pending_future exists to avoid, so a mutex built from it would
+    # reintroduce ->get croaking for a caller queued behind real async work.
     while (my $pending = $self->{_control_query}) {
         await $pending->without_cancel;
     }

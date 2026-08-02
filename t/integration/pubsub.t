@@ -151,6 +151,10 @@ subtest 'cancelling a listen leaves the listener running' => sub {
     my $abandoned = $pubsub->listen('cancel_listen_b', sub { });
     $abandoned->cancel;
 
+    is $pubsub->{_control_query}, undef, 'the cancelled control query freed its slot';
+    ok $pubsub->listen('cancel_listen_c', sub { })->get,
+        'a control query queued behind a cancelled one still runs';
+
     is $pubsub->{_stopping}, 0, 'listener not left in the stopping state';
 
     $pubsub->notify('cancel_listen_a', 'still here')->get;
@@ -760,8 +764,13 @@ subtest 'concurrent control queries on one connection are serialized, not raced'
     my $f1 = $pubsub->listen('concurrent_a', sub { });
     my $f2 = $pubsub->listen('concurrent_b', sub { });
 
-    ok eval { $f1->get; 1 }, 'first concurrent listen succeeded' or diag $@;
-    ok eval { $f2->get; 1 }, 'second concurrent listen succeeded' or diag $@;
+    my $ok1  = eval { $f1->get; 1 };
+    my $err1 = $@;
+    ok $ok1, 'first concurrent listen succeeded' or diag $err1;
+
+    my $ok2  = eval { $f2->get; 1 };
+    my $err2 = $@;
+    ok $ok2, 'second concurrent listen succeeded' or diag $err2;
 
     is $pubsub->subscribed_channels, 3, 'all three channels registered';
 
@@ -802,17 +811,20 @@ subtest 'a reconnect racing a listen takes only one connection' => sub {
         })->();
     };
 
-    kill_backends($dsn);
+    my $captured = capture_stderr(sub {
+        kill_backends();
 
-    # kill_backends is synchronous DBI and never turns the reactor, so
-    # {connected} still reads stale here. Waiting for the listener to notice
-    # is what actually starts the race: without it, the listen() below would
-    # read the same stale flag, skip connect() entirely, and try to issue
-    # LISTEN on the connection whose backend was just killed.
-    wait_until(sub { !$pubsub->is_connected }, 'listener noticed', 5);
-
+        # kill_backends is synchronous DBI and never turns the reactor, so
+        # {connected} still reads stale here. Waiting for the listener to
+        # notice is what actually starts the race: without it, the listen()
+        # below would read the same stale flag, skip connect() entirely, and
+        # try to issue LISTEN on the connection whose backend was just
+        # killed.
+        wait_until(sub { !$pubsub->is_connected }, 'listener noticed', 5);
+    });
+    is $captured, '', 'the termination notice does not reach fd 2';
     ok scalar(grep { /FATAL:\s+terminating connection due to administrator command/ } @logged),
-        'the termination notice reaches on_log instead of fd 2';
+        'the termination notice reaches on_log instead';
 
     # The supervisor is now backing off; this listen races it.
     $pubsub->listen('race_during', sub { })->get;

@@ -128,9 +128,10 @@ subtest 'on_connect callback' => sub {
     $conn->release;
 };
 
-# A caller that has to queue waits on a plain Future, which cannot drive the
-# event loop the way a Future::IO one can, so the loop is pumped here until
-# the future settles.
+# A queued caller's future is safe to ->get directly now (see
+# pending_future in Async::DBD::Pg::Util), but several tests below still
+# want to observe a future settle without blocking on it, so this stays as
+# a convenience wrapper rather than the workaround it once was.
 sub settle {
     my ($f, $timeout) = @_;
 

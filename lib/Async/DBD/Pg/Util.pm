@@ -159,20 +159,17 @@ sub safe_dsn {
 # Cloning from a real Future::IO future instead gives every future this
 # returns the reactor-aware ->await a caller's top-level ->get needs.
 #
-# The prototype itself is created once and cancelled immediately: only its
-# class is wanted, not a running timer. Cached rather than rebuilt per call,
-# since its class is fixed by whichever Future::IO implementation is loaded
-# for the life of the process -- nothing in this distribution switches
-# implementations after startup.
-my $PENDING_PROTO;
-
+# Built fresh each call rather than cloned from a cached prototype: caching
+# would fix the class at whichever implementation was loaded on first use,
+# and a consumer that installs a mock implementation later via
+# Future::IO->override_impl -- the documented way to test Future::IO code --
+# would silently get a real-implementation future back from a mocked
+# reactor. The cost of not caching is one timer create-and-cancel per call,
+# noise beside the database round trip this is used around.
 sub pending_future {
-    $PENDING_PROTO //= do {
-        my $f = Future::IO->sleep(0);
-        $f->cancel;
-        $f;
-    };
-    return $PENDING_PROTO->new;
+    my $f = Future::IO->sleep(0);
+    $f->cancel;
+    return $f->new;
 }
 
 1;
