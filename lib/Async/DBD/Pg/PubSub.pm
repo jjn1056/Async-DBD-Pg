@@ -121,7 +121,7 @@ async sub connect {
     # Held for the duration of the await. See _AwaiterGuard: the view keeps one
     # caller's cancellation from failing the others, and the guard makes sure
     # the attempt is still cancelled once the last caller has gone.
-    my $guard = Async::DBD::Pg::PubSub::_AwaiterGuard->new($self);
+    my $guard = Async::DBD::Pg::PubSub::_AwaiterGuard->new($self, $attempt);
 
     await $attempt->without_cancel;
 
@@ -569,18 +569,25 @@ sub DESTROY { shift->restore }
 # The count is dropped in a destructor rather than after the await: a cancelled
 # sub never resumes, so anything written after the await would be skipped in
 # exactly the case this exists for.
+#
+# Each guard remembers its own attempt and checks it against {_connecting}
+# before touching either key. {_connecting} normally names the one attempt
+# every live guard was built for, but nothing enforces that this guard's
+# attempt is still the current one -- if it were destroyed after a second
+# attempt had already taken the slot, it would otherwise decrement and
+# possibly cancel a stranger's attempt using its own guard's leftover count.
 package Async::DBD::Pg::PubSub::_AwaiterGuard;
 
 use strict;
 use warnings;
-use Scalar::Util qw(weaken);
+use Scalar::Util qw(refaddr weaken);
 
 sub new {
-    my ($class, $pubsub) = @_;
+    my ($class, $pubsub, $attempt) = @_;
 
     $pubsub->{_connecting_waiters}++;
 
-    my $self = bless { pubsub => $pubsub }, $class;
+    my $self = bless { pubsub => $pubsub, attempt => $attempt }, $class;
     weaken($self->{pubsub});
 
     return $self;
@@ -591,6 +598,7 @@ sub DESTROY {
 
     my $pubsub = $self->{pubsub} or return;
     return unless $pubsub->{_connecting};
+    return unless refaddr($pubsub->{_connecting}) == refaddr($self->{attempt});
     return if --$pubsub->{_connecting_waiters} > 0;
 
     my $attempt = delete $pubsub->{_connecting};
