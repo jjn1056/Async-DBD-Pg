@@ -427,6 +427,46 @@ sub kill_all_backends {
     return;
 }
 
+sub wait_until {
+    my ($code, $label, $timeout) = @_;
+
+    $timeout //= 1;
+    my $deadline = time + $timeout;
+
+    while (time < $deadline) {
+        return 1 if $code->();
+        Future::IO->sleep(0.02)->get;
+    }
+
+    return $code->() ? 1 : 0;
+}
+
+# True if any of the given backend pids are still visible in
+# pg_stat_activity. pg_terminate_backend sends a signal and returns as soon
+# as it is sent, not once the backend has actually exited, so this is what a
+# wait for "actually gone" polls -- a fresh, throwaway connection each call,
+# never one of the pool's own, so it cannot itself become a target the next
+# kill_all_backends call reaches, and never touches the idle connections
+# under test.
+sub backends_alive {
+    my (@pids) = @_;
+    return 0 unless @pids;
+
+    my $parsed = Async::DBD::Pg::Util::parse_dsn(test_dsn());
+    my $dbh = DBI->connect(
+        $parsed->{dbi_dsn}, $parsed->{user}, $parsed->{password},
+        { RaiseError => 1, PrintError => 0 },
+    );
+    my $placeholders = join ',', ('?') x @pids;
+    my ($count) = $dbh->selectrow_array(
+        "SELECT count(*) FROM pg_stat_activity WHERE pid IN ($placeholders)",
+        undef, @pids,
+    );
+    $dbh->disconnect;
+
+    return $count > 0;
+}
+
 subtest 'a connection that died while idle is repaired, not reported' => sub {
     my @logged;
     my $pg = Async::DBD::Pg->new(
@@ -598,6 +638,13 @@ subtest 'finding one dead connection discards its idle siblings' => sub {
     $conn1->query('SELECT 1')->get;
     $conn2->query('SELECT 1')->get;
     $held->query('SELECT 1')->get;
+
+    # pg_pid is a cached attribute recorded at connect time, not a live read,
+    # so fetching it here does not touch the socket -- it does not disturb
+    # the "nothing is read from the idle sockets" property this subtest goes
+    # on to test below.
+    my ($pid1, $pid2) = ($conn1->dbh->{pg_pid}, $conn2->dbh->{pg_pid});
+
     $conn1->release;
     $conn2->release;
 
@@ -606,7 +653,15 @@ subtest 'finding one dead connection discards its idle siblings' => sub {
 
     my $captured = capture_stderr(sub {
         kill_all_backends();
-        Future::IO->sleep(0.2)->get;
+
+        # pg_terminate_backend sends the signal and returns as soon as it is
+        # sent, not once the backend has actually exited -- a fixed sleep
+        # here is a guess at how long that takes. Wait for the two specific
+        # backends this subtest depends on to actually be gone instead,
+        # checked through a separate, throwaway connection (backends_alive)
+        # that never touches conn1's or conn2's own idle sockets.
+        wait_until(sub { !backends_alive($pid1, $pid2) },
+            'both idle backends actually gone', 5);
     });
     is $captured, '', 'nothing is read from the idle sockets during the kill';
 
@@ -941,9 +996,17 @@ subtest 'concurrent notices on different connections all reach on_log' => sub {
     });
 
     is $captured, '', 'nothing reaches fd 2 from either connection';
-    ok scalar(grep { $_->[1] =~ /concurrent_marker_slow/ } @logged),
+
+    # wait_all above already blocks until both queries' own futures are
+    # done, and _capture_pg_notices runs synchronously inside each one
+    # before it resolves -- but waiting explicitly for @logged to hold each
+    # marker, rather than trusting that internal ordering, removes the
+    # assumption instead of relying on it.
+    ok wait_until(sub { scalar grep { $_->[1] =~ /concurrent_marker_slow/ } @logged },
+        'slow notice logged', 2),
         'the slower notice reached on_log';
-    ok scalar(grep { $_->[1] =~ /concurrent_marker_fast/ } @logged),
+    ok wait_until(sub { scalar grep { $_->[1] =~ /concurrent_marker_fast/ } @logged },
+        'fast notice logged', 2),
         'the faster notice reached on_log';
 
     $conn_a->release;
