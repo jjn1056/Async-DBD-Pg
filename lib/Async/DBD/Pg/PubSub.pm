@@ -123,7 +123,17 @@ async sub connect {
     # the attempt is still cancelled once the last caller has gone.
     my $guard = Async::DBD::Pg::PubSub::_AwaiterGuard->new($self, $attempt);
 
-    await $attempt->without_cancel;
+    # Teardown is the only thing that can cancel the shared attempt now, and a
+    # cancelled future reaches its awaiters as "Future=HASH(0x...) was
+    # cancelled" -- an address and no explanation. Callers get told what
+    # actually happened to them.
+    my $connected = eval { await $attempt->without_cancel; 1 };
+
+    unless ($connected) {
+        my $err = $@;
+        die $err unless $attempt->is_cancelled;
+        die "PubSub connect was cancelled\n";
+    }
 
     return $self;
 }
@@ -464,6 +474,13 @@ async sub disconnect {
         $reconnecting->cancel unless $reconnecting->is_ready;
     }
 
+    # A connect still in flight would otherwise finish after we return and
+    # leave a connection checked out to an object that has been torn down.
+    # Awaiters cannot cancel it -- see _AwaiterGuard -- so teardown must.
+    if (my $connecting = delete $self->{_connecting}) {
+        $connecting->cancel unless $connecting->is_ready;
+    }
+
     unless ($self->{connected} || $self->{conn}) {
         $self->{channels}  = {};
         $self->{_stopping} = 0;
@@ -491,6 +508,10 @@ sub _pool_shutdown {
 
     if (my $reconnecting = delete $self->{_reconnect_future}) {
         $reconnecting->cancel unless $reconnecting->is_ready;
+    }
+
+    if (my $connecting = delete $self->{_connecting}) {
+        $connecting->cancel unless $connecting->is_ready;
     }
 
     if (my $listener = delete $self->{_listener_future}) {

@@ -232,6 +232,33 @@ subtest 'abandoning the only connect releases everything' => sub {
     $pubsub->disconnect->get;
 };
 
+subtest 'disconnecting during a connect does not leave it running' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 3,
+    );
+    my $pubsub = $pg->pubsub;
+
+    # Start a connect and tear down before it can finish. Nothing may be left
+    # checked out to an object that has been disconnected.
+    my $connecting = $pubsub->connect;
+    $pubsub->disconnect->get;
+
+    ok wait_until(sub { $pg->active_count == 0 }, 'checkout released', 3),
+        'no connection is left checked out after disconnect';
+    ok !$pubsub->is_connected, 'and the object is not connected';
+
+    # The caller is still waiting on that connect. A cancelled future surfaces
+    # as "Future=HASH(0x...) was cancelled", which tells them nothing about
+    # what happened or whether it was their fault.
+    ok $connecting->is_ready, 'the waiting caller was told';
+    like $connecting->failure, qr/PubSub connect was cancelled/,
+        'and told something that explains it';
+
+    $connecting->cancel unless $connecting->is_ready;
+};
+
 subtest 'abandoning a queued connect does not leave a waiter behind' => sub {
     my $pg = Async::DBD::Pg->new(
         dsn             => test_dsn(),
