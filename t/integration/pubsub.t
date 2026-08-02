@@ -11,6 +11,7 @@ use Test::Async::DBD::Pg qw(skip_without_postgres test_dsn);
 my $dsn = skip_without_postgres();
 
 use Future;
+use Future::AsyncAwait;
 use Future::IO;
 
 BEGIN { Future::IO->load_best_impl; }
@@ -304,6 +305,32 @@ subtest 'abandoning a queued connect does not leave a waiter behind' => sub {
     ok wait_until(sub { $pg->active_count == 0 }, 'not handed to a ghost', 3),
         'the connection was not checked out to nobody';
     is $pg->idle_count, 1, 'the connection went back to idle instead';
+
+    $pubsub->disconnect->get;
+};
+
+subtest 'a queued connect can be ->get directly, without polling first' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 1,
+    );
+    my $pubsub = $pg->pubsub;
+
+    my $held = $pg->connection->get;
+
+    # Release from a timer, so connect() below is still queued behind the
+    # held connection -- not yet ready -- when ->get is called on it
+    # directly. connect()'s shared attempt is _establish()'s own returned
+    # future, whose class comes from whatever it first suspends on: before
+    # the pool's queue branch was fixed to use pending_future, a caller
+    # queued this way got back a future that could never block on ->get,
+    # only croak "is not yet complete and does not provide ->await".
+    my $releaser = Future::IO->sleep(0.1);
+    $releaser->on_done(sub { $held->release });
+
+    ok $pubsub->connect->get,
+        'a connect queued behind pool exhaustion can be ->get directly';
 
     $pubsub->disconnect->get;
 };
@@ -709,6 +736,103 @@ subtest 'listen() during the reconnect backoff does not orphan a connection' => 
     $pubsub->disconnect->get;
     ok wait_until(sub { $pg->active_count == 0 }, 'pool drained after disconnect', 3),
         'no orphaned connection left checked out';
+};
+
+subtest 'concurrent control queries on one connection are serialized, not raced' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 5,
+    );
+    my $pubsub = $pg->pubsub;
+
+    # Establishes the connection and its listener loop before the race, so
+    # both calls below reach _run_control_query with nothing else left to
+    # await first.
+    $pubsub->listen('serial_seed', sub { })->get;
+
+    # Two first-subscriptions fired back to back, with neither awaited before
+    # the second is issued: each reaches _run_control_query wanting the same
+    # connection at the same moment. Without serialization, DBD::Pg refuses
+    # the second async query while the first is still in flight and this
+    # fails outright rather than merely racing -- see the mutation check
+    # below.
+    my $f1 = $pubsub->listen('concurrent_a', sub { });
+    my $f2 = $pubsub->listen('concurrent_b', sub { });
+
+    ok eval { $f1->get; 1 }, 'first concurrent listen succeeded' or diag $@;
+    ok eval { $f2->get; 1 }, 'second concurrent listen succeeded' or diag $@;
+
+    is $pubsub->subscribed_channels, 3, 'all three channels registered';
+
+    $pubsub->disconnect->get;
+};
+
+subtest 'a reconnect racing a listen takes only one connection' => sub {
+    my @got_before;
+    my @logged;
+    my $pg = Async::DBD::Pg->new(
+        dsn                    => test_dsn(),
+        min_connections        => 0,
+        max_connections        => 5,
+        reconnect              => 1,
+        reconnect_min_interval => 0.1,
+        reconnect_max_interval => 0.1,
+        on_log                 => sub { push @logged, $_[1] },
+    );
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('race_before', sub { push @got_before, $_[1] })->get;
+
+    # Delay exactly one pool checkout, so the listen() below is still in
+    # flight when the supervisor wakes from its backoff. Real contention does
+    # this for free but not reliably; forcing it makes the test deterministic.
+    # The delay lives here rather than in the pool: production code does not
+    # carry test scaffolding.
+    my $orig      = Async::DBD::Pg->can('connection');
+    my $delay_one = 1;
+    no warnings 'redefine';
+    local *Async::DBD::Pg::connection = sub {
+        my ($pool) = @_;
+        return $pool->$orig unless $delay_one;
+        $delay_one = 0;
+        return (async sub {
+            await Future::IO->sleep(0.3);
+            return await $pool->$orig;
+        })->();
+    };
+
+    kill_backends($dsn);
+
+    # kill_backends is synchronous DBI and never turns the reactor, so
+    # {connected} still reads stale here. Waiting for the listener to notice
+    # is what actually starts the race: without it, the listen() below would
+    # read the same stale flag, skip connect() entirely, and try to issue
+    # LISTEN on the connection whose backend was just killed.
+    wait_until(sub { !$pubsub->is_connected }, 'listener noticed', 5);
+
+    ok scalar(grep { /FATAL:\s+terminating connection due to administrator command/ } @logged),
+        'the termination notice reaches on_log instead of fd 2';
+
+    # The supervisor is now backing off; this listen races it.
+    $pubsub->listen('race_during', sub { })->get;
+
+    ok wait_until(sub { $pubsub->is_connected }, 'reconnected', 5),
+        'pub/sub came back';
+
+    # A channel subscribed before the race must still deliver afterwards. If
+    # two connections were taken, the listener loop polls one socket while
+    # _process_notifications reads the other, and this notification is dropped
+    # silently -- no error, no log line, and the subscription still reports
+    # itself as active.
+    $pubsub->notify('race_before', 'still here')->get;
+    ok wait_until(sub { @got_before }, 'notification arrived', 5),
+        'a channel subscribed before the race still delivers';
+
+    $pubsub->disconnect->get;
+
+    is $pg->active_count, 0,
+        'no connection was orphaned by the race';
 };
 
 subtest 'a failure inside the replay is retried in place, not left to end the supervisor' => sub {

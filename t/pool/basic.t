@@ -200,6 +200,34 @@ subtest 'a queued caller is served when a connection frees up' => sub {
     $conn->release;
 };
 
+subtest 'a queued caller can ->get its future directly, without settling first' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 1,
+        queue_timeout   => 5,
+    );
+
+    my $held = $pg->connection->get;
+
+    # Release from a timer, so the request below is still queued -- not yet
+    # ready -- at the moment ->get is called on it directly. Before
+    # pending_future, a queued caller's future was a bare Future->new with
+    # no event loop of its own: calling ->get while it was not yet ready
+    # would croak "is not yet complete and does not provide ->await" rather
+    # than block, which is the only reason settle() above exists. This is
+    # the documented, synchronous way every other example in this file
+    # acquires a connection, and it was broken for the one caller who
+    # actually has to wait.
+    my $releaser = Future::IO->sleep(0.1);
+    $releaser->on_done(sub { $held->release });
+
+    my $conn = $pg->connection->get;
+    ok $conn, 'a queued connection request can be ->get directly';
+
+    $conn->release;
+};
+
 subtest 'on_release runs before a connection is reused' => sub {
     my @released;
     my $pg = Async::DBD::Pg->new(

@@ -12,7 +12,7 @@ use DBD::Pg;
 use Async::DBD::Pg::Connection;
 use Async::DBD::Pg::Error;
 use Async::DBD::Pg::PubSub;
-use Async::DBD::Pg::Util qw(parse_dsn);
+use Async::DBD::Pg::Util qw(parse_dsn pending_future);
 use IO::Socket;
 use POSIX qw(dup);
 use Scalar::Util qw(refaddr weaken);
@@ -405,7 +405,12 @@ async sub connection {
     }
 
     # 3. Queue and wait
-    my $future = Future->new;
+    #
+    # pending_future rather than a bare Future->new: a caller that has to
+    # queue here is otherwise handed back a future whose top-level ->get can
+    # never block, only croak once it isn't already ready -- see
+    # Async::DBD::Pg::Util for why.
+    my $future = pending_future();
     my $waiting = {
         future    => $future,
         queued_at => time(),

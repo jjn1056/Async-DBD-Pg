@@ -7,6 +7,8 @@ use Future::AsyncAwait;
 use Future::IO qw(POLLIN);
 use Scalar::Util qw(refaddr weaken);
 
+use Async::DBD::Pg::Util qw(pending_future);
+
 sub new {
     my ($class, %args) = @_;
 
@@ -356,21 +358,23 @@ async sub _reconnect_loop {
         last if $self->{_stopping};
 
         my $ok = eval {
-            unless ($self->{connected} && $self->{conn}) {
-                my $pool = $self->{pool}
-                    or die "pool is gone\n";
-
-                $self->{conn}      = await $pool->connection;
-                $self->{connected} = 1;
-            }
+            # Through connect(), not a checkout of our own. An ordinary
+            # listen() may be connecting right now, and deciding separately
+            # whether a connection is needed is what produced two of them:
+            # the check and the checkout are separate moments, and this sub
+            # suspends between them, so both paths could see "not connected"
+            # and act on it. connect() owns the one attempt and shares it,
+            # so whichever of us asks second waits for the first instead of
+            # starting another.
+            await $self->connect;
 
             # An ordinary connect/listen call may already have re-established
-            # the connection while this loop was backing off -- the branch
-            # above finds it and skips taking a second one of our own, which
-            # would otherwise leave the winner's connection checked out to
-            # nobody. Either way, replay every registered channel: that path
-            # only replays the channel it was called for, so anything
-            # subscribed before it would stay silently orphaned without this.
+            # the connection while this loop was backing off -- connect()
+            # above finds that attempt and shares it rather than starting a
+            # second one, so both paths end up on the same connection.
+            # Either way, replay every registered channel: that path only
+            # replays the channel it was called for, so anything subscribed
+            # before it would stay silently orphaned without this.
             #
             # Issued through _run_control_query, the same idiom listen() and
             # unlisten() use, rather than querying the connection directly:
@@ -445,6 +449,28 @@ async sub _stop_listener {
 async sub _run_control_query {
     my ($self, $sql, @bind) = @_;
 
+    # Only one control query at a time on this connection: DBD::Pg cannot run
+    # two async queries on one handle, and listen() and the reconnect loop's
+    # replay can both arrive here the moment a shared connect resolves. Loop
+    # rather than check once -- everyone waiting on the same predecessor wakes
+    # together, so a single check would let them all through behind it.
+    while (my $pending = $self->{_control_query}) {
+        await $pending->without_cancel;
+    }
+
+    # Claimed with a fresh future rather than the query's own future: the
+    # query does not exist yet, since _stop_listener below awaits before one
+    # is issued. Reading the loop's exit and claiming this are not separated
+    # by an await, so no second caller can slip in between.
+    #
+    # pending_future rather than a bare Future->new: a second caller waiting
+    # on the loop above is otherwise handed back a listen()/unlisten() future
+    # whose top-level ->get can never block, only croak once it isn't already
+    # ready -- see Async::DBD::Pg::Util for why.
+    my $done = pending_future();
+    $self->{_control_query} = $done;
+    my $query_guard = Async::DBD::Pg::PubSub::_ControlQueryGuard->new($self, $done);
+
     await $self->_stop_listener if $self->{_listener_future};
 
     # Stopping the listener set _stopping, and the listener loop refuses to
@@ -458,6 +484,7 @@ async sub _run_control_query {
     my $err = $@;
 
     $listener->restore;
+    $query_guard->release;
 
     die $err if $err;
 
@@ -578,6 +605,46 @@ sub restore {
 }
 
 sub DESTROY { shift->restore }
+
+# Releases the one-at-a-time slot _run_control_query claims on {_control_query}
+# before touching the connection. Released from a destructor as well as
+# explicitly, so a caller cancelling mid-query still frees the slot for
+# whoever is waiting instead of leaving them stuck forever -- the same reason
+# _ListenerGuard above restores from both places.
+package Async::DBD::Pg::PubSub::_ControlQueryGuard;
+
+use strict;
+use warnings;
+use Scalar::Util qw(refaddr weaken);
+
+sub new {
+    my ($class, $pubsub, $done) = @_;
+
+    my $self = bless { pubsub => $pubsub, done => $done }, $class;
+    weaken($self->{pubsub});
+
+    return $self;
+}
+
+sub release {
+    my ($self) = @_;
+
+    my $done = delete $self->{done} or return;
+    my $pubsub = delete $self->{pubsub};
+
+    # Cleared before $done is marked ready: a waiter's while loop resumes as
+    # soon as that happens, possibly synchronously in this same call, and
+    # would otherwise see the slot still occupied and await the same future
+    # again for nothing. Checked against $done's identity in case this guard
+    # somehow outlives its slot, so it can never clear a claim it didn't make.
+    if ($pubsub && $pubsub->{_control_query} && refaddr($pubsub->{_control_query}) == refaddr($done)) {
+        delete $pubsub->{_control_query};
+    }
+
+    $done->done unless $done->is_ready;
+}
+
+sub DESTROY { shift->release }
 
 # Counts the callers waiting on one shared connect attempt. Every awaiter holds
 # one of these, including the caller that started the attempt.
