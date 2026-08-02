@@ -567,7 +567,19 @@ that decides a connection is needed, and it is safe to share.
 - Consumes: `connect()` from Task 2, `_process_notifications($self, $conn)`
   from Task 1.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Add the missing import**
+
+The test below uses `async sub`, and `t/integration/pubsub.t` does not import
+`Future::AsyncAwait`. Add it beside the existing `use Future;` near the top of
+the file:
+
+```perl
+use Future;
+use Future::AsyncAwait;
+use Future::IO;
+```
+
+- [ ] **Step 2: Write the failing test**
 
 ```perl
 subtest 'a reconnect racing a listen takes only one connection' => sub {
@@ -626,7 +638,7 @@ subtest 'a reconnect racing a listen takes only one connection' => sub {
 };
 ```
 
-- [ ] **Step 2: Run it and watch it fail**
+- [ ] **Step 3: Run it and watch it fail**
 
 ```bash
 source ~/perl5/perlbrew/etc/bashrc && perlbrew use perl-5.42.2@default && \
@@ -643,7 +655,7 @@ Note the construction: `reconnect` and its intervals are **pool** options, and
 `$pg->pubsub` takes no arguments. `t/integration/pubsub.t:396-410` is the
 existing example.
 
-- [ ] **Step 3: Delete the supervisor's own checkout**
+- [ ] **Step 4: Delete the supervisor's own checkout**
 
 In `_reconnect_loop`, replace this (`lib/Async/DBD/Pg/PubSub.pm:331-338`):
 
@@ -673,11 +685,11 @@ with:
             await $self->connect;
 ```
 
-- [ ] **Step 4: Run the file**
+- [ ] **Step 5: Run the file**
 
 Same command as Step 2. Expected: PASS, all subtests.
 
-- [ ] **Step 5: Prove the fix is what makes it pass**
+- [ ] **Step 6: Prove the fix is what makes it pass**
 
 Copy `lib/` to a scratch directory, restore the deleted `unless` block in the
 copy, and run the file against it without `-l`, confirming `%INC` from inside
@@ -687,7 +699,7 @@ Expected: `'no connection was orphaned by the race'` goes RED. A concurrency
 test that has never been seen red is not evidence. If it stays green, the test
 is not reproducing the race and you should report that rather than proceeding.
 
-- [ ] **Step 6: Run the file 30 times**
+- [ ] **Step 7: Run the file 30 times**
 
 ```bash
 for i in $(seq 1 30); do
@@ -702,7 +714,7 @@ grep -L '^Result: PASS' /tmp/pb-*.out | wc -l
 Expected: `0` files without a PASS. Report the count. Confirm nothing else was
 touching the database.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add lib/Async/DBD/Pg/PubSub.pm t/integration/pubsub.t
