@@ -949,3 +949,35 @@ There is no `->retain` left in the distribution.
 
 The general form: if a future is worth starting, something should own it and something
 should look at how it ends. `->retain` supplies neither.
+
+### 65. Pub/sub reconnect can orphan a pooled connection
+
+`connect()` and `_reconnect_loop` both decide independently whether to
+reconnect, and neither consults the other. `connect()` shares concurrent
+explicit callers through `{_connecting}`; the supervisor checks only
+`unless ($self->{connected} && $self->{conn})` before checking out a connection
+of its own. Whichever `_establish` finishes last silently overwrites `{conn}`
+and `{connected}`, abandoning the other connection — and any `LISTEN` issued on
+it — without returning it to the pool.
+
+The abandoned connection is never released. `active_count` stays at 1 after
+`disconnect()` instead of dropping to 0, so each occurrence permanently costs
+the pool one connection, and any channel registered on the losing connection
+stops delivering while still appearing subscribed.
+
+Normally invisible: `listen()`'s own reconnect is a single fast round trip that
+finishes long before the supervisor's backoff elapses. Under scheduler or IO
+contention that fast path can still be in flight when the supervisor wakes.
+Reproduced deterministically by delaying one pool checkout by 0.3s and dropping
+`reconnect_min_interval` to 0.1s, which produces three connections where there
+should be one and leaves the second permanently orphaned.
+
+Observed in the test suite at roughly 6 occurrences in 70 runs of
+`t/integration/pubsub.t`, usually as 'listen() during the reconnect backoff does
+not orphan a connection'.
+
+Fixing this means making the two paths coordinate — either extending the
+`_connecting`-sharing pattern so it also covers and consults
+`_reconnect_future`, or folding both into a single slot both paths check. That
+is a design change to the reconnect coordination rather than a local fix, so it
+is deliberately not bundled with unrelated work.
