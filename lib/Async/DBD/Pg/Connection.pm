@@ -53,6 +53,11 @@ async sub query {
         ($sql, $bind) = convert_placeholders($sql, $bind);
     }
 
+    # Once per checkout, and only for a connection that was idle.
+    if (delete $self->{_check_liveness}) {
+        await $self->_heal_if_dead;
+    }
+
     $self->{query_count}++;
     $self->{last_used} = time();
 
@@ -122,6 +127,136 @@ async sub _query_with_timeout {
     die $failure;
 }
 
+# Replace this connection if it died while it was sitting idle. Called before
+# the first statement after checkout, never after a failure: a statement on a
+# dead connection succeeds at prepare and at execute and only fails at
+# pg_result, by which point it may already have run and nothing about it can
+# safely be repeated.
+async sub _heal_if_dead {
+    my ($self) = @_;
+
+    my $pool = $self->{pool} or return 0;
+
+    return 0 unless $pool->{heal_dead_connections};
+    return 0 if $pool->{_shutting_down};
+
+    # The transaction died with the connection. Continuing on a replacement
+    # would run the caller's statements outside the transaction they asked
+    # for, which is worse than the failure.
+    return 0 if $self->{in_transaction};
+
+    my $dbh = $self->{dbh} or return 0;
+
+    # Free, and no round trip: a healthy idle connection has nothing waiting
+    # to be read, while one whose server has gone is readable because the
+    # peer's close is sitting there. DBI's own Active flag stays true on a
+    # dead connection and is no help.
+    my $fd = $dbh->{pg_socket};
+    return 0 unless defined $fd && $fd >= 0;
+
+    my $rin = '';
+    vec($rin, $fd, 1) = 1;
+
+    # select's error return is -1 (e.g. on EINTR), which is true in boolean
+    # context; checked as a number instead so an interrupted call falls
+    # through to the round trip below rather than being read as "readable".
+    # Getting this wrong doesn't change the outcome -- a healthy connection's
+    # ping still succeeds and the heal is still skipped -- it just costs one
+    # avoidable round trip on an already-uncommon path.
+    my $ready = select(my $rout = $rin, undef, undef, 0);
+    return 0 unless defined $ready && $ready > 0;
+
+    # Readable is suggestive, not conclusive: an asynchronous notification
+    # would look the same if an application ran LISTEN on a pooled
+    # connection. Confirm before throwing the connection away. This round
+    # trip happens only when something already looks wrong.
+    return 0 if $dbh->ping;
+
+    $pool->_log(warn => 'replacing a pooled connection that was already dead');
+
+    await $pool->_replace_dbh($self);
+
+    # Whatever killed this one has usually killed the rest.
+    my $dropped = $pool->_discard_idle_connections;
+    $pool->_log(warn => "discarded $dropped idle connection(s) after finding one dead")
+        if $dropped;
+
+    return 1;
+}
+
+# Route a PostgreSQL NOTICE (or any other warning DBI's PrintWarn would
+# otherwise print straight to fd 2) through the pool's own logging. DBD::Pg
+# raises it as an ordinary Perl warning while reading from the socket, and
+# measurement is what says where: under pg_async, a statement's own notice
+# surfaces during the pg_ready poll in _wait_for_result, not during execute
+# or pg_result, because execute only dispatches and returns without waiting.
+# All three are wrapped anyway -- it costs nothing on a call that raises
+# nothing, and it stops the interception being tied to which phase a notice
+# happens to arrive in today. prepare is not wrapped; it never touches the
+# network under pg_async.
+#
+# $SIG{__WARN__} is global, so it is localised strictly around the one
+# synchronous call it wraps, never across an await: a local unwinds with its
+# frame, and a caller can cancel while a sub is suspended, running nothing
+# after that point. That also rules out a guard object living for the whole
+# query -- its constructor/DESTROY pair would be a global assignment held
+# across every await the query makes, and two connections' queries running
+# concurrently would have one's DESTROY clobber the other's still-active
+# handler. A local avoids that by construction: its scope is one synchronous
+# call, and only one call is ever running at a time in a single-threaded
+# event loop. Wrapping the call sites individually with this rather than
+# duplicating the handler at each one keeps it in one place.
+sub _capture_pg_notices {
+    my ($self, $code) = @_;
+
+    my $pool = $self->{pool};
+
+    # No pool to log through. Leaving $SIG{__WARN__} untouched lets the
+    # notice behave exactly as it would without this wrapper -- printed, or
+    # caught by whatever handler is already in effect -- which is re-raising
+    # it rather than swallowing it.
+    return $code->() unless $pool;
+
+    # _log's own fallback, when no on_log is configured, is itself a warn()
+    # call. It does not re-enter this handler: Perl does not deliver
+    # $SIG{__WARN__} recursively to the handler currently running, so a
+    # warn() from inside this one uses the true default (print to stderr)
+    # on its own, with nothing extra needed here to arrange that. The same
+    # non-re-entrance is what lets the passed-through branch below just
+    # warn() rather than needing to juggle the handler itself.
+    local $SIG{__WARN__} = sub {
+        my ($message) = @_;
+
+        # ERROR, FATAL and PANIC mean the connection itself may be gone, not
+        # merely something the statement noticed along the way -- logged at
+        # warn to match how the rest of this module reports a dead
+        # connection (_heal_if_dead's own "replacing a pooled connection
+        # that was already dead"), rather than at the same level as routine
+        # chatter.
+        if ($message =~ /^(?:ERROR|FATAL|PANIC):/) {
+            $message =~ s/\n\z//;
+            $pool->_log(warn => $message);
+            return;
+        }
+
+        # The rest of PostgreSQL's severities are routine and downgraded to
+        # an info-level log line.
+        if ($message =~ /^(?:NOTICE|WARNING|INFO|LOG|DEBUG):/) {
+            $message =~ s/\n\z//;
+            $pool->_log(info => $message);
+            return;
+        }
+
+        # Not a PostgreSQL message at all -- a DBI handle-lifecycle warning,
+        # say -- is a real problem, not chatter, and is passed through as an
+        # ordinary warning instead of being relabeled and mixed in with
+        # server message text.
+        warn $message;
+    };
+
+    return $code->();
+}
+
 # Core async query execution using DBD::Pg async support
 async sub _execute_async {
     my ($self, $sql, $bind) = @_;
@@ -144,12 +279,14 @@ async sub _execute_async {
     my $statement = Async::DBD::Pg::Connection::_StatementGuard->new($self, $sth);
 
     my $rv = eval {
-        if (ref $bind eq 'ARRAY' && @$bind) {
-            $sth->execute(@$bind);
-        }
-        else {
-            $sth->execute;
-        }
+        $self->_capture_pg_notices(sub {
+            if (ref $bind eq 'ARRAY' && @$bind) {
+                $sth->execute(@$bind);
+            }
+            else {
+                $sth->execute;
+            }
+        });
     };
 
     if ($@ || !defined $rv) {
@@ -161,7 +298,7 @@ async sub _execute_async {
     # Wait for async result using Future::IO
     await $self->_wait_for_result($dbh);
 
-    my $result = eval { $dbh->pg_result };
+    my $result = eval { $self->_capture_pg_notices(sub { $dbh->pg_result }) };
     if ($@ || !$result) {
         my $err = $@ || $dbh->errstr;
         $statement->release;
@@ -210,7 +347,10 @@ async sub _wait_for_result {
 
     my $sock = $self->_get_socket;
 
-    while (!$dbh->pg_ready) {
+    # A statement's own NOTICE is delivered here, while pg_ready reads the
+    # socket -- see _capture_pg_notices. The wrap is per iteration, around
+    # only the synchronous pg_ready call, never across the await below.
+    while (!$self->_capture_pg_notices(sub { $dbh->pg_ready })) {
         await Future::IO->poll($sock, POLLIN);
     }
 }

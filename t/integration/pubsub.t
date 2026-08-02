@@ -49,13 +49,16 @@ sub kill_backends {
     return;
 }
 
-# pg_terminate_backend makes libpq print a "FATAL: terminating connection..."
-# notice straight to the process's real file descriptor 2. That bypasses
-# every layer this test could otherwise intercept (warn, $SIG{__WARN__}, a
-# scalar-backed STDERR), because none of those change what fd 2 points at.
-# Only a descriptor-level redirect sees it, so this closes and reopens
-# STDERR onto a real file for the duration of $code and hands back what
-# landed there, restoring STDERR on every path, including a die in $code.
+# Killing a listener's backend makes the FATAL arrive via DBI's own
+# PrintWarn calling Perl's warn() -- not, as this file once assumed, a raw
+# libpq write that bypasses warn() and $SIG{__WARN__} entirely. Measured
+# directly: PrintWarn => 0 makes the notice vanish completely, which a raw
+# write could not do, since libpq's own notice processor has no way to know
+# about a DBI attribute. _capture_pg_notices intercepts it at the same site
+# as any other server message, so it now reaches on_log instead of file
+# descriptor 2. This descriptor-level helper stays regardless: it is what
+# proves fd 2 stays empty, catching anything that lands there regardless of
+# source, rather than assuming it does because the mechanism is understood.
 sub capture_stderr {
     my ($code) = @_;
 
@@ -371,9 +374,11 @@ subtest 'a dead listener reports itself disconnected' => sub {
     $pubsub->listen('death_reporting', sub { })->get;
     ok $pubsub->is_connected, 'connected before the backend dies';
 
-    # Killing the backend is expected to make libpq print a termination
-    # notice straight to stderr, bypassing our logging entirely. Captured
-    # and asserted below rather than left to leak into test output.
+    # Killing the backend makes DBD::Pg's PrintWarn raise the termination
+    # notice as an ordinary warning, which _capture_pg_notices routes to
+    # on_log -- not, as this comment once claimed, a raw libpq write that
+    # bypasses warn() entirely. Captured at the descriptor level anyway, to
+    # prove fd 2 actually stays empty rather than assuming it does.
     my $captured = capture_stderr(sub {
         kill_backends();
         wait_until(sub { !$pubsub->is_connected }, 'listener noticed', 5);
@@ -383,12 +388,14 @@ subtest 'a dead listener reports itself disconnected' => sub {
     is $pubsub->conn, undef, 'dead connection let go';
     is $pubsub->subscribed_channels, 1, 'subscription registry kept for replay';
     ok scalar(grep { /listener stopped/i } @logged), 'loss reported';
-    like $captured, qr/FATAL:\s+terminating connection due to administrator command/,
-        'expected backend-termination notice captured on stderr';
+    is $captured, '', 'the termination notice does not reach fd 2';
+    ok scalar(grep { /FATAL:\s+terminating connection due to administrator command/ } @logged),
+        'the termination notice reaches on_log instead';
 };
 
 subtest 'the listener comes back after the connection dies' => sub {
     my @reconnected;
+    my @logged;
     my $pg = Async::DBD::Pg->new(
         dsn                    => test_dsn(),
         min_connections        => 0,
@@ -397,7 +404,7 @@ subtest 'the listener comes back after the connection dies' => sub {
         reconnect_min_interval => 0.1,
         reconnect_max_interval => 0.5,
         on_reconnect           => sub { push @reconnected, $_[0] },
-        on_log                 => sub { },
+        on_log                 => sub { push @logged, $_[1] },
     );
     my $pubsub = $pg->pubsub;
 
@@ -408,9 +415,6 @@ subtest 'the listener comes back after the connection dies' => sub {
     wait_until(sub { @got }, 'delivery before the kill', 3);
     is \@got, ['before'], 'delivering before the connection dies';
 
-    # Killing the backend is expected to make libpq print a termination
-    # notice straight to stderr, bypassing our logging entirely. Captured
-    # and asserted below rather than left to leak into test output.
     my $captured = capture_stderr(sub {
         kill_backends();
         wait_until(sub { @reconnected }, 'reconnected', 15);
@@ -419,8 +423,9 @@ subtest 'the listener comes back after the connection dies' => sub {
     ok scalar @reconnected, 'on_reconnect fired';
     ok $pubsub->is_connected, 'connected again';
     is $pubsub->subscribed_channels, 1, 'channel still subscribed';
-    like $captured, qr/FATAL:\s+terminating connection due to administrator command/,
-        'expected backend-termination notice captured on stderr';
+    is $captured, '', 'the termination notice does not reach fd 2';
+    ok scalar(grep { /FATAL:\s+terminating connection due to administrator command/ } @logged),
+        'the termination notice reaches on_log instead';
 
     # The assertion that matters. Everything above could pass while nothing
     # was actually being delivered any more.
@@ -432,11 +437,12 @@ subtest 'the listener comes back after the connection dies' => sub {
 };
 
 subtest 'without reconnect the listener stays down' => sub {
+    my @logged;
     my $pg = Async::DBD::Pg->new(
         dsn             => test_dsn(),
         min_connections => 0,
         max_connections => 4,
-        on_log          => sub { },
+        on_log          => sub { push @logged, $_[1] },
     );
     my $pubsub = $pg->pubsub;
 
@@ -446,8 +452,9 @@ subtest 'without reconnect the listener stays down' => sub {
         kill_backends();
         wait_until(sub { !$pubsub->is_connected }, 'listener noticed', 5);
     });
-    like $captured, qr/FATAL:\s+terminating connection due to administrator command/,
-        'expected backend-termination notice captured on stderr';
+    is $captured, '', 'the termination notice does not reach fd 2';
+    ok scalar(grep { /FATAL:\s+terminating connection due to administrator command/ } @logged),
+        'the termination notice reaches on_log instead';
 
     # Give a reconnect long enough to have happened, had one been asked for.
     Future::IO->sleep(1)->get;
@@ -456,6 +463,7 @@ subtest 'without reconnect the listener stays down' => sub {
 };
 
 subtest 'disconnect during the backoff window forgets subscriptions too' => sub {
+    my @logged;
     my $pg = Async::DBD::Pg->new(
         dsn                    => test_dsn(),
         min_connections        => 0,
@@ -463,7 +471,7 @@ subtest 'disconnect during the backoff window forgets subscriptions too' => sub 
         reconnect              => 1,
         reconnect_min_interval => 2,
         reconnect_max_interval => 3,
-        on_log                 => sub { },
+        on_log                 => sub { push @logged, $_[1] },
     );
     my $pubsub = $pg->pubsub;
 
@@ -477,8 +485,9 @@ subtest 'disconnect during the backoff window forgets subscriptions too' => sub 
         kill_backends();
         wait_until(sub { !$pubsub->is_connected }, 'listener noticed', 5);
     });
-    like $captured, qr/FATAL:\s+terminating connection due to administrator command/,
-        'expected backend-termination notice captured on stderr';
+    is $captured, '', 'the termination notice does not reach fd 2';
+    ok scalar(grep { /FATAL:\s+terminating connection due to administrator command/ } @logged),
+        'the termination notice reaches on_log instead';
 
     ok !$pubsub->{connected} && !$pubsub->{conn}, 'caught in the backoff window';
 
@@ -507,8 +516,9 @@ subtest 'a pool shutdown while queued for reconnect makes the supervisor give up
         kill_backends();
         wait_until(sub { !$pubsub->is_connected }, 'listener noticed', 5);
     });
-    like $captured, qr/FATAL:\s+terminating connection due to administrator command/,
-        'expected backend-termination notice captured on stderr';
+    is $captured, '', 'the termination notice does not reach fd 2';
+    ok scalar(grep { /FATAL:\s+terminating connection due to administrator command/ } @logged),
+        'the termination notice reaches on_log instead';
 
     # With only one connection allowed in this pool, holding one ourselves
     # forces the supervisor's next attempt to queue instead of succeeding,
@@ -534,6 +544,7 @@ subtest 'a pool shutdown while queued for reconnect makes the supervisor give up
 };
 
 subtest 'listen() during the reconnect backoff does not orphan a connection' => sub {
+    my @logged;
     my $pg = Async::DBD::Pg->new(
         dsn                    => test_dsn(),
         min_connections        => 0,
@@ -541,7 +552,7 @@ subtest 'listen() during the reconnect backoff does not orphan a connection' => 
         reconnect              => 1,
         reconnect_min_interval => 2,
         reconnect_max_interval => 3,
-        on_log                 => sub { },
+        on_log                 => sub { push @logged, $_[1] },
     );
     my $pubsub = $pg->pubsub;
 
@@ -552,8 +563,9 @@ subtest 'listen() during the reconnect backoff does not orphan a connection' => 
         kill_backends();
         wait_until(sub { !$pubsub->is_connected }, 'listener noticed', 5);
     });
-    like $captured, qr/FATAL:\s+terminating connection due to administrator command/,
-        'expected backend-termination notice captured on stderr';
+    is $captured, '', 'the termination notice does not reach fd 2';
+    ok scalar(grep { /FATAL:\s+terminating connection due to administrator command/ } @logged),
+        'the termination notice reaches on_log instead';
 
     # Call listen() for a second channel while the supervisor is still
     # backing off (the long min interval above makes this land inside the
@@ -597,8 +609,9 @@ subtest 'a failure inside the replay is retried in place, not left to end the su
         kill_backends();
         wait_until(sub { !$pubsub->is_connected }, 'listener noticed', 5);
     });
-    like $captured1, qr/FATAL:\s+terminating connection due to administrator command/,
-        'expected backend-termination notice captured on stderr';
+    is $captured1, '', 'the termination notice does not reach fd 2';
+    ok scalar(grep { /FATAL:\s+terminating connection due to administrator command/ } @logged),
+        'the termination notice reaches on_log instead';
 
     # An ordinary listen() wins the race, same as the earlier subtest, and
     # its own control query goes through fine. The supervisor's own replay
@@ -672,8 +685,9 @@ subtest 'the give-up check does not fire on PostgreSQL wording alone' => sub {
         kill_backends();
         wait_until(sub { !$pubsub->is_connected }, 'listener noticed', 5);
     });
-    like $captured, qr/FATAL:\s+terminating connection due to administrator command/,
-        'expected backend-termination notice captured on stderr';
+    is $captured, '', 'the termination notice does not reach fd 2';
+    ok scalar(grep { /FATAL:\s+terminating connection due to administrator command/ } @logged),
+        'the termination notice reaches on_log instead';
 
     Future::IO->sleep(3)->get;    # several backoff cycles
 
@@ -715,8 +729,9 @@ subtest 'a connection dying again mid-replay does not leave the supervisor inert
         kill_backends();
         wait_until(sub { !$pubsub->is_connected }, 'listener noticed', 5);
     });
-    like $captured1, qr/FATAL:\s+terminating connection due to administrator command/,
-        'expected backend-termination notice captured on stderr';
+    is $captured1, '', 'the termination notice does not reach fd 2';
+    ok scalar(grep { /FATAL:\s+terminating connection due to administrator command/ } @logged),
+        'the termination notice reaches on_log instead';
 
     # An ordinary listen() wins the race, same as the earlier subtests.
     $pubsub->listen('inert_b', sub { })->get;
@@ -749,12 +764,13 @@ subtest 'a connection dying again mid-replay does not leave the supervisor inert
     # Unlike the other kill_backends() calls in this file, this one lands
     # while _run_control_query is stopping the listener out from under
     # itself, cancelling the very poll that would otherwise notice the
-    # server's notice and print it. Confirmed empty across repeated runs
-    # rather than a one-off, so the connection reliably fails later via a
-    # lower-level driver error instead -- but accept the ordinary notice too
-    # rather than pin to exactly empty, in case that timing ever shifts.
-    ok $captured2 eq '' || $captured2 =~ /FATAL:\s+terminating connection due to administrator command/,
-        'no unexpected output from the connection dying mid-replay';
+    # server's notice -- so the connection reliably fails later via a
+    # lower-level driver error instead of a notice ever reaching
+    # pg_notifies at all. Either way fd 2 stays clean: if the notice is
+    # never seen, nothing is ever printed; if it is seen, it goes through
+    # _capture_pg_notices to on_log instead of stderr. No alternative to
+    # pin to here -- unlike before, both outcomes agree.
+    is $captured2, '', 'nothing reaches fd 2 from the connection dying mid-replay either way';
 
     # The failure this branch used to die from silently now has to be
     # reported and retried like any other reconnect failure, not swallowed.
@@ -811,8 +827,9 @@ subtest 'a failure that escapes through on_log still clears the reconnect slot' 
         kill_backends();
         wait_until(sub { !$pubsub->is_connected }, 'listener noticed', 5);
     });
-    like $captured1, qr/FATAL:\s+terminating connection due to administrator command/,
-        'expected backend-termination notice captured on stderr';
+    is $captured1, '', 'the termination notice does not reach fd 2';
+    ok scalar(grep { /FATAL:\s+terminating connection due to administrator command/ } @logged),
+        'the termination notice reaches on_log instead';
 
     ok wait_until(sub { !defined $pubsub->{_reconnect_future} }, 'reconnect slot released', 5),
         'the escaping die still clears _reconnect_future rather than leaving a dead future behind';
@@ -828,8 +845,9 @@ subtest 'a failure that escapes through on_log still clears the reconnect slot' 
         kill_backends();
         wait_until(sub { !$pubsub->is_connected }, 'listener noticed again', 5);
     });
-    like $captured2, qr/FATAL:\s+terminating connection due to administrator command/,
-        'expected backend-termination notice captured on stderr';
+    is $captured2, '', 'the termination notice does not reach fd 2';
+    ok scalar(grep { /FATAL:\s+terminating connection due to administrator command/ } @logged),
+        'the termination notice reaches on_log instead';
 
     ok wait_until(sub {
         $pubsub->{_reconnect_future} && !$pubsub->{_reconnect_future}->is_ready

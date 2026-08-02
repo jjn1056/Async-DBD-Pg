@@ -76,6 +76,11 @@ sub new {
         reconnect_max_interval => delete $args{reconnect_max_interval} // 30,
         on_reconnect           => delete $args{on_reconnect},
 
+        # A connection that died while idle is replaced and the caller's
+        # statement run again, rather than the caller being handed a failure
+        # the pool caused.
+        heal_dead_connections => delete $args{heal_dead_connections} // 1,
+
         # Pool state
         idle    => [],
         active  => [],
@@ -375,6 +380,10 @@ async sub connection {
         push @{$self->{active}}, $conn;
         $conn->{last_used} = time();
         $conn->{released} = 0;
+
+        # It has been sitting unused and its server may have gone away since.
+        $conn->{_check_liveness} = 1;
+
         return $conn;
     }
 
@@ -435,6 +444,14 @@ async sub _create_connection {
         AutoCommit        => 1,
         RaiseError        => $use_async ? 0 : 1,
         PrintError        => 0,
+        # A PostgreSQL NOTICE is delivered to DBI as a warning, and Connection
+        # routes it through the pool's on_log by wrapping the calls that can
+        # raise one in a $SIG{__WARN__} handler. That only works if DBI still
+        # calls warn() for it: PrintWarn => 0 drops the notice text entirely
+        # (errstr goes undef, there's nothing left to route), so this is set
+        # explicitly rather than left to default, which depends on the
+        # caller's own $^W and is not something to depend on here.
+        PrintWarn         => 1,
         pg_enable_utf8    => 1,
         pg_server_prepare => 1,
     );
@@ -494,6 +511,54 @@ async sub _create_connection {
     }
 
     $self->{stats}{created}++;
+    return $conn;
+}
+
+# Give a connection a working handle in place of a dead one. The replacement
+# is built by the ordinary connect path, so async connect, on_connect and
+# statement_timeout all apply and there is no second copy of connect logic to
+# drift. The Connection object never leaves the active list, so no pool counts
+# move.
+#
+# This does not take a _ConnectingGuard: that guard exists so a caller waiting
+# in connection() sees room, not room-minus-one, while a connect is in flight.
+# Taking one here would count the replacement while the dead Connection is
+# still on the active list, pushing _committed_count to max_connections + 1
+# and blocking an unrelated caller for the duration of the heal -- worse than
+# transiently over-admitting the pool by one on what is already a rare path.
+async sub _replace_dbh {
+    my ($self, $conn) = @_;
+
+    my $fresh = await $self->_create_connection;
+
+    # Take the handle and neutralise the wrapper it arrived in: it was never
+    # added to any pool list, and its destructor would otherwise release a
+    # connection the pool is not tracking.
+    my $dbh = delete $fresh->{dbh};
+    $fresh->{released} = 1;
+    $fresh->{pool}     = undef;
+
+    $conn->_close_dbh;
+    $self->{stats}{discarded}++;
+
+    $conn->{dbh} = $dbh;
+
+    # _get_socket memoises its dup()'d poll socket on the Connection, keyed by
+    # raw fd number. On the ordinary heal path that number is already free
+    # before this runs, not merely available for reuse on some future edit:
+    # _heal_if_dead's ping has already made libpq close the dead socket
+    # (pg_socket reads -1 by the time _replace_dbh is entered), so the
+    # replacement built by _create_connection above commonly lands on the
+    # exact same fd. Without these two deletes, _get_socket's cache-hit check
+    # only compares that number, sees no change, and hands _wait_for_result a
+    # dup of the socket that was already closed -- which reports readable at
+    # EOF, so the poll loop busy-waits for the life of every query on the
+    # connection instead of waiting once. Measured: 11 Future::IO->poll calls
+    # with these deletes, ~50,000 without, for one query. One full core,
+    # silently; on a listener loop, forever.
+    delete $conn->{_cached_sock};
+    delete $conn->{_cached_fd};
+
     return $conn;
 }
 
@@ -707,7 +772,35 @@ sub _release_to_idle_or_waiting {
 sub _discard_connection {
     my ($self, $conn) = @_;
     $conn->_close_dbh;
+
+    # Mark it released so that DESTROY, finding the dbh already gone, does
+    # not mistake this for an unreleased connection and route it back
+    # through _return_connection, which would discard it a second time.
+    $conn->{released} = 1;
     $self->{stats}{discarded}++;
+}
+
+# Whatever killed one connection has usually killed the rest, so finding a
+# dead one is reason to drop the whole idle set rather than let each be
+# rediscovered by a later caller. Connections that are checked out are left
+# alone: their owners are mid-work, and each repairs itself on its next
+# statement.
+#
+# Unlike the other two discard paths -- max_queries retirement calls
+# _ensure_min_connections afterwards, and idle-timeout reaping deliberately
+# keeps the floor in the first place -- this one does not try to refill down
+# to min_connections. Deliberate: the server the idle set was just found dead
+# against may still be down, and reconnecting immediately to it would only
+# manufacture more connect failures rather than restore capacity. The pool
+# sits below its floor until a caller asks for a connection on demand, up to
+# max_connections; that caller pays connect latency, not a failure.
+sub _discard_idle_connections {
+    my ($self) = @_;
+
+    my @idle = splice @{$self->{idle}};
+    $self->_discard_connection($_) for @idle;
+
+    return scalar @idle;
 }
 
 sub _ensure_min_connections {
@@ -1002,6 +1095,14 @@ which is where session settings belong: C<search_path>, timezone, or the
 DBD::Pg attributes this module does not wrap. A callback that dies discards
 the connection and the failure reaches the caller who asked for it.
 
+Also called when L</heal_dead_connections> replaces a dead connection's
+handle, since the replacement is built by the same connect path. In that
+case the C<$conn> passed in is a donor: only its handle is kept, and moments
+later the wrapper itself is left with no handle and no pool. A callback that
+retains its C<$conn> beyond returning -- to register it in a table of live
+connections, say -- will find that on a heal it was handed one of these
+rather than a connection the pool will ever hand to a caller.
+
 =head3 on_release
 
     on_release => async sub {
@@ -1021,6 +1122,13 @@ that dies causes the connection to be discarded rather than reused.
     },
 
 Receives the pool's own diagnostics. Without it they go to C<warn>.
+
+Also receives PostgreSQL server notices, at level C<info> -- the C<NOTICE> a
+statement such as C<DROP TABLE IF EXISTS> on a table that does not exist, or
+an explicit C<RAISE NOTICE>, produces. Without this option those notices
+still reach C<warn> the same way the pool's own diagnostics do; what changes
+is that they no longer bypass C<on_log> and print straight to file
+descriptor 2 regardless of whether a handler is configured.
 
 =head3 reconnect
 
@@ -1059,6 +1167,41 @@ continue indefinitely; each one is reported through L</on_log>.
 Called after the listener has been re-established and every channel
 re-subscribed. Read it as "you may have missed notifications", and resynchronise
 if that matters to you.
+
+=head3 heal_dead_connections
+
+Replace a pooled connection that turns out to be dead before running the
+caller's statement on it, instead of failing. On by default; set to 0 to have
+the original error propagate untouched.
+
+A connection can die while sitting idle in the pool, most often because the
+server restarted or an administrator ended the session. The caller who is
+handed it next has done nothing wrong, so the pool repairs itself rather than
+reporting a fault of its own making.
+
+The check runs once, before the first statement on a connection that came
+from the idle list; a connection the pool just built cannot be stale, so
+freshly created connections skip it. It costs nothing on the common path: a
+healthy idle connection has nothing waiting to be read, so a non-blocking
+check of the socket is enough to tell it apart from one whose server has
+gone, which is readable because the peer's close is already sitting there. A
+connection that looks wrong this way is confirmed dead with a ping before
+being condemned, since a channel notification delivered to a pooled
+connection would look the same and is not a fault. Only a connection
+confirmed dead is replaced, and only before its statement is ever sent, so
+nothing is retried and no statement can run twice. A statement inside a
+transaction is never healed either: the transaction died with the connection,
+and running the statement on a replacement would silently execute it outside
+the transaction the caller asked for.
+
+Finding a dead connection also discards the pool's other idle connections,
+on the reasoning that whatever killed one has usually killed the rest. This
+shows up as extra C<on_log> output and as jumps in the C<discarded> and
+C<created> statistics. Connections that are currently checked out are left
+alone.
+
+Replacing a connection is reported through L</on_log>, so a database that is
+flapping is visible rather than silently absorbed.
 
 =head2 connection
 

@@ -30,6 +30,7 @@ sub make_connection {
             AutoCommit     => 1,
             RaiseError     => 1,
             PrintError     => 0,
+            PrintWarn      => 1,
             pg_enable_utf8 => 1,
         }
     ) or die "Cannot connect: " . DBI->errstr;
@@ -308,6 +309,26 @@ subtest 'event loop not blocked during query' => sub {
 
     is $result->first->{answer}, 42, 'query completed';
     ok $ticks >= 3, "event loop ran during query (got $ticks ticks)";
+
+    $conn->_close_dbh;
+};
+
+subtest 'a notice on a connection with no pool is not swallowed' => sub {
+    # This connection was built directly, not through a pool, so there is no
+    # on_log to route a notice through. _capture_pg_notices leaves
+    # $SIG{__WARN__} untouched in that case rather than eating the notice --
+    # losing it is worse than printing it -- so it still reaches whatever
+    # handler is already in effect, exactly as it would without this feature.
+    my $conn = make_connection();
+
+    my @warnings;
+    {
+        local $SIG{__WARN__} = sub { push @warnings, join '', @_ };
+        $conn->query(q{DO $$ BEGIN RAISE NOTICE 'nopool_marker'; END $$})->get;
+    }
+
+    ok scalar(grep { /nopool_marker/ } @warnings),
+        'the notice still reaches a warning rather than being silently dropped';
 
     $conn->_close_dbh;
 };

@@ -43,13 +43,16 @@ sub settle {
     return $f;
 }
 
-# pg_terminate_backend makes libpq print a "FATAL: terminating connection..."
-# notice straight to the process's real file descriptor 2. That bypasses
-# every layer this test could otherwise intercept (warn, $SIG{__WARN__}, a
-# scalar-backed STDERR), because none of those change what fd 2 points at.
-# Only a descriptor-level redirect sees it, so this closes and reopens
-# STDERR onto a real file for the duration of $code and hands back what
-# landed there, restoring STDERR on every path, including a die in $code.
+# Killing a listener's backend makes the FATAL arrive via DBI's own
+# PrintWarn calling Perl's warn() -- not a raw libpq write that bypasses
+# warn() and $SIG{__WARN__} entirely. _capture_pg_notices intercepts it at
+# the same site as any other server message, so it now reaches on_log
+# instead of file descriptor 2. This descriptor-level helper stays
+# regardless: it is what proves fd 2 stays empty, catching anything that
+# lands there regardless of source, rather than assuming it does because
+# the mechanism is understood. This closes and reopens STDERR onto a real
+# file for the duration of $code and hands back what landed there,
+# restoring STDERR on every path, including a die in $code.
 sub capture_stderr {
     my ($code) = @_;
 
@@ -216,6 +219,7 @@ subtest 'shutdown gives back the pub/sub listener connection' => sub {
 };
 
 subtest 'shutdown completes while a listener is trying to reconnect' => sub {
+    my @logged;
     my $pg = Async::DBD::Pg->new(
         dsn                    => test_dsn(),
         min_connections        => 0,
@@ -223,7 +227,7 @@ subtest 'shutdown completes while a listener is trying to reconnect' => sub {
         reconnect              => 1,
         reconnect_min_interval => 1,
         reconnect_max_interval => 2,
-        on_log                 => sub { },
+        on_log                 => sub { push @logged, $_[1] },
     );
     my $pubsub = $pg->pubsub;
 
@@ -247,8 +251,9 @@ subtest 'shutdown completes while a listener is trying to reconnect' => sub {
 
         Future::IO->sleep(0.3)->get;    # let it fail and start backing off
     });
-    like $captured, qr/FATAL:\s+terminating connection due to administrator command/,
-        'expected backend-termination notice captured on stderr';
+    is $captured, '', 'the termination notice does not reach fd 2';
+    ok scalar(grep { /FATAL:\s+terminating connection due to administrator command/ } @logged),
+        'the termination notice reaches on_log instead';
 
     settle($pg->shutdown, 10);
 

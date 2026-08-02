@@ -262,4 +262,40 @@ subtest 'idle_timeout of 0 disables reaping' => sub {
     is $stale->disconnects, 0, 'connection left open';
 };
 
+subtest 'healing dead connections is on unless turned off' => sub {
+    my $on = make_pool();
+    is $on->{heal_dead_connections}, 1, 'on by default';
+
+    my $off = make_pool(heal_dead_connections => 0);
+    is $off->{heal_dead_connections}, 0, 'can be turned off';
+};
+
+subtest 'discarding idle connections leaves checked out ones alone' => sub {
+    my $pg = make_pool();
+
+    my @idle_dbh = map { add_idle($pg) } 1 .. 3;
+
+    my $busy_dbh = Test::Async::DBD::Pg::FakeDBH->new;
+    push @{$pg->{active}},
+        Async::DBD::Pg::Connection->new(dbh => $busy_dbh, pool => $pg);
+
+    my $discarded = $pg->_discard_idle_connections;
+
+    is $discarded, 3, 'reports how many it closed';
+    is $pg->idle_count, 0, 'idle list emptied';
+    is $_->disconnects, 1, 'idle connection closed' for @idle_dbh;
+
+    # Somebody else is using this one. Closing it underneath them would be
+    # worse than the outage.
+    is $pg->active_count, 1, 'checked out connection still in the pool';
+    is $busy_dbh->disconnects, 0, 'and still open';
+
+    is $pg->stats->{discarded}, 3, 'counted as discarded';
+};
+
+subtest 'discarding idle connections with none idle is harmless' => sub {
+    my $pg = make_pool();
+    is $pg->_discard_idle_connections, 0, 'nothing to do, nothing done';
+};
+
 done_testing;
