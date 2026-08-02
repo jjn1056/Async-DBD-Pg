@@ -467,3 +467,46 @@ is narrower than "never nest": nest `await`, never nest `->get`, under
 This was not reachable through `UV`, which makes it easy to miss if a branch
 is only ever run under one implementation locally. It is why this project's
 own constraint says both.
+
+### A third constraint, found chasing an intermittent test failure
+
+`pg_terminate_backend(pid)`, called without its optional timeout argument --
+which is how every test in this suite calls it -- sends the target backend
+SIGTERM and returns as soon as the signal is sent, not once the backend has
+actually exited. The gap between "signal sent" and "backend gone" is usually
+small enough to be invisible, which is exactly what makes it a trap: a fixed
+sleep after the kill will look sufficient in every run that happens not to
+hit it.
+
+`t/pool/basic.t`'s `'finding one dead connection discards its idle
+siblings'` subtest killed two idle connections, slept a fixed 0.2s, then
+re-acquired one and queried it to trigger the heal. Intermittently -- rarely
+enough that thirty consecutive runs in one measurement showed none of it --
+this failed with an uncaught exception instead of the expected sibling
+discard:
+
+```
+DBD::Pg::db pg_result failed: FATAL:  terminating connection due to
+administrator command server closed the connection unexpectedly
+```
+
+This is not the healing feature misbehaving. It is the already-sent path
+working exactly as designed, hit by a test whose own precondition had not
+actually held yet: when termination was still in flight at query time, the
+connection still looked alive to `_heal_if_dead`'s pre-flight check, so
+healing correctly declined -- and the statement went out on a connection
+that then died under it, surfacing at `pg_result` the same way any
+already-sent statement's failure does (see the case above). The 0.2s sleep
+was standing in for "the kill has actually taken effect," which it usually
+was, and occasionally was not.
+
+The fix is not a longer sleep -- that is the same gap with a smaller
+probability of being hit, not a closed one. It is waiting for the actual
+condition: a `backends_alive(@pids)` helper polls `pg_stat_activity` for the
+specific backend pids just killed, through a separate, throwaway connection
+so the connections under test are never themselves touched, and a
+`wait_until` polls that until it reports them gone (or a generous timeout
+elapses). Any test on this branch that kills a backend and then does
+something to a connection depending on that kill having taken effect has
+this same trap waiting for it. Wait for the backend to be gone; do not sleep
+and hope.
