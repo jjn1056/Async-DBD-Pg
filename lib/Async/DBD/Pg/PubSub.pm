@@ -143,8 +143,31 @@ async sub connect {
 async sub _establish {
     my ($self, $pool) = @_;
 
-    $self->{conn} = await $pool->connection;
+    $self->{phase} = 'connecting';
+
+    # Subscribed here, on a connection still held only in this lexical.
+    # Nothing else can reach it, so this needs no serialization and cannot
+    # race a caller -- which is what replaying onto a published connection
+    # did. Callers see either the previous connection or a complete one.
+    #
+    # Guarded from checkout to publish: a query failing partway through the
+    # loop, or cancellation at any of these awaits, would otherwise strand
+    # the checkout -- see _EstablishGuard for why it can't just fall out of
+    # scope on its own.
+    my $conn  = await $pool->connection;
+    my $guard = Async::DBD::Pg::PubSub::_EstablishGuard->new($conn);
+
+    for my $channel (sort keys %{ $self->{channels} }) {
+        await $conn->query("LISTEN " . $conn->dbh->quote_identifier($channel));
+    }
+
+    $self->{conn}  = $conn;
     $self->{phase} = 'live';
+
+    # Not separated from the publish above by an await: once {conn} is set,
+    # teardown is what releases it, and disarming here after some later
+    # await would leave both this guard and teardown thinking they owned it.
+    $guard->disarm;
 
     await $self->_start_listener;
 
@@ -340,8 +363,10 @@ async sub _start_listener {
     return $self;
 }
 
-# Re-establish a listener that failed, replaying its subscriptions. Runs until
-# it succeeds, or until something cancels it.
+# Re-establish a listener that failed. connect() (via _establish) subscribes
+# every registered channel before publishing the new connection, so this loop
+# only has to get a connection, not replay anything itself. Runs until it
+# succeeds, or until something cancels it.
 async sub _reconnect_loop {
     my ($self) = @_;
 
@@ -370,30 +395,6 @@ async sub _reconnect_loop {
             # so whichever of us asks second waits for the first instead of
             # starting another.
             await $self->connect;
-
-            # An ordinary connect/listen call may already have re-established
-            # the connection while this loop was backing off -- connect()
-            # above finds that attempt and shares it rather than starting a
-            # second one, so both paths end up on the same connection.
-            # Either way, replay every registered channel: that path only
-            # replays the channel it was called for, so anything subscribed
-            # before it would stay silently orphaned without this.
-            #
-            # Issued through _run_control_query, the same idiom listen() and
-            # unlisten() use, rather than querying the connection directly:
-            # a listener may already be running here (the race case above),
-            # and its guard stops and restarts the listener safely around
-            # each query, including under cancellation. Whatever this loop
-            # hits along the way -- acquiring, replaying, starting the
-            # listener -- funnels into the one failure handling below, so a
-            # connection dying again mid-replay is retried like any other
-            # failed attempt instead of escaping uncaught and leaving nothing
-            # running to notice.
-            for my $channel (sort keys %{ $self->{channels} }) {
-                await $self->_run_control_query("LISTEN $channel");
-            }
-
-            await $self->_start_listener;
             1;
         };
         my $err = $@;
@@ -643,6 +644,47 @@ sub DESTROY {
 
     return if ${^GLOBAL_PHASE} eq 'DESTRUCT';
     $self->_pool_shutdown;
+}
+
+# Releases the connection _establish checks out for its subscribe loop if
+# nothing has claimed it by the time this guard is destroyed. connection()
+# pushes onto the pool's own {active} list before returning it, so that
+# checkout holds a strong reference independent of whatever local variable
+# _establish keeps -- a query failing partway through the loop, or the whole
+# sub being cancelled at one of its awaits, drops that lexical without ever
+# bringing its refcount to zero, and Connection::DESTROY's own auto-release
+# never fires. Left unguarded, the connection stays on {active} forever: the
+# pool believes it is checked out to nobody. Disarmed once _establish
+# publishes the connection to {conn}, where teardown takes over
+# responsibility for releasing it instead.
+#
+# Holds $conn strongly rather than weakening it, unlike the other guards in
+# this file: those weaken their reference to the pub/sub object because it
+# outlives them, but nothing else holds this connection if this guard does
+# not -- weakening it would just recreate the leak this guard exists to
+# close.
+package Async::DBD::Pg::PubSub::_EstablishGuard;
+
+use strict;
+use warnings;
+
+sub new {
+    my ($class, $conn) = @_;
+
+    return bless { conn => $conn }, $class;
+}
+
+sub disarm {
+    my ($self) = @_;
+
+    delete $self->{conn};
+}
+
+sub DESTROY {
+    my ($self) = @_;
+
+    my $conn = delete $self->{conn} or return;
+    $conn->release;
 }
 
 # Releases the one-at-a-time slot _run_control_query claims on {_control_query}

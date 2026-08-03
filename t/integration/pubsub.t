@@ -1033,6 +1033,7 @@ subtest 'a failure inside the replay is retried in place, not left to end the su
     my $pubsub = $pg->pubsub;
 
     $pubsub->listen('lockout_a', sub { })->get;
+    $pubsub->listen('lockout_b', sub { })->get;
 
     my $captured1 = capture_stderr(sub {
         kill_backends();
@@ -1042,33 +1043,39 @@ subtest 'a failure inside the replay is retried in place, not left to end the su
     ok scalar(grep { /FATAL:\s+terminating connection due to administrator command/ } @logged),
         'the termination notice reaches on_log instead';
 
-    # An ordinary listen() wins the race, same as the earlier subtest, and
-    # its own control query goes through fine. The supervisor's own replay
-    # is then made to fail on its second channel -- standing in for any
-    # error from the query itself, without needing a real connection
-    # failure. That realistic shape, with the listener teardown genuinely
-    # happening, is covered separately below.
-    $pubsub->listen('lockout_b', sub { })->get;
-
-    my $orig = \&Async::DBD::Pg::PubSub::_run_control_query;
+    # Both channels are already registered, so the supervisor's own
+    # _establish is what subscribes them on reconnect -- nothing else is
+    # racing it here. Fail the second LISTEN inside that subscribe loop
+    # once, standing in for any error from the query itself, without
+    # needing a real connection failure. That realistic shape, with the
+    # connection genuinely dying mid-subscribe, is covered separately below.
+    my $orig_query = Async::DBD::Pg::Connection->can('query');
     my $seen = 0;
     {
         no strict 'refs';
         no warnings 'redefine';
-        *Async::DBD::Pg::PubSub::_run_control_query = sub {
-            $seen++;
-            return Future->fail("simulated: connection died mid-replay\n") if $seen > 1;
-            return $orig->(@_);
+        *Async::DBD::Pg::Connection::query = sub {
+            my ($conn, $sql, @bind) = @_;
+            if ($sql =~ /^LISTEN/) {
+                $seen++;
+                return Future->fail("simulated: connection died mid-replay\n") if $seen == 2;
+            }
+            return $conn->$orig_query($sql, @bind);
         };
     }
 
-    ok wait_until(sub { $seen > 1 }, 'supervisor reached the stubbed replay', 8),
-        'the supervisor woke into the race branch and started replaying';
+    ok wait_until(sub { $seen >= 2 }, 'supervisor reached the stubbed subscribe loop', 8),
+        'the supervisor woke up and started subscribing on reconnect';
 
     {
         no warnings 'redefine';
-        *Async::DBD::Pg::PubSub::_run_control_query = $orig;
+        *Async::DBD::Pg::Connection::query = $orig_query;
     }
+
+    # The connection checked out for the failed attempt has to come back to
+    # the pool, not sit on {active} forever -- _EstablishGuard's job.
+    is $pg->active_count, 0,
+        'the connection checked out for the failed attempt was released, not leaked';
 
     # The failure is caught by the loop's own eval and retried in place now,
     # not left to escape and end the supervisor's future -- it is still the
@@ -1085,6 +1092,7 @@ subtest 'a failure inside the replay is retried in place, not left to end the su
     ok wait_until(sub { $pubsub->is_connected }, 'supervisor recovers on its own retry', 10),
         'reconnects without needing a fresh, independent listener death';
     is $pubsub->subscribed_channels, 2, 'both channels still registered';
+    is $pg->active_count, 1, 'exactly one connection in use after recovery';
 
     $pubsub->disconnect->get;
 };
@@ -1153,6 +1161,7 @@ subtest 'a connection dying again mid-replay does not leave the supervisor inert
     my $pubsub = $pg->pubsub;
 
     $pubsub->listen('inert_a', sub { })->get;
+    $pubsub->listen('inert_b', sub { })->get;
 
     my $captured1 = capture_stderr(sub {
         kill_backends();
@@ -1162,50 +1171,56 @@ subtest 'a connection dying again mid-replay does not leave the supervisor inert
     ok scalar(grep { /FATAL:\s+terminating connection due to administrator command/ } @logged),
         'the termination notice reaches on_log instead';
 
-    # An ordinary listen() wins the race, same as the earlier subtests.
-    $pubsub->listen('inert_b', sub { })->get;
-
-    # Let the supervisor's own replay run for real, but kill the backend
-    # again immediately before its first control query. The listener
-    # teardown _run_control_query does happens for real, and the query that
-    # follows then genuinely fails against a connection that just died --
-    # not a synthetic failure that never touches any of that.
-    my $orig = \&Async::DBD::Pg::PubSub::_run_control_query;
+    # Let the supervisor's own reconnect run for real, but kill the backend
+    # again immediately before its first subscribe query, inside
+    # _establish's own subscribe loop rather than a separate control query.
+    # The query that follows then genuinely fails against a connection that
+    # just died, not a synthetic failure that never touches any of that.
+    my $orig_query = Async::DBD::Pg::Connection->can('query');
     my $seen = 0;
     my $captured2 = capture_stderr(sub {
         {
             no strict 'refs';
             no warnings 'redefine';
-            *Async::DBD::Pg::PubSub::_run_control_query = sub {
-                $seen++;
-                kill_backends() if $seen == 1;
-                return $orig->(@_);
+            *Async::DBD::Pg::Connection::query = sub {
+                my ($conn, $sql, @bind) = @_;
+                if ($sql =~ /^LISTEN/) {
+                    kill_backends() if $seen == 0;
+                    $seen++;
+                }
+                return $conn->$orig_query($sql, @bind);
             };
         }
-        wait_until(sub { $seen >= 1 }, 'supervisor reached its own replay', 8);
+        wait_until(sub { $seen >= 1 }, 'supervisor reached its own subscribe loop', 8);
         Future::IO->sleep(2)->get;
     });
     {
         no warnings 'redefine';
-        *Async::DBD::Pg::PubSub::_run_control_query = $orig;
+        *Async::DBD::Pg::Connection::query = $orig_query;
     }
 
-    # Unlike the other kill_backends() calls in this file, this one lands
-    # while _run_control_query is stopping the listener out from under
-    # itself, cancelling the very poll that would otherwise notice the
-    # server's notice -- so the connection reliably fails later via a
-    # lower-level driver error instead of a notice ever reaching
-    # pg_notifies at all. Either way fd 2 stays clean: if the notice is
-    # never seen, nothing is ever printed; if it is seen, it goes through
-    # _capture_pg_notices to on_log instead of stderr. No alternative to
-    # pin to here -- unlike before, both outcomes agree.
-    is $captured2, '', 'nothing reaches fd 2 from the connection dying mid-replay either way';
+    # This kill lands while the just-checked-out connection's own first
+    # LISTEN is about to run -- before any listener loop exists for it, since
+    # that only starts once _establish finishes subscribing. So the query
+    # reliably fails via a lower-level driver error on the query itself,
+    # rather than a notice ever reaching pg_notifies through a poll there is
+    # nothing yet running to make. fd 2 stays clean either way: captured and
+    # proved rather than assumed.
+    is $captured2, '', 'nothing reaches fd 2 from the connection dying mid-subscribe either way';
+
+    # The connection checked out for the doomed attempt has to come back to
+    # the pool even though it died server-side, not sit on {active} forever.
+    # _return_connection removes from {active} before ever checking whether
+    # the dbh is still alive, so this holds whether or not the connection is
+    # genuinely dead by the time it gets here.
+    is $pg->active_count, 0,
+        'the connection checked out for the doomed attempt was released, not leaked';
 
     # The failure this branch used to die from silently now has to be
     # reported and retried like any other reconnect failure, not swallowed.
     ok wait_until(sub {
         scalar grep { /reconnect attempt \d+ failed/i } @logged
-    }, 'a failed replay is logged like any other attempt', 5),
+    }, 'a failed subscribe attempt is logged like any other attempt', 5),
         'the supervisor reports the failure rather than dying silently';
 
     # And it has to keep going: a fresh listener eventually comes back on
@@ -1213,6 +1228,7 @@ subtest 'a connection dying again mid-replay does not leave the supervisor inert
     ok wait_until(sub { $pubsub->is_connected }, 'supervisor recovers on its own', 10),
         'the supervisor keeps retrying rather than going inert';
     is $pubsub->subscribed_channels, 2, 'both channels still registered';
+    is $pg->active_count, 1, 'exactly one connection in use after recovery';
 
     $pubsub->disconnect->get;
 };
@@ -1468,6 +1484,122 @@ subtest 'a listener paused by a control query resumes without a flag reset' => s
     $pubsub->notify('resume_probe', 'after')->get;
     ok wait_until(sub { @got }, 'notification arrived', 5),
         'delivery resumes after a control query without any flag being reset';
+
+    $pubsub->disconnect->get;
+};
+
+subtest 'a connection is fully subscribed before anyone can see it' => sub {
+    my @logged;
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 4,
+        on_log          => sub { push @logged, $_[1] },
+    );
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('publish_a', sub { })->get;
+    $pubsub->listen('publish_b', sub { })->get;
+
+    # {conn} must stay unpublished for the whole subscribe loop. Sampling at
+    # every LISTEN, not merely once _start_listener is reached, is what
+    # distinguishes subscribe-then-publish from a publish that merely
+    # happens to land before _start_listener is called: once the loop has
+    # run at all, every channel is already subscribed by the time
+    # _start_listener runs either way, so a check made only there cannot
+    # tell the two apart.
+    my @conn_published_during_subscribe;
+    no warnings 'redefine';
+    my $orig_query = Async::DBD::Pg::Connection->can('query');
+    local *Async::DBD::Pg::Connection::query = sub {
+        my ($conn, $sql, @bind) = @_;
+        push @conn_published_during_subscribe, defined $pubsub->{conn} ? 1 : 0
+            if $sql =~ /^LISTEN/;
+        return $conn->$orig_query($sql, @bind);
+    };
+
+    # {channels} has to still be populated when _establish runs, which
+    # disconnect() can't provide -- it forgets every subscription by design.
+    # Killing the backend and reconnecting is the path that reaches
+    # _establish with channels still registered, same shape the other
+    # reconnect subtests in this file use.
+    my $captured = capture_stderr(sub {
+        kill_backends();
+        wait_until(sub { !$pubsub->is_connected }, 'listener noticed', 5);
+    });
+    is $captured, '', 'the termination notice does not reach fd 2';
+    ok scalar(grep { /FATAL:\s+terminating connection due to administrator command/ } @logged),
+        'the termination notice reaches on_log instead';
+
+    $pubsub->connect->get;
+
+    ok !(grep { $_ } @conn_published_during_subscribe),
+        'the connection was not published while any channel was still being subscribed';
+    is scalar(@conn_published_during_subscribe), 2,
+        'both channels were actually subscribed, not silently skipped';
+
+    $pubsub->disconnect->get;
+};
+
+subtest 'a failure inside the subscribe loop releases the connection back to the pool' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn => test_dsn(), min_connections => 0, max_connections => 4,
+    );
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('guard_a', sub { })->get;
+    $pubsub->listen('guard_b', sub { })->get;
+
+    is $pg->active_count, 1, 'one connection checked out for the listener';
+
+    # Simulate the connection dying without disconnect()'s channel-clearing
+    # side effect -- release it and mark disconnected, the same shape
+    # _listener_loop's on_fail handler leaves, so {channels} survives for
+    # the reconnect below to find.
+    $pubsub->{conn}->release;
+    delete $pubsub->{conn};
+    $pubsub->{phase} = 'disconnected';
+    is $pg->active_count, 0, 'released before the reconnect attempt';
+
+    # Fail the second LISTEN in the subscribe loop, standing in for any
+    # query error in the window between checkout and publish -- exactly what
+    # _EstablishGuard exists to cover.
+    my $orig_query = Async::DBD::Pg::Connection->can('query');
+    my $seen = 0;
+    {
+        no strict 'refs';
+        no warnings 'redefine';
+        *Async::DBD::Pg::Connection::query = sub {
+            my ($conn, $sql, @bind) = @_;
+            if ($sql =~ /^LISTEN/ && ++$seen == 2) {
+                return Future->fail("simulated: query failed mid-subscribe\n");
+            }
+            return $conn->$orig_query($sql, @bind);
+        };
+    }
+
+    my $ok  = eval { $pubsub->connect->get; 1 };
+    my $err = $@;
+
+    {
+        no warnings 'redefine';
+        *Async::DBD::Pg::Connection::query = $orig_query;
+    }
+
+    ok !$ok, 'connect fails when a subscribe query fails';
+    like $err, qr/simulated: query failed mid-subscribe/, 'and reports why';
+
+    # The connection checked out for the failed attempt is a bare lexical
+    # inside _establish once the exception unwinds it -- the pool's own
+    # {active} list keeps it alive independent of that lexical, so nothing
+    # short of an explicit release gets it back. Without the guard this
+    # never returns to 0.
+    is $pg->active_count, 0,
+        'the connection checked out for the failed attempt was released, not leaked';
+
+    # Not just accounted for correctly -- actually usable afterward.
+    ok $pubsub->connect->get, 'a later connect still succeeds';
+    is $pg->active_count, 1, 'exactly one connection in use afterward';
 
     $pubsub->disconnect->get;
 };
