@@ -1402,4 +1402,44 @@ subtest 'the slot is free before the listener is restarted' => sub {
     $pubsub->disconnect->get;
 };
 
+subtest 'the listener is not restarted while a queued control query is in flight' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn => test_dsn(), min_connections => 0, max_connections => 3,
+    );
+    my $pubsub = $pg->pubsub;
+
+    # Establishes the connection and its listener loop before the race, so
+    # both calls below reach _run_control_query with nothing else left to
+    # await first -- same setup as 'concurrent control queries on one
+    # connection are serialized, not raced'.
+    $pubsub->listen('overlap_seed', sub { })->get;
+
+    # Marking the first query's $done ready wakes a waiter parked in
+    # _run_control_query's mutex loop synchronously, inside that same call --
+    # before the first query's own release() reaches _start_listener. A
+    # second, still-queued call below reclaims {_control_query} and sends its
+    # own statement on this connection in that window, so a restart that does
+    # not re-check the slot would start the listener loop polling the same
+    # socket a different query is still awaiting a result on.
+    my $restarted_while_held = 0;
+    no warnings 'redefine';
+    my $orig = Async::DBD::Pg::PubSub->can('_start_listener');
+    local *Async::DBD::Pg::PubSub::_start_listener = sub {
+        my ($ps) = @_;
+        $restarted_while_held = 1 if $ps->{_control_query};
+        return $ps->$orig;
+    };
+
+    my $first  = $pubsub->listen('overlap_a', sub { });
+    my $second = $pubsub->listen('overlap_b', sub { });
+
+    $first->get;
+    $second->get;
+
+    ok !$restarted_while_held,
+        'the listener was never restarted while the control-query slot was still held';
+
+    $pubsub->disconnect->get;
+};
+
 done_testing;

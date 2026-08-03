@@ -726,7 +726,16 @@ sub release {
     # check with nothing left to restart it.
     delete $pubsub->{_listener_paused} if $pubsub;
 
-    return unless $pubsub && $pubsub->{connected};
+    # $done->done above can, in the same call, run a second control query
+    # queued behind this one all the way through reclaiming {_control_query}
+    # and sending its own statement on this connection -- a waiter parked in
+    # _run_control_query's mutex loop resumes synchronously once the future
+    # it is awaiting completes. A non-empty slot here means somebody else is
+    # mid-query, so restarting the listener now would poll the same socket
+    # that query is still awaiting a result on. Deferred instead: that
+    # query's own release() re-checks the same way, and restarts it once it
+    # is genuinely the last one out.
+    return unless $pubsub && $pubsub->{connected} && !$pubsub->{_control_query};
 
     my $started = $pubsub->_start_listener;
     $started->on_fail(sub {
