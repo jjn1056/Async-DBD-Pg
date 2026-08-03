@@ -21,7 +21,6 @@ sub new {
         channels         => {},
         phase            => 'disconnected',
         _listener_future => undef,
-        _listener_paused => 0,
 
         # Read from the pool, which is where an application sets them.
         reconnect              => $pool ? $pool->{reconnect}              : 0,
@@ -146,14 +145,6 @@ async sub _establish {
 
     $self->{conn} = await $pool->connection;
     $self->{phase} = 'live';
-
-    # A stale {_listener_paused} from a previous session's disconnect() --
-    # whose own _stop_listener call sets it, relying on an explicit delete
-    # further down rather than a guard, so a disconnect cancelled before
-    # reaching that delete leaves it set -- would otherwise make the
-    # listener loop this starts below refuse to ever poll, having never run
-    # once.
-    delete $self->{_listener_paused};
 
     await $self->_start_listener;
 
@@ -283,13 +274,13 @@ async sub _listener_loop {
     my $conn = $self->{conn} or return;
     my $sock = $conn->_get_socket;
 
-    # A phase other than 'live' means teardown; {_listener_paused} means a
-    # control query has this connection for the moment. Either is a reason
-    # to stop polling -- {_reconnect_loop} below, deliberately, checks only
-    # the first.
-    while (!($self->{phase} ne 'live' || $self->{_listener_paused})) {
+    # Pause exactly while something holds this connection. Reading the slot
+    # rather than a flag someone sets means there is nothing to leave behind:
+    # a paused listener resumes because the holder released, not because a
+    # second code path remembered to clear a boolean.
+    while ($self->{phase} eq 'live' && !$self->{_control_query}) {
         await Future::IO->poll($sock, POLLIN);
-        last if $self->{phase} ne 'live' || $self->{_listener_paused};
+        last unless $self->{phase} eq 'live' && !$self->{_control_query};
         $self->_process_notifications($conn);
     }
 
@@ -451,12 +442,6 @@ async sub _stop_listener {
 
     my $listener = delete $self->{_listener_future} or return;
 
-    # Not {phase}: setting that to 'closing' means teardown, and the
-    # reconnect supervisor reads it as exactly that. Setting it here for
-    # what is often just a moment's pause for one control query is what let
-    # a supervisor waking from backoff mid-query conclude it had been told
-    # to stop and exit permanently, taking the listener down with it.
-    $self->{_listener_paused} = 1;
     $listener->cancel unless $listener->is_ready;
 
     eval { await $listener };
@@ -591,15 +576,9 @@ async sub disconnect {
     unless ($self->{phase} eq 'live' || $self->{conn}) {
         $self->{channels} = {};
         $self->{phase}    = 'disconnected';
-        delete $self->{_listener_paused};
         return $self;
     }
 
-    # The call below sets {_listener_paused}, same as any other caller, but
-    # unlike _run_control_query's call -- where releasing the guard clears it
-    # again -- nothing here does that automatically. Cleared explicitly below
-    # instead, or a later _establish would find it already set and its fresh
-    # listener loop would refuse to ever poll.
     await $self->_stop_listener if $self->{_listener_future};
 
     if (my $conn = delete $self->{conn}) {
@@ -609,7 +588,6 @@ async sub disconnect {
 
     $self->{channels} = {};
     $self->{phase}    = 'disconnected';
-    delete $self->{_listener_paused};
 
     return $self;
 }
@@ -696,16 +674,6 @@ sub release {
     }
     delete $pubsub->{_control_query_inflight} if $pubsub;
     $done->done unless $done->is_ready;
-
-    # Only the pause this guard's _stop_listener call put on, never a
-    # teardown in progress -- set only by disconnect()/_pool_shutdown()/
-    # DESTROY, via {phase}, and this guard has no business clearing
-    # something it did not set. Doing so unconditionally is what let a
-    # control query's own cleanup clobber a teardown in progress. The
-    # listener loop refuses to run while this is set, so leaving it here
-    # would make _start_listener below build a loop that exits on its first
-    # check with nothing left to restart it.
-    delete $pubsub->{_listener_paused} if $pubsub;
 
     # $done->done above can, in the same call, run a second control query
     # queued behind this one all the way through reclaiming {_control_query}

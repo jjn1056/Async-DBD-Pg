@@ -969,13 +969,13 @@ subtest 'a reconnect supervisor backing off is not fooled by an ordinary listen(
 
     $pubsub->listen('i1_early', sub { push @got_early, $_[1] })->get;
 
-    # Delay exactly one control query well past the backoff above, so
-    # {_listener_paused} is still set when the supervisor wakes and checks
-    # {_stopping}. Real contention does this for free -- the window widens
-    # with the number of channels replayed on reconnect -- but not reliably
-    # enough to test against; forcing it makes the test deterministic. The
-    # delay lives here rather than in Connection.pm: production code does
-    # not carry test scaffolding.
+    # Delay exactly one control query well past the backoff above, so the
+    # control-query slot is still held -- pausing the listener -- when the
+    # supervisor wakes and checks {phase}. Real contention does this for
+    # free -- the window widens with the number of channels replayed on
+    # reconnect -- but not reliably enough to test against; forcing it makes
+    # the test deterministic. The delay lives here rather than in
+    # Connection.pm: production code does not carry test scaffolding.
     my $orig_query = Async::DBD::Pg::Connection->can('query');
     my $delay_one  = 1;
     no warnings 'redefine';
@@ -1006,11 +1006,12 @@ subtest 'a reconnect supervisor backing off is not fooled by an ordinary listen(
         'pub/sub came back';
 
     # The real proof: a channel subscribed before the race must still
-    # deliver. Before splitting {_stopping} from {_listener_paused}, the
-    # supervisor woke mid-pause, read the shared flag as true, and exited
-    # permanently believing it had been told to stop -- the listener never
-    # restarted and this channel was never re-subscribed on the new
-    # connection, with no error and no log line.
+    # deliver. Before the listener's pause and the supervisor's stop signal
+    # were tracked separately, the supervisor woke mid-pause, read the
+    # shared flag as true, and exited permanently believing it had been
+    # told to stop -- the listener never restarted and this channel was
+    # never re-subscribed on the new connection, with no error and no log
+    # line.
     $pubsub->notify('i1_early', 'still here')->get;
     ok wait_until(sub { @got_early }, 'notification arrived', 5),
         'a channel subscribed before the race still delivers';
@@ -1447,6 +1448,26 @@ subtest 'the listener is not restarted while a queued control query is in flight
     $pubsub->notify('overlap_a', 'delivered')->get;
     ok wait_until(sub { @got }, 'notification after both control queries settle', 3),
         'the listener was restarted once the slot was genuinely free';
+
+    $pubsub->disconnect->get;
+};
+
+subtest 'a listener paused by a control query resumes without a flag reset' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn => test_dsn(), min_connections => 0, max_connections => 3,
+    );
+    my $pubsub = $pg->pubsub;
+
+    my @got;
+    $pubsub->listen('resume_probe', sub { push @got, $_[1] })->get;
+
+    # A control query pauses the listener for its duration. Nothing outside
+    # the guard should have to put anything back for delivery to resume.
+    $pubsub->listen('resume_other', sub { })->get;
+
+    $pubsub->notify('resume_probe', 'after')->get;
+    ok wait_until(sub { @got }, 'notification arrived', 5),
+        'delivery resumes after a control query without any flag being reset';
 
     $pubsub->disconnect->get;
 };

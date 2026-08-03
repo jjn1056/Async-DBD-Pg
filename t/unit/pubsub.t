@@ -92,10 +92,10 @@ subtest 'a failed control query leaves pub/sub usable' => sub {
     my $pubsub = _pubsub_in_phase($pg, 'disconnected');
 
     # Stand in for a live listener connection whose first statement fails.
-    # A listener future has to be present, because stopping it is what sets
-    # {_listener_paused} in the first place. phase stays 'disconnected' so
-    # the listener is not restarted here, which would need a real socket;
-    # restarting it is covered by t/integration/pubsub.t.
+    # A listener future has to be present so _run_control_query's own call
+    # to _stop_listener runs. phase stays 'disconnected' so the listener is
+    # not restarted here, which would need a real socket; restarting it is
+    # covered by t/integration/pubsub.t.
     my $conn = Test::Async::DBD::Pg::FlakyConn->new(fail_next => 1);
     $pubsub->{conn} = $conn;
     $pubsub->{_listener_future} = Future->done(1);
