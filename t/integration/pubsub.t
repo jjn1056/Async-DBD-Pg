@@ -1604,6 +1604,61 @@ subtest 'a failure inside the subscribe loop releases the connection back to the
     $pubsub->disconnect->get;
 };
 
+subtest 'cancellation mid-subscribe releases the connection back to the pool' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn => test_dsn(), min_connections => 0, max_connections => 4,
+    );
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('cancel_guard_a', sub { })->get;
+    $pubsub->listen('cancel_guard_b', sub { })->get;
+
+    is $pg->active_count, 1, 'one connection checked out for the listener';
+
+    # Simulate the connection dying without disconnect()'s channel-clearing
+    # side effect -- same shape as the leak test above.
+    $pubsub->{conn}->release;
+    delete $pubsub->{conn};
+    $pubsub->{phase} = 'disconnected';
+    is $pg->active_count, 0, 'released before the reconnect attempt';
+
+    # Stall the second LISTEN rather than fail it. This is the path the
+    # guard exists for and an eval cannot cover: a cancelled sub never
+    # resumes, so nothing after an await ever runs -- only a destructor,
+    # torn down by the cancellation itself, can free the checkout.
+    my $orig_query = Async::DBD::Pg::Connection->can('query');
+    my $seen = 0;
+    {
+        no strict 'refs';
+        no warnings 'redefine';
+        *Async::DBD::Pg::Connection::query = sub {
+            my ($conn, $sql, @bind) = @_;
+            if ($sql =~ /^LISTEN/ && ++$seen == 2) {
+                return Future->new;   # never resolves on its own
+            }
+            return $conn->$orig_query($sql, @bind);
+        };
+    }
+
+    # Not awaited: still suspended inside _establish's subscribe loop when
+    # disconnect() below cancels {_connecting}.
+    my $connecting = $pubsub->connect;
+    ok wait_until(sub { $seen >= 2 }, 'reached the stalled subscribe query', 8),
+        'connect() suspended mid-subscribe, on the second LISTEN';
+
+    $pubsub->disconnect->get;
+
+    {
+        no warnings 'redefine';
+        *Async::DBD::Pg::Connection::query = $orig_query;
+    }
+
+    is $pg->active_count, 0,
+        'the connection checked out for the cancelled attempt was released, not leaked';
+
+    $connecting->cancel unless $connecting->is_ready;
+};
+
 subtest 'phase reports the lifecycle, and teardown cannot disagree with itself' => sub {
     my $pg = Async::DBD::Pg->new(
         dsn => test_dsn(), min_connections => 0, max_connections => 3,
