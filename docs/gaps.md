@@ -1126,7 +1126,7 @@ current lazy-splice behaviour and documents it; adding a proper
 `on_cancel` will need that comment and its `waiting_count` assertions
 revisited.
 
-### 70. `connect()` racing `disconnect()`'s `UNLISTEN *` can leave a connection checked out to an object reporting itself disconnected
+### 70. `connect()` racing `disconnect()`'s `UNLISTEN *` can leave a connection checked out to an object reporting itself disconnected — FIXED
 
 **File:** `PubSub.pm` (`disconnect`, `_establish`)
 
@@ -1169,10 +1169,33 @@ The *read* side is inert; the *write* side is not, because the assignment
 destroys `'closing'`. Do not conclude from "no reader" that the line can
 be left alone.
 
-Not demonstrated: this is a source reading, not a live reproduction. The
-reproduction needs the database to itself (`kill_backends` in the shared
-suite makes concurrent runs unreliable), so it was deferred rather than
-run alongside other work. Confirm before fixing.
+**Demonstrated, then fixed.** The source reading above was confirmed by
+reproduction under both `Future::IO::Impl::UV` and `::IOAsync`: widening
+the `UNLISTEN *` await and letting an ordinary `connect()` arrive in the
+window leaves `active=1 idle=1`, `is_connected` false, and `{conn}` still
+holding a connection — a live checkout behind an object reporting itself
+disconnected, with no error and no log line. `shutdown` still returns, so
+the symptom is the stranded checkout rather than a wedged pool.
+
+Fixed in `connect()`, the only route into `_establish`: it now refuses
+with `Error::Connection` while `{phase}` is `'closing'`, matching
+`_run_control_query`, which already declines the same way and with the
+same message once teardown has begun. Refusing rather than queueing keeps
+the two teardown-time refusals identical, and `'closing'` stays
+non-terminal — once the disconnect settles, `{phase}` is `'disconnected'`
+and connecting works again.
+
+This also closes the wrinkle above by construction: `_establish` was the
+only writer of `{phase} = 'connecting'`, and it is now unreachable while
+teardown holds `'closing'`, so the assignment can no longer destroy the
+in-progress signal.
+
+Covered by `t/integration/pubsub.t`'s `'a connect arriving during
+teardown does not strand a connection'`, which asserts the invariant
+(nothing checked out, nothing held) separately from this build's chosen
+resolution (the refusal), and pins that a connect after teardown settles
+still works. Mutation-verified: removing the refusal reds the
+stranded-checkout assertions, not merely the refusal ones.
 
 ### 71. The listener's pause around control queries may be defensive rather than load-bearing
 

@@ -88,6 +88,22 @@ async sub connect {
 
     return $self if $self->{phase} eq 'live' && $self->{conn} && $self->{conn}->dbh;
 
+    # Teardown cancels an in-flight attempt on its way out, but it does that
+    # before its own last await -- the UNLISTEN * it issues while shutting the
+    # connection down. An attempt started after that point has already been
+    # passed by the only thing that would have cleaned it up: it checks out a
+    # connection and publishes it behind disconnect()'s back, disconnect() then
+    # finishes and marks the object disconnected, and the checkout is stranded
+    # for the life of the pool with no error and no log line.
+    #
+    # Refused rather than queued behind the teardown, matching
+    # _run_control_query, which declines the same way and with the same error
+    # once {phase} is 'closing'. 'closing' is not terminal: once teardown
+    # settles, {phase} is 'disconnected' and a fresh connect is allowed again.
+    die Async::DBD::Pg::Error::Connection->new(
+        message => 'PubSub is disconnecting',
+    ) if $self->{phase} eq 'closing';
+
     # One attempt, shared by everyone who needs a connection -- explicit
     # callers and the reconnect supervisor alike. Callers arriving together
     # would otherwise each check one out and all but the last would be dropped
@@ -917,12 +933,20 @@ L</listen>; useful when you want to establish the connection ahead of the
 first subscription. Callers arriving together share one attempt, and calling
 it while already connected does nothing.
 
+Fails with an L<Async::DBD::Pg::Error::Connection> if a L</disconnect> is
+still in progress, rather than establishing a connection that teardown has
+already passed and would never release. This is not a terminal state: once
+the disconnect settles, connecting again succeeds. L</listen> connects for
+you, so it fails the same way when called during a teardown.
+
 =head2 disconnect
 
     await $pubsub->disconnect;
 
 Issues C<UNLISTEN *>, forgets every subscription and returns the listener
 connection to the pool.
+
+A L</connect> arriving while this is in progress is refused; see L</connect>.
 
 =head2 is_connected
 

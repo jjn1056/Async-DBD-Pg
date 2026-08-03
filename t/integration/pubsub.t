@@ -1735,4 +1735,65 @@ subtest 'phase reports the lifecycle, and teardown cannot disagree with itself' 
     ok !$pubsub->is_connected, 'and is_connected agrees';
 };
 
+subtest 'a connect arriving during teardown does not strand a connection' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn => test_dsn(), min_connections => 0, max_connections => 4,
+    );
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('teardown_race', sub { })->get;
+    is $pg->active_count, 1, 'the pub/sub holds its connection to start with';
+
+    # disconnect() has one real suspension between deciding to tear down and
+    # finishing -- the UNLISTEN * it issues on the way out. Widening it opens
+    # the window a caller has to arrive in; the flag lets the test wait for
+    # teardown to actually reach it rather than guessing with a sleep.
+    my $unlisten_started = 0;
+    no warnings 'redefine';
+    my $orig_query = Async::DBD::Pg::Connection->can('query');
+    local *Async::DBD::Pg::Connection::query = async sub {
+        my ($conn, $sql, @bind) = @_;
+        if ($sql eq 'UNLISTEN *') {
+            $unlisten_started = 1;
+            await Future::IO->sleep(0.5);
+        }
+        return await $conn->$orig_query($sql, @bind);
+    };
+
+    my $disconnecting = $pubsub->disconnect;
+    ok wait_until(sub { $unlisten_started }, 'teardown reached UNLISTEN *', 3),
+        'teardown is suspended mid-UNLISTEN, with the window open';
+
+    # An ordinary caller -- a listen(), or the reconnect supervisor -- arriving
+    # now. Teardown has already passed the point where it cancels an in-flight
+    # attempt, so nothing downstream of here will clean this one up.
+    my $connecting  = $pubsub->connect;
+    $disconnecting->get;
+    my $established = eval { $connecting->get; 1 };
+    my $err         = $@;
+
+    # The invariant, independent of how the race is resolved: teardown must not
+    # leave a live checkout behind an object that reports itself disconnected.
+    ok !$pubsub->is_connected, 'the pub/sub reports itself disconnected';
+    ok !defined $pubsub->{conn},
+        'no connection is held by a pub/sub that reports itself disconnected';
+    ok wait_until(sub { $pg->active_count == 0 }, 'checkout released', 3),
+        'no connection is left checked out to the torn-down pub/sub';
+
+    # How this build resolves it: refuse, matching _run_control_query, which
+    # already declines to start work once {phase} is 'closing'.
+    ok !$established, 'the racing connect is refused rather than establishing';
+    like $err, qr/disconnect/i, 'the caller is told teardown was in progress';
+
+    # Teardown finishing must leave the object usable again, not permanently
+    # wedged -- 'closing' is a phase, not a terminal state for a fresh connect.
+    $pubsub->listen('teardown_race_after', sub { })->get;
+    ok $pubsub->is_connected, 'a connect after teardown settles still works';
+    $pubsub->disconnect->get;
+    ok wait_until(sub { $pg->active_count == 0 }, 'released again', 3),
+        'and that connection is released too';
+
+    $pg->shutdown->get;
+};
+
 done_testing;
