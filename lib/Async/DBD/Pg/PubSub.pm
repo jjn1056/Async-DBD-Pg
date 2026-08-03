@@ -595,15 +595,16 @@ async sub disconnect {
 sub _pool_shutdown {
     my ($self) = @_;
 
-    # Left at 'closing' rather than reset to 'disconnected' afterward. Not
-    # because any code path currently reads the difference -- traced and
-    # confirmed neither can: a fresh listen() is turned away earlier, by the
-    # pool's own shut-down guard in connection(), before it ever reaches
-    # _run_control_query; and a control query woken by this function's own
-    # cancellation cascade below reads {phase} before any trailing reset
-    # here could run. 'closing' is chosen because it is the honest answer --
-    # unlike disconnect(), a pool-shut-down pubsub is not going to reconnect,
-    # and 'disconnected' would claim otherwise.
+    # Left at 'closing' rather than reset to 'disconnected' afterward. The
+    # difference is unreachable through the public API -- every route to a
+    # control query goes through listen()/unlisten(), and both gate on
+    # {phase} eq 'live' before ever dispatching one, so a fresh call is
+    # turned away earlier still, by the pool's own shut-down guard in
+    # connection() -- which is why the test that pins this reaches into
+    # _run_control_query directly rather than through listen(). 'closing' is
+    # chosen because it is the honest answer -- unlike disconnect(), a
+    # pool-shut-down pubsub is not going to reconnect, and 'disconnected'
+    # would claim otherwise.
     $self->{phase} = 'closing';
 
     if (my $reconnecting = delete $self->{_reconnect_future}) {
