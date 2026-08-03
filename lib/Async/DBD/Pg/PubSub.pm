@@ -662,6 +662,16 @@ sub DESTROY {
 # the same benefit a lexical filehandle gets from not needing an explicit
 # close.
 #
+# That "exactly one release" holds structurally, not by anything observable
+# at runtime: this guard is the only releaser for a checkout it holds, the
+# checkout is never handed elsewhere while armed, and the guard itself is a
+# plain lexical whose lifetime is exactly its enclosing frame's -- it cannot
+# outlive the sub and release a connection some later borrower already has.
+# Connection::release's own idempotency (Connection.pm) would silently
+# absorb a second release if that reasoning were ever wrong, which is why
+# it has to be reasoned about rather than measured: no {active}/{idle} count
+# can tell one release from two on the same connection object.
+#
 # Holds $conn strongly rather than weakening it, unlike the other guards in
 # this file: those weaken their reference to the pub/sub object because it
 # outlives them, but nothing else holds this connection if this guard does

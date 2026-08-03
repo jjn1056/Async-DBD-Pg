@@ -1665,17 +1665,14 @@ subtest 'cancelling notify releases the connection back to the pool' => sub {
     );
     my $pubsub = $pg->pubsub;
 
-    # A normal, uncancelled call has to release exactly once through the
-    # guard, not once through the guard and once more through some leftover
-    # explicit call -- that would double-return the same connection object
-    # into {idle}, not merely no-op the way a second ->release does on its
-    # own. idle_count catches a double-push that active_count alone would
-    # not: a connection returned twice looks identical to active_count as
-    # one returned once, but would inflate idle_count for a single physical
-    # connection.
+    # Not just released -- returned reusable. active_count alone cannot
+    # distinguish that from the connection being discarded instead of
+    # pooled: both leave it at 0. idle_count == 1 confirms it came back
+    # through the ordinary idle path, and that this call was served by
+    # exactly the one physical connection the pool ever created for it.
     $pubsub->notify('checkoutguard_sanity', 'payload')->get;
     is $pg->active_count, 0, 'released after an ordinary, uncancelled notify';
-    is $pg->idle_count, 1, 'returned to idle exactly once, not duplicated';
+    is $pg->idle_count, 1, 'returned to idle reusable, not discarded';
 
     # Stall notify's own query rather than let it complete -- this is the
     # path a guard exists for and an eval cannot cover: cancelling the
