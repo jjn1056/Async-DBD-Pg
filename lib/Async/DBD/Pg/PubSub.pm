@@ -19,11 +19,9 @@ sub new {
         pool             => $pool,
         conn             => undef,
         channels         => {},
-        connected        => 0,
+        phase            => 'disconnected',
         _listener_future => undef,
-        _stopping        => 0,
         _listener_paused => 0,
-        _tearing_down    => 0,
 
         # Read from the pool, which is where an application sets them.
         reconnect              => $pool ? $pool->{reconnect}              : 0,
@@ -41,7 +39,7 @@ sub new {
 
 sub pool                { shift->{pool} }
 sub conn                { shift->{conn} }
-sub is_connected        { shift->{connected} }
+sub is_connected        { shift->{phase} eq 'live' }
 sub subscribed_channels { scalar keys %{shift->{channels}} }
 
 sub _validate_channel {
@@ -89,7 +87,7 @@ sub _backoff_delay {
 async sub connect {
     my ($self) = @_;
 
-    return $self if $self->{connected} && $self->{conn} && $self->{conn}->dbh;
+    return $self if $self->{phase} eq 'live' && $self->{conn} && $self->{conn}->dbh;
 
     # One attempt, shared by everyone who needs a connection -- explicit
     # callers and the reconnect supervisor alike. Callers arriving together
@@ -147,8 +145,7 @@ async sub _establish {
     my ($self, $pool) = @_;
 
     $self->{conn} = await $pool->connection;
-    $self->{connected} = 1;
-    $self->{_stopping} = 0;
+    $self->{phase} = 'live';
 
     # A stale {_listener_paused} from a previous session's disconnect() --
     # whose own _stop_listener call sets it, relying on an explicit delete
@@ -171,7 +168,7 @@ async sub listen {
     die "listen requires a callback"
         unless ref $callback eq 'CODE';
 
-    await $self->connect unless $self->{connected};
+    await $self->connect unless $self->{phase} eq 'live';
 
     my $callbacks = $self->{channels}{$channel} ||= [];
     my $first_subscription = !@$callbacks;
@@ -286,13 +283,13 @@ async sub _listener_loop {
     my $conn = $self->{conn} or return;
     my $sock = $conn->_get_socket;
 
-    # {_stopping} means teardown; {_listener_paused} means a control query
-    # has this connection for the moment. Either is a reason to stop
-    # polling -- {_reconnect_loop} below, deliberately, checks only the
-    # first.
-    while (!($self->{_stopping} || $self->{_listener_paused})) {
+    # A phase other than 'live' means teardown; {_listener_paused} means a
+    # control query has this connection for the moment. Either is a reason
+    # to stop polling -- {_reconnect_loop} below, deliberately, checks only
+    # the first.
+    while (!($self->{phase} ne 'live' || $self->{_listener_paused})) {
         await Future::IO->poll($sock, POLLIN);
-        last if $self->{_stopping} || $self->{_listener_paused};
+        last if $self->{phase} ne 'live' || $self->{_listener_paused};
         $self->_process_notifications($conn);
     }
 
@@ -302,7 +299,7 @@ async sub _listener_loop {
 async sub _start_listener {
     my ($self) = @_;
 
-    return $self unless $self->{connected} && $self->{conn};
+    return $self unless $self->{phase} eq 'live' && $self->{conn};
     return $self if $self->{_listener_future} && !$self->{_listener_future}->is_ready;
 
     my $listener = $self->_listener_loop;
@@ -312,14 +309,14 @@ async sub _start_listener {
     $listener->on_fail(sub {
         my ($err) = @_;
         my $self = $weak_self or return;
-        return if $self->{_stopping};
+        return if $self->{phase} ne 'live';
 
         $self->_log(warn => "PubSub listener stopped: $err");
 
         # The connection is gone. Say so rather than continuing to report a
         # connection that cannot deliver anything, and hand it back so the
         # pool discards it instead of holding it checked out to nobody.
-        $self->{connected} = 0;
+        $self->{phase} = 'disconnected';
         if (my $conn = delete $self->{conn}) {
             $conn->release;
         }
@@ -359,7 +356,7 @@ async sub _reconnect_loop {
 
     my $attempt = 0;
 
-    while (!$self->{_stopping}) {
+    while ($self->{phase} ne 'closing') {
         $attempt++;
 
         my $delay = _backoff_delay(
@@ -370,7 +367,7 @@ async sub _reconnect_loop {
 
         await Future::IO->sleep($delay);
 
-        last if $self->{_stopping};
+        last if $self->{phase} eq 'closing';
 
         my $ok = eval {
             # Through connect(), not a checkout of our own. An ordinary
@@ -424,7 +421,7 @@ async sub _reconnect_loop {
 
         # Hand back anything acquired before the failure, so a half-built
         # attempt does not keep a connection checked out.
-        $self->{connected} = 0;
+        $self->{phase} = 'disconnected';
         if (my $conn = delete $self->{conn}) {
             $conn->release;
         }
@@ -454,11 +451,11 @@ async sub _stop_listener {
 
     my $listener = delete $self->{_listener_future} or return;
 
-    # Not {_stopping}: that means teardown, and the reconnect supervisor
-    # reads it as exactly that. Setting it here for what is often just a
-    # moment's pause for one control query is what let a supervisor waking
-    # from backoff mid-query conclude it had been told to stop and exit
-    # permanently, taking the listener down with it.
+    # Not {phase}: setting that to 'closing' means teardown, and the
+    # reconnect supervisor reads it as exactly that. Setting it here for
+    # what is often just a moment's pause for one control query is what let
+    # a supervisor waking from backoff mid-query conclude it had been told
+    # to stop and exit permanently, taking the listener down with it.
     $self->{_listener_paused} = 1;
     $listener->cancel unless $listener->is_ready;
 
@@ -492,16 +489,9 @@ async sub _run_control_query {
     # would find {conn} still looking valid, issue its own query on it, and
     # then have teardown release that same connection out from under it a
     # moment later -- corrupting it for whoever the pool hands it to next.
-    # Kept separate from {_stopping} rather than merged with it: the two are
-    # nearly redundant now that {_listener_paused} below carries {_stopping}'s
-    # other, unrelated use, but not interchangeable -- _establish resets
-    # {_stopping} on a fresh connection but not this one, so a connect()
-    # racing disconnect()'s teardown window can observe them disagreeing.
-    # The approved {phase} redesign is where the two are meant to merge, not
-    # here.
     die Async::DBD::Pg::Error::Connection->new(
         message => 'PubSub is disconnecting',
-    ) if $self->{_tearing_down};
+    ) if $self->{phase} eq 'closing';
 
     # Claimed with a fresh future rather than the query's own future: the
     # query does not exist yet, since _stop_listener below awaits before one
@@ -567,14 +557,11 @@ async sub disconnect {
     my ($self) = @_;
 
     # Stop trying to come back before tearing down; otherwise a reconnect in
-    # flight would re-establish the listener behind us.
-    $self->{_stopping} = 1;
-
-    # Kept separate from {_stopping} rather than merged with it -- see the
-    # comment in _run_control_query above for why. This one is untouched by
-    # anything but disconnect() and _pool_shutdown(), and is what
-    # _run_control_query checks before ever claiming the slot.
-    $self->{_tearing_down} = 1;
+    # flight would re-establish the listener behind us. Set before the
+    # cancellations below rather than after: _run_control_query checks this
+    # before ever claiming the slot, and a query cancelled a few lines down
+    # can wake a waiter synchronously, inside that same cancellation call.
+    $self->{phase} = 'closing';
 
     if (my $reconnecting = delete $self->{_reconnect_future}) {
         $reconnecting->cancel unless $reconnecting->is_ready;
@@ -601,10 +588,9 @@ async sub disconnect {
         $query->cancel unless $query->is_ready;
     }
 
-    unless ($self->{connected} || $self->{conn}) {
-        $self->{channels}      = {};
-        $self->{_stopping}     = 0;
-        $self->{_tearing_down} = 0;
+    unless ($self->{phase} eq 'live' || $self->{conn}) {
+        $self->{channels} = {};
+        $self->{phase}    = 'disconnected';
         delete $self->{_listener_paused};
         return $self;
     }
@@ -621,10 +607,8 @@ async sub disconnect {
         $conn->release;
     }
 
-    $self->{channels}      = {};
-    $self->{connected}     = 0;
-    $self->{_stopping}     = 0;
-    $self->{_tearing_down} = 0;
+    $self->{channels} = {};
+    $self->{phase}    = 'disconnected';
     delete $self->{_listener_paused};
 
     return $self;
@@ -633,12 +617,10 @@ async sub disconnect {
 sub _pool_shutdown {
     my ($self) = @_;
 
-    $self->{_stopping} = 1;
-
-    # See disconnect() for why this exists separately from {_stopping}. Not
-    # reset afterward -- unlike disconnect(), this object is not expected to
-    # reconnect.
-    $self->{_tearing_down} = 1;
+    # Left at 'closing' rather than reset to 'disconnected' afterward --
+    # unlike disconnect(), this object is not expected to reconnect, and
+    # _run_control_query's teardown check must keep refusing forever.
+    $self->{phase} = 'closing';
 
     if (my $reconnecting = delete $self->{_reconnect_future}) {
         $reconnecting->cancel unless $reconnecting->is_ready;
@@ -669,7 +651,6 @@ sub _pool_shutdown {
     }
 
     $self->{channels} = {};
-    $self->{connected} = 0;
 }
 
 sub DESTROY {
@@ -716,11 +697,11 @@ sub release {
     delete $pubsub->{_control_query_inflight} if $pubsub;
     $done->done unless $done->is_ready;
 
-    # Only the pause this guard's _stop_listener call put on, never
-    # {_stopping}: that flag means teardown, set only by
-    # disconnect()/_pool_shutdown()/DESTROY, and this guard has no business
-    # clearing something it did not set -- doing so unconditionally is what
-    # let a control query's own cleanup clobber a teardown in progress. The
+    # Only the pause this guard's _stop_listener call put on, never a
+    # teardown in progress -- set only by disconnect()/_pool_shutdown()/
+    # DESTROY, via {phase}, and this guard has no business clearing
+    # something it did not set. Doing so unconditionally is what let a
+    # control query's own cleanup clobber a teardown in progress. The
     # listener loop refuses to run while this is set, so leaving it here
     # would make _start_listener below build a loop that exits on its first
     # check with nothing left to restart it.
@@ -735,7 +716,15 @@ sub release {
     # that query is still awaiting a result on. Deferred instead: that
     # query's own release() re-checks the same way, and restarts it once it
     # is genuinely the last one out.
-    return unless $pubsub && $pubsub->{connected} && !$pubsub->{_control_query};
+    #
+    # {phase} eq 'live' also gates a teardown in progress: disconnect() and
+    # _pool_shutdown() set {phase} to 'closing' before cancelling an
+    # in-flight control query, and that cancellation is what runs this
+    # release() -- so a query cancelled by teardown reaches this line with
+    # {phase} already 'closing', and this guard will not restart the
+    # listener for it. See disconnect()'s second _stop_listener call for the
+    # older, coarser safeguard that used to be needed here.
+    return unless $pubsub && $pubsub->{phase} eq 'live' && !$pubsub->{_control_query};
 
     my $started = $pubsub->_start_listener;
     $started->on_fail(sub {

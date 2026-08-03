@@ -151,10 +151,10 @@ subtest 'cancelling a listen leaves the listener running' => sub {
     my $abandoned = $pubsub->listen('cancel_listen_b', sub { });
     $abandoned->cancel;
 
-    is $pubsub->{_stopping}, 0, 'listener not left in the stopping state';
+    isnt $pubsub->{phase}, 'closing', 'listener not left mid-teardown';
 
     # Checked after the assertion above rather than before it: a further
-    # control query here would complete and restore {_stopping} through its
+    # control query here would complete and restore {phase} through its
     # own guard, masking a broken restart on the cancelled one.
     is $pubsub->{_control_query}, undef, 'the cancelled control query freed its slot';
 
@@ -733,9 +733,9 @@ subtest 'disconnect during the backoff window forgets subscriptions too' => sub 
     $pubsub->listen('minor_disconnect', sub { })->get;
 
     # Right after the connection dies, and until the supervisor's first
-    # attempt completes, connected and conn are both false while the
+    # attempt completes, phase is not 'live' and conn is undef while the
     # supervisor sleeps its backoff. disconnect called in that window used
-    # to return early before clearing channels or resetting _stopping.
+    # to return early before clearing channels or resetting phase.
     my $captured = capture_stderr(sub {
         kill_backends();
         wait_until(sub { !$pubsub->is_connected }, 'listener noticed', 5);
@@ -744,12 +744,12 @@ subtest 'disconnect during the backoff window forgets subscriptions too' => sub 
     ok scalar(grep { /FATAL:\s+terminating connection due to administrator command/ } @logged),
         'the termination notice reaches on_log instead';
 
-    ok !$pubsub->{connected} && !$pubsub->{conn}, 'caught in the backoff window';
+    ok $pubsub->{phase} ne 'live' && !$pubsub->{conn}, 'caught in the backoff window';
 
     $pubsub->disconnect->get;
 
     is $pubsub->subscribed_channels, 0, 'subscriptions forgotten even from the early-return path';
-    is $pubsub->{_stopping}, 0, '_stopping reset even from the early-return path';
+    isnt $pubsub->{phase}, 'closing', 'phase not left mid-teardown, even from the early-return path';
 };
 
 subtest 'a pool shutdown while queued for reconnect makes the supervisor give up' => sub {
@@ -1430,7 +1430,8 @@ subtest 'the listener is not restarted while a queued control query is in flight
         return $ps->$orig;
     };
 
-    my $first  = $pubsub->listen('overlap_a', sub { });
+    my @got;
+    my $first  = $pubsub->listen('overlap_a', sub { push @got, $_[1] });
     my $second = $pubsub->listen('overlap_b', sub { });
 
     $first->get;
@@ -1439,7 +1440,32 @@ subtest 'the listener is not restarted while a queued control query is in flight
     ok !$restarted_while_held,
         'the listener was never restarted while the control-query slot was still held';
 
+    # "Never restarted while held" alone does not prove it is ever restarted
+    # at all -- dropping the restart from release() entirely would pass the
+    # check above just as vacuously. Delivery after both queries have
+    # settled is what proves it actually comes back.
+    $pubsub->notify('overlap_a', 'delivered')->get;
+    ok wait_until(sub { @got }, 'notification after both control queries settle', 3),
+        'the listener was restarted once the slot was genuinely free';
+
     $pubsub->disconnect->get;
+};
+
+subtest 'phase reports the lifecycle, and teardown cannot disagree with itself' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn => test_dsn(), min_connections => 0, max_connections => 3,
+    );
+    my $pubsub = $pg->pubsub;
+
+    is $pubsub->{phase}, 'disconnected', 'starts disconnected';
+
+    $pubsub->listen('phase_probe', sub { })->get;
+    is $pubsub->{phase}, 'live', 'live once connected';
+    ok $pubsub->is_connected, 'and is_connected agrees';
+
+    $pubsub->disconnect->get;
+    is $pubsub->{phase}, 'disconnected', 'disconnected after teardown';
+    ok !$pubsub->is_connected, 'and is_connected agrees';
 };
 
 done_testing;
