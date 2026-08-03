@@ -1125,3 +1125,25 @@ does not leave a waiter behind'` (the comment at `:401`) depends on the
 current lazy-splice behaviour and documents it; adding a proper
 `on_cancel` will need that comment and its `waiting_count` assertions
 revisited.
+
+### 70. `connect()` racing `disconnect()`'s `UNLISTEN *` can leave a connection checked out to an object reporting itself disconnected
+
+**File:** `PubSub.pm` (`disconnect`, `_establish`)
+
+`disconnect()` has one real suspension between deciding to tear down and
+finishing: `await $conn->query('UNLISTEN *')`. A `connect()` (via an
+ordinary `listen()`, or the reconnect supervisor) arriving during that
+window runs `_establish`, which sets `connected = 1` and checks out a
+fresh connection independently of what `disconnect()` is doing. When
+`disconnect()` resumes and finishes, it unconditionally sets
+`connected = 0` — clobbering the `connect()` that ran concurrently. The
+result: `connected` reads false, `{conn}` still holds a real, checked-out
+connection, and `active_count` stays at 1. A connection is held by an
+object that reports itself disconnected, with no error and no log line —
+item 65's failure mode, arriving through a different door than the one
+that item closed.
+
+Pre-existing, not introduced by this branch's fix wave — identical at
+`781bc9b`, the commit before it. Not fixed here; recorded because
+`docs/gaps.md` is now the register and this was found while verifying
+adjacent work, not because it is in scope for this branch.

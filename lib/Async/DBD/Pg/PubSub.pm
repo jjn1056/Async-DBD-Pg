@@ -490,10 +490,13 @@ async sub _run_control_query {
     # would find {conn} still looking valid, issue its own query on it, and
     # then have teardown release that same connection out from under it a
     # moment later -- corrupting it for whoever the pool hands it to next.
-    # Kept separate from {_stopping} rather than merged with it: the two
-    # mean the same thing now that {_listener_paused} below carries
-    # {_stopping}'s other, unrelated use, but consolidating them is a
-    # distinct simplification from this fix and not made here.
+    # Kept separate from {_stopping} rather than merged with it: the two are
+    # nearly redundant now that {_listener_paused} below carries {_stopping}'s
+    # other, unrelated use, but not interchangeable -- _establish resets
+    # {_stopping} on a fresh connection but not this one, so a connect()
+    # racing disconnect()'s teardown window can observe them disagreeing.
+    # The approved {phase} redesign is where the two are meant to merge, not
+    # here.
     die Async::DBD::Pg::Error::Connection->new(
         message => 'PubSub is disconnecting',
     ) if $self->{_tearing_down};
@@ -520,6 +523,11 @@ async sub _run_control_query {
     # this sub where it stands and runs nothing after the await.
     my $listener = Async::DBD::Pg::PubSub::_ListenerGuard->new($self);
 
+    # Held outside the eval so it can be asked about after: a cancelled
+    # future reaches its awaiter as "Future=HASH(0x...) was cancelled" -- an
+    # address and no explanation, same as connect() guards against for its
+    # own shared attempt below.
+    my $query;
     my $result = eval {
         # Re-read here rather than trusted from before the awaits above: a
         # waiter can be parked behind the mutex for its predecessor's whole
@@ -540,7 +548,7 @@ async sub _run_control_query {
         # goes back to the pool. Without this, teardown has no way to know a
         # query is even in flight: the slot above is never released, and
         # every later control query parks in the while loop forever.
-        my $query = $conn->query($sql, @bind);
+        $query = $conn->query($sql, @bind);
         $self->{_control_query_inflight} = $query;
         await $query;
     };
@@ -549,6 +557,13 @@ async sub _run_control_query {
     $listener->restore;
     $query_guard->release;
 
+    # $query->is_cancelled here can only mean teardown cancelled it: a
+    # caller giving up on its own listen()/unlisten() tears this frame down
+    # at whatever await it is suspended on rather than letting it resume,
+    # so a caller-cancelled query never reaches this line at all.
+    die Async::DBD::Pg::Error::Connection->new(
+        message => 'PubSub is disconnecting',
+    ) if $err && $query && $query->is_cancelled;
     die $err if $err;
 
     return $result;

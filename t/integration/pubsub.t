@@ -324,6 +324,8 @@ subtest 'disconnecting cancels a control query in flight, not abandons it' => su
 
     ok wait_until(sub { $in_flight->is_ready }, 'abandoned query settled', 3),
         'the abandoned control query settles rather than hanging forever';
+    like $in_flight->failure, qr/PubSub is disconnecting/,
+        'and says why, not a bare "Future=HASH(0x...) was cancelled"';
     ok !$pubsub->{_control_query}, 'and the mutex slot was not left claimed';
 
     ok $pubsub->listen('c1_after', sub { })->get,
