@@ -1167,7 +1167,7 @@ subtest 'the reconnect supervisor gives up when the pool is gone' => sub {
     # ever succeed without a pool, so it must stop rather than log forever.
     my $captured = capture_stderr(sub {
         delete $pubsub->{pool};
-        kill_backends($dsn);
+        kill_backends();
 
         wait_until(
             sub {
@@ -1184,7 +1184,11 @@ subtest 'the reconnect supervisor gives up when the pool is gone' => sub {
     my @gave_up = ($captured =~ /giving up on reconnect/g);
     is scalar @gave_up, 1, 'it said so once, on the way out';
 
-    # Put the pool back so teardown can release the connection it still holds.
+    # Restore the weak pool reference so the object is left in its ordinary
+    # shape. disconnect() below never actually touches {pool}: {connected} and
+    # {conn} are already both false here, cleared by the failed attempt's own
+    # cleanup above, so it takes the early-return path with nothing left to
+    # release.
     $pubsub->{pool} = $pg;
     $pubsub->disconnect->get;
 };
