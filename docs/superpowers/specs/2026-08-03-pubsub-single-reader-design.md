@@ -123,6 +123,29 @@ stale future and may complete a query nobody is waiting for. Register the
 cleanup on the future itself (`on_ready`) so it runs however the future
 settles — done, failed or cancelled.
 
+**4. `pg_ready` raises inside the listener loop.** Today the readiness check
+runs in the query's own frame, so a DBI exception lands on the query, which is
+the party that cares. Once the listener performs that check on the query's
+behalf, an exception lands on the **listener** instead — killing it, taking the
+delegate with it, triggering a reconnect, and leaving the query to be failed by
+case 1 rather than by its own error.
+
+Mojo::Pg guards exactly this, wrapping both calls in `local $dbh->{RaiseError}
+= 0` under the comment "Do not raise exceptions inside the event loop":
+
+    return if !$self->{waiting} || !do { local $dbh->{RaiseError} = 0; $dbh->pg_ready };
+    my $rv = do { local $dbh->{RaiseError} = 0; $dbh->pg_result };
+
+`_result_ready` must therefore not let an exception escape into the loop. It
+should catch, and the error must be delivered to the **waiting query's** future
+rather than raised where the listener would see it. A query that errors must
+not present as a connection failure.
+
+Note that `local` on a hash element across an `await` aborts the process under
+Future::AsyncAwait (`SAVEt_HELEM`) — a hazard already recorded for `%SIG` in
+this codebase. `_result_ready` is synchronous and awaits nothing, so `local` is
+safe *inside* it, but it must stay that way.
+
 **3. The listener is mid-`_process_notifications` when the query is issued.**
 A user callback calling `listen()` claims the control-query slot synchronously
 and dispatches. The loop must therefore check the waiter *after* draining
@@ -176,6 +199,58 @@ expression of "is the result ready" in the codebase.
   parking is what stops notifications stranding in libpq's buffer, and it is
   also Mojo's order.
 
+## How other clients solve this
+
+Checked against source, not from memory.
+
+**Every mature client has exactly one socket reader, and demultiplexes
+notifications from the same byte stream as query results.**
+
+- **node-postgres** — `parse(stream, msg => this.emit(msg.name, msg))`. One
+  parser attached to the stream; `notificationResponse` is just another message
+  type. No independent readers exist, and no pause mechanism exists because
+  none is possible.
+- **asyncpg** — the protocol layer invokes `_process_notification(pid, channel,
+  payload)`, which dispatches to registered listeners. No dedicated poller.
+- **Mojo::Pg** — one reactor `io` watcher on the socket, whose callback reads
+  notifications and then checks query readiness.
+
+**They get single-reader for free; we have to build it.** None of them *await* a
+poll — they register a handler and the event loop calls it, and one handler
+naturally does both jobs. `await Future::IO->poll(...)` makes every awaiting
+coroutine its own reader, which is exactly how this codebase acquired two. The
+delegate reconstructs single-reader-ness inside a pull-based idiom. That is the
+reason a delegate is needed at all, rather than simply deleting the pause.
+
+**Mojo::Pg's callback order is the order in this design.** `_notifications`
+first, then `pg_ready`, then `pg_result` — independent confirmation that gaps
+item 75's drain-before-anything-else is a deliberate invariant rather than a
+local workaround.
+
+**Watcher lifetime is equivalent, packaged differently.** Mojo watches while
+`_notifications || {waiting}` — listening *or* a query pending — and
+`_unwatch`es when neither holds. This design ties the delegate to the listener
+and falls back to self-polling otherwise. Same arbitration: in both, whoever is
+around to own the fd owns it, and there is never a second.
+
+### Deliberate divergence: serialize rather than refuse
+
+Both competitors **refuse** a concurrent operation:
+
+- Mojo::Pg: `croak 'Non-blocking query already in progress' if $self->{waiting};`
+- asyncpg: `InterfaceError('cannot perform operation: another operation is in
+  progress')`, via its `_Atomic` guard on `fetch`/`execute`/`executemany`
+
+This design **serializes** instead, behind the `{_control_query}` mutex — a
+second caller waits rather than failing. That is a conscious divergence, not an
+oversight. Our control queries are not user statements; they are the
+`LISTEN`/`UNLISTEN` issued by `listen()` and `unlisten()`. Subscribing to
+several channels concurrently is ordinary use of a pub/sub API and should not
+throw. asyncpg would raise on two concurrent `add_listener` calls, because they
+route through the same exclusive section; we should not.
+
+Recorded here so the mutex is not later "corrected" to match the competition.
+
 ## Testing
 
 Every existing pub/sub test must pass unchanged — they are the safety net, and
@@ -198,6 +273,10 @@ New coverage, each of which must be shown failing before implementation:
    completes.
 6. An ordinary pooled connection still self-polls — the delegate must never
    leak onto a connection returned to the pool.
+7. A control query that fails on its own merits — a syntax error, a permission
+   error — is reported to *that query's* caller with its `Error::Query` and
+   SQLSTATE intact, and the listener survives. Failure path 4: this is the test
+   that catches a query error being reported as a connection failure.
 
 The fragmentation experiment (`scratchpad/frag-experiment.pl`) and the latency
 probe should both be re-run against the finished branch: 160/160 clean, and
