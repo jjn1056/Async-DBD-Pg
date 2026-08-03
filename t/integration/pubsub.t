@@ -1073,7 +1073,7 @@ subtest 'a failure inside the replay is retried in place, not left to end the su
     }
 
     # The connection checked out for the failed attempt has to come back to
-    # the pool, not sit on {active} forever -- _EstablishGuard's job.
+    # the pool, not sit on {active} forever -- _CheckoutGuard's job.
     is $pg->active_count, 0,
         'the connection checked out for the failed attempt was released, not leaked';
 
@@ -1563,7 +1563,7 @@ subtest 'a failure inside the subscribe loop releases the connection back to the
 
     # Fail the second LISTEN in the subscribe loop, standing in for any
     # query error in the window between checkout and publish -- exactly what
-    # _EstablishGuard exists to cover.
+    # _CheckoutGuard exists to cover.
     my $orig_query = Async::DBD::Pg::Connection->can('query');
     my $seen = 0;
     {
@@ -1657,6 +1657,68 @@ subtest 'cancellation mid-subscribe releases the connection back to the pool' =>
         'the connection checked out for the cancelled attempt was released, not leaked';
 
     $connecting->cancel unless $connecting->is_ready;
+};
+
+subtest 'cancelling notify releases the connection back to the pool' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn => test_dsn(), min_connections => 0, max_connections => 4,
+    );
+    my $pubsub = $pg->pubsub;
+
+    # A normal, uncancelled call has to release exactly once through the
+    # guard, not once through the guard and once more through some leftover
+    # explicit call -- that would double-return the same connection object
+    # into {idle}, not merely no-op the way a second ->release does on its
+    # own. idle_count catches a double-push that active_count alone would
+    # not: a connection returned twice looks identical to active_count as
+    # one returned once, but would inflate idle_count for a single physical
+    # connection.
+    $pubsub->notify('checkoutguard_sanity', 'payload')->get;
+    is $pg->active_count, 0, 'released after an ordinary, uncancelled notify';
+    is $pg->idle_count, 1, 'returned to idle exactly once, not duplicated';
+
+    # Stall notify's own query rather than let it complete -- this is the
+    # path a guard exists for and an eval cannot cover: cancelling the
+    # returned future tears the sub down mid-await, and only a destructor
+    # runs after that point.
+    my $orig_query = Async::DBD::Pg::Connection->can('query');
+    my $seen = 0;
+    {
+        no strict 'refs';
+        no warnings 'redefine';
+        *Async::DBD::Pg::Connection::query = sub {
+            my ($conn, $sql, @bind) = @_;
+            if ($sql =~ /pg_notify/) {
+                $seen++;
+                return Future->new;   # never resolves on its own
+            }
+            return $conn->$orig_query($sql, @bind);
+        };
+    }
+
+    my $notifying = $pubsub->notify('cancel_notify_test', 'payload');
+    ok wait_until(sub { $seen >= 1 }, 'reached the stalled notify query', 8),
+        'notify() suspended waiting on pg_notify';
+    is $pg->active_count, 1, 'one connection checked out for the in-flight notify';
+
+    $notifying->cancel;
+
+    {
+        no warnings 'redefine';
+        *Async::DBD::Pg::Connection::query = $orig_query;
+    }
+
+    is $pg->active_count, 0,
+        'the connection checked out for the cancelled notify was released, not leaked';
+
+    # The real proof: the pool can actually drain, not merely report zero.
+    # Bounded rather than left to hang forever, so a regression here fails
+    # by a missed elapsed-time bound instead of stalling the whole run.
+    my $started = time;
+    $pg->shutdown(timeout => 2)->get;
+    my $elapsed = time - $started;
+    ok $elapsed < 1,
+        'shutdown drained promptly rather than waiting on a stranded checkout';
 };
 
 subtest 'phase reports the lifecycle, and teardown cannot disagree with itself' => sub {

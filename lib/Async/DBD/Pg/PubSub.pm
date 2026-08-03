@@ -152,10 +152,10 @@ async sub _establish {
     #
     # Guarded from checkout to publish: a query failing partway through the
     # loop, or cancellation at any of these awaits, would otherwise strand
-    # the checkout -- see _EstablishGuard for why it can't just fall out of
+    # the checkout -- see _CheckoutGuard for why it can't just fall out of
     # scope on its own.
     my $conn  = await $pool->connection;
-    my $guard = Async::DBD::Pg::PubSub::_EstablishGuard->new($conn);
+    my $guard = Async::DBD::Pg::PubSub::_CheckoutGuard->new($conn);
 
     for my $channel (sort keys %{ $self->{channels} }) {
         await $conn->query("LISTEN " . $conn->dbh->quote_identifier($channel));
@@ -240,17 +240,16 @@ async sub notify {
         unless $self->_validate_channel($channel);
 
     my $pool = $self->{pool} or die "No pool configured";
-    my $conn = await $pool->connection;
 
-    my $result = eval {
-        await $conn->query('SELECT pg_notify($1, $2)', $channel, $payload);
-    };
-    my $err = $@;
+    # Guarded rather than released explicitly after an eval: this checkout
+    # is never published anywhere else, so it always wants exactly one
+    # release on the way out, on every path -- success, a failed query, or
+    # the caller cancelling this future while the query is in flight, which
+    # explicit code after the await below would never run for.
+    my $conn  = await $pool->connection;
+    my $guard = Async::DBD::Pg::PubSub::_CheckoutGuard->new($conn);
 
-    $conn->release;
-
-    die $err if $err;
-    return $result;
+    return await $conn->query('SELECT pg_notify($1, $2)', $channel, $payload);
 }
 
 # The connection is passed in rather than read from $self. The listener loop
@@ -646,24 +645,29 @@ sub DESTROY {
     $self->_pool_shutdown;
 }
 
-# Releases the connection _establish checks out for its subscribe loop if
-# nothing has claimed it by the time this guard is destroyed. connection()
-# pushes onto the pool's own {active} list before returning it, so that
-# checkout holds a strong reference independent of whatever local variable
-# _establish keeps -- a query failing partway through the loop, or the whole
-# sub being cancelled at one of its awaits, drops that lexical without ever
-# bringing its refcount to zero, and Connection::DESTROY's own auto-release
-# never fires. Left unguarded, the connection stays on {active} forever: the
-# pool believes it is checked out to nobody. Disarmed once _establish
-# publishes the connection to {conn}, where teardown takes over
-# responsibility for releasing it instead.
+# Releases a checked-out connection if nothing has claimed it by the time
+# this guard is destroyed. connection() pushes onto the pool's own {active}
+# list before returning it, so a checkout holds a strong reference
+# independent of whatever local variable a caller keeps -- a query failing,
+# or the whole sub being cancelled at one of its awaits, drops that lexical
+# without ever bringing its refcount to zero, and Connection::DESTROY's own
+# auto-release never fires. Left unguarded, the connection stays on {active}
+# forever: the pool believes it is checked out to nobody.
+#
+# Two shapes of caller: _establish disarms once it publishes the connection
+# to {conn}, where teardown takes over responsibility for releasing it.
+# notify() never disarms at all -- its checkout is never published anywhere
+# else, so it always wants exactly one release on the way out, on every
+# path, and never having to remember to call $conn->release explicitly is
+# the same benefit a lexical filehandle gets from not needing an explicit
+# close.
 #
 # Holds $conn strongly rather than weakening it, unlike the other guards in
 # this file: those weaken their reference to the pub/sub object because it
 # outlives them, but nothing else holds this connection if this guard does
 # not -- weakening it would just recreate the leak this guard exists to
 # close.
-package Async::DBD::Pg::PubSub::_EstablishGuard;
+package Async::DBD::Pg::PubSub::_CheckoutGuard;
 
 use strict;
 use warnings;
