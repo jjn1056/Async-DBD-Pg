@@ -325,8 +325,16 @@ async sub _listener_loop {
         # traffic made it readable again.
         $self->_process_notifications($conn);
 
-        await Future::IO->poll($sock, POLLIN);
+        # Re-checked here rather than after the poll below. The call above runs
+        # user callbacks, and one that calls listen()/unlisten() claims the
+        # control-query slot synchronously before returning to us -- so by this
+        # line the pause may already be owed to somebody. Leaving cleanly is
+        # better than parking on the socket and being cancelled out of it.
+        # After the poll the same test would be redundant: the while condition
+        # re-tests it with nothing in between.
         last unless $self->{phase} eq 'live' && !$self->{_control_query};
+
+        await Future::IO->poll($sock, POLLIN);
     }
 
     return;
