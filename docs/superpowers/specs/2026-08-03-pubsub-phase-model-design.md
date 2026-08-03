@@ -98,6 +98,25 @@ while ($self->{phase} eq 'live' && !$self->{_control_query}) { ... }
 Nothing to set, nothing to clear, nothing to fall out of sync. Bug (5) — a flag
 set on one path with nothing to clear it on another — is not expressible here.
 
+### One guard per control query, not two
+
+Deriving the pause forces a change that is an improvement in its own right.
+`_run_control_query` currently builds two guards: `_ControlQueryGuard` (which
+frees the slot) and, nine lines later, `_ListenerGuard` (which restarts the
+listener). Perl destroys lexicals in reverse order of declaration, so the
+listener is restarted **before** the slot is freed. Today that is harmless,
+because the two communicate through a flag the restart does not consult. Under a
+derived pause it is fatal: the restarted listener would evaluate
+`!$self->{_control_query}`, find the slot still held, exit immediately, and
+nothing would ever start it again — a silently dead listener, which is the exact
+failure class this design exists to remove.
+
+Reordering the declarations would fix it and leave the hazard latent for the
+next person. Instead the two collapse into one guard that owns "this control
+query holds the connection", and on release frees the slot and then restarts the
+listener. One guard class instead of two, and the ordering is a property of the
+code rather than of where two `my` statements happen to sit.
+
 ### Establish, then publish
 
 `_establish` builds the connection in a lexical, subscribes every channel to it,
@@ -140,13 +159,13 @@ improvement on four ad-hoc `if (my $f = delete ...)` blocks, not a proof.
 - **`{_connecting}`, `{_connecting_waiters}`, `_AwaiterGuard`** — concurrent
   `connect()` callers still share one attempt, and the last one to abandon still
   cancels it. Self-contained and covered by mutation-verified tests.
-- **`{_control_query}`, `{_control_query_inflight}`, `_ControlQueryGuard`** —
-  two concurrent user `listen()` calls still need serializing. Now a local
-  concern with no reconnect entanglement.
+- **`{_control_query}`, `{_control_query_inflight}`** — two concurrent user
+  `listen()` calls still need serializing. Now a local concern with no reconnect
+  entanglement, and guarded by one class rather than two.
 - **`{_listener_future}`, `{_reconnect_future}`** — futures teardown cancels.
 
-Net: eleven lifecycle keys to about eight, and three ambiguous booleans become
-one unambiguous field with a derived listener state.
+Net: eleven lifecycle keys to about eight, three guard classes to two, and three
+ambiguous booleans become one unambiguous field with a derived listener state.
 
 ## Migration
 
