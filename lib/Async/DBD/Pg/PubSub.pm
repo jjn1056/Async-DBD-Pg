@@ -664,13 +664,20 @@ sub DESTROY {
 #
 # That "exactly one release" holds structurally, not by anything observable
 # at runtime: this guard is the only releaser for a checkout it holds, the
-# checkout is never handed elsewhere while armed, and the guard itself is a
-# plain lexical whose lifetime is exactly its enclosing frame's -- it cannot
-# outlive the sub and release a connection some later borrower already has.
+# checkout is never reachable by anyone else while armed -- _establish
+# publishes it and disarms with no await in between, so nothing can run in
+# that window -- and the guard itself is a plain lexical whose lifetime is
+# exactly its enclosing frame's, so it cannot outlive the sub and release a
+# connection some later borrower already has.
+#
 # Connection::release's own idempotency (Connection.pm) would silently
-# absorb a second release if that reasoning were ever wrong, which is why
-# it has to be reasoned about rather than measured: no {active}/{idle} count
-# can tell one release from two on the same connection object.
+# absorb a second release of the same checkout if that reasoning were ever
+# wrong, which is why this has to be reasoned about rather than measured:
+# no {active}/{idle} count can tell one such release from two. A stale
+# release landing on a *later* checkout would show up -- connection()
+# resets {released} on checkout, so it would move a live one back to idle
+# -- but that is the hazard the lexical-lifetime argument above excludes,
+# not one the counts are relied on to catch.
 #
 # Holds $conn strongly rather than weakening it, unlike the other guards in
 # this file: those weaken their reference to the pub/sub object because it
