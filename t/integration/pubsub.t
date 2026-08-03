@@ -251,7 +251,14 @@ subtest 'abandoning the only connect releases everything' => sub {
     my $abandoned = $pubsub->connect;
     $abandoned->cancel;
 
-    ok wait_until(sub { $pg->active_count == 0 }, 'checkout released', 3),
+    # A negative property, checked with the negative form: wait_until tests
+    # its condition before ever sleeping, so asserting active_count == 0
+    # here would pass at the instant connect() was called, before the TCP
+    # handshake has run in any universe -- the leak this guards against has
+    # not had a chance to happen yet, whether or not it ever will. Giving it
+    # real wall-clock time to appear, and asserting it did not, is what
+    # actually exercises the guarantee.
+    ok !wait_until(sub { $pg->active_count > 0 }, 'a leaked checkout would appear here', 1),
         'no connection is left checked out';
     ok !$pubsub->is_connected, 'and the object is not left connected';
 
@@ -291,6 +298,79 @@ subtest 'disconnecting during a connect does not leave it running' => sub {
         'and told something that explains it';
 
     $connecting->cancel unless $connecting->is_ready;
+};
+
+# A regression in either of the next two subtests fails by *hanging*, not by
+# a red assertion -- if one of them never finishes, that hang is the
+# failure, not infrastructure flakiness.
+subtest 'disconnecting cancels a control query in flight, not abandons it' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 3,
+    );
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('c1_seed', sub { })->get;
+
+    # Not awaited: still suspended inside its own LISTEN query when
+    # disconnect() below runs. Without a fix, disconnect() has no way to
+    # know this query exists, releases {conn} out from under it, and the
+    # mutex slot this query claimed is never freed -- every later control
+    # query on this object parks in _run_control_query's while loop forever.
+    my $in_flight = $pubsub->listen('c1_in_flight', sub { });
+
+    $pubsub->disconnect->get;
+
+    ok wait_until(sub { $in_flight->is_ready }, 'abandoned query settled', 3),
+        'the abandoned control query settles rather than hanging forever';
+    ok !$pubsub->{_control_query}, 'and the mutex slot was not left claimed';
+
+    ok $pubsub->listen('c1_after', sub { })->get,
+        'a fresh listen() after disconnect is not stuck behind the abandoned one';
+
+    $pubsub->disconnect->get;
+};
+
+subtest 'a control query queued behind one abandoned by disconnect is also woken cleanly' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 3,
+    );
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('c1q_seed', sub { })->get;
+
+    # $holder claims the mutex slot and suspends in its own query; $queued
+    # parks behind it in _run_control_query's while loop. Cancelling
+    # $holder's query -- what disconnect() does below -- wakes $queued
+    # synchronously, inside that same cancellation call, before disconnect()
+    # has gone on to release {conn}. A waiter woken this way that cannot
+    # tell teardown is underway would see {conn} still looking valid, issue
+    # its own query on it, and then have disconnect() release that same
+    # connection a moment later with the query still running -- corrupting
+    # it for whichever caller the pool hands it to next.
+    my $holder = $pubsub->listen('c1q_holder', sub { });
+    my $queued = $pubsub->listen('c1q_queued', sub { });
+
+    $pubsub->disconnect->get;
+
+    # Unbounded rather than wait_until: this is the assertion that hangs,
+    # not merely fails, if the queued waiter is left unable to tell
+    # teardown is underway.
+    my $ok  = eval { $queued->get; 1 };
+    my $err = $@;
+    ok !$ok, 'the queued query does not silently succeed once teardown is underway';
+    like $err, qr/PubSub is disconnecting/, 'and reports why';
+    ok !$pubsub->{_control_query}, 'and the mutex slot was not left claimed';
+
+    # The real proof: a completely unrelated connection must still work.
+    my $probe = $pg->connection->get;
+    my $result = $probe->query('SELECT 1 AS n')->get;
+    is $result->first->{n}, 1,
+        'an unrelated connection from the pool is not corrupted by the abandoned query';
+    $probe->release;
 };
 
 subtest 'abandoning a queued connect does not leave a waiter behind' => sub {

@@ -125,6 +125,39 @@ All subsequent LISTEN/UNLISTEN operations silently fail.
 Fixed. `_stopping` is cleared and the listener restarted whether or not the statement
 succeeded, and the failure is still reported to the caller. Covered by t/unit/pubsub.t.
 
+### 67. PubSub `{_stopping}` is overloaded between three different meanings
+
+**File:** `PubSub.pm` — `_reconnect_loop` reads it as "teardown asked me to
+stop" (`:347`, `:358`); `_stop_listener` sets it for the duration of every
+control query (`:442`); `_ListenerGuard::restore` clears it unconditionally
+(`:597`). A different `_stopping` defect from item 7 above, in the same
+flag.
+
+Not theory: reproduced end to end by making one `LISTEN` slow enough that
+it is still in flight when the reconnect supervisor wakes from backoff.
+The supervisor reads `last if $self->{_stopping}` while an ordinary
+`listen()` holds the flag for its own control query, concludes it was told
+to stop, and exits permanently. `listen()` only replays the channel it was
+called for, so a channel subscribed before the interleaving is silently
+dropped: the object reports itself connected with N subscriptions and one
+of them is dead, with no error and no log line — verbatim the failure
+class item 65 exists to prevent, produced by a different mechanism than
+the one that item fixed.
+
+Pre-existing on `main`, not introduced by item 65's fix — the identical
+script against the commit before that work produces byte-identical
+output. Recommended fix, not yet applied: split the flag. `{_stopping}`
+should mean only "teardown asked me to stop," set by
+`disconnect`/`_pool_shutdown`/`DESTROY`. A separate `{_listener_paused}`,
+set by `_stop_listener` and cleared by `_ListenerGuard::restore`, would
+carry the "a control query has the listener stopped for a moment" meaning
+instead. `_listener_loop` would check both; `_reconnect_loop` would check
+only `{_stopping}`.
+
+The window widens with the number of channels an application re-subscribes
+on reconnect — 50 channels at roughly 2ms each against a 0.25-0.5s default
+backoff is not a tail case.
+
 ---
 
 ## Section 2: Resource Leaks & Data Integrity (must fix)
@@ -992,3 +1025,93 @@ underlying attempt only once the last of them has left. Separately, the listener
 loop was changed to read notifications from the connection it actually polls
 rather than whatever `{conn}` currently holds, closing the other route by which
 two connections could end up coexisting unnoticed.
+
+Sharing one connection is only safe if issuing statements on it is also
+serialized: once `_reconnect_loop`'s replay and an ordinary `listen()` can
+both reach the connection the moment a shared connect resolves, DBD::Pg
+refuses a second async query while the first is in flight. Fixed by a
+`{_control_query}` mutex in `_run_control_query`, claimed with a
+re-checking `while` loop (a single `if` would reproduce the same
+check-then-act defect one level up) and released by a guard on every path,
+including cancellation. See item 66 for a shipped bug the mutex's own
+implementation surfaced, and item 68 for a hazard fixed alongside it.
+`disconnect()` and `_pool_shutdown()` were also changed to cancel a
+control query still in flight before releasing the connection, and to tell
+a waiter woken by that cancellation that teardown is underway rather than
+let it issue a query of its own on a connection about to be released out
+from under it — without this, the connection-sharing fix above would trade
+the orphaned-connection bug for a permanent hang on every `listen()` after
+a `disconnect()` that raced an in-flight control query.
+
+### 66. Queued pool callers could never `->get` their connection, only croak — FIXED
+
+**File:** `Async/DBD/Pg.pm:407-413` (the pool's queue-and-wait branch)
+
+`Future::AsyncAwait` builds the pending placeholder a suspended `async sub`
+returns by cloning whatever future it is currently suspended on — `Future`'s
+own `AWAIT_CLONE` is `shift->new`. A plain `Future->new`, which the pool used
+to hand a queued caller its eventual connection, has no event loop of its
+own: `->get`/`->await` on one that is not yet ready can only croak
+("...is not yet complete and does not provide ->await"), never block. The
+poisoning propagates through every nested `async sub` between the queue and
+whoever called `->get`, so this reached `$pg->connection->get` itself — the
+documented, synchronous way this distribution's own examples and tests
+acquire a connection.
+
+Reproduced directly, no pub/sub involved: exhaust a `max_connections => 1`
+pool and call `->get` on the second requester. Croaks on `main`.
+
+A prior author had already hit this and worked around it in test code --
+`t/pool/basic.t`'s `settle()` helper polls `is_ready` in a loop instead of
+calling `->get` directly, with a comment naming the same limitation.
+
+Fixed by `pending_future()` (`Async::DBD::Pg::Util`), a leaf `Future`
+cloned from a real, immediately-cancelled `Future::IO` future rather than
+`Future->new` — using `Future->new`'s documented instance-method form
+("construct another in the same class"), not an undocumented one. A cached
+prototype was considered and rejected: it would fix the class at whichever
+implementation loaded first, and a consumer switching implementations later
+via `Future::IO->override_impl` would silently get a real-implementation
+future back from a mocked reactor. Built fresh per call instead; measured at
+11.3µs (UV) / 16.8µs (IOAsync) per call, noise beside the round trip it
+wraps. Now backs the pool's queue branch and the pub/sub control-query mutex
+(item 65). Covered by a permanent regression test in `t/pool/basic.t`.
+
+### 68. `_run_control_query` did not re-check `{conn}` after acquiring its slot — FIXED
+
+**File:** `PubSub.pm` (`_run_control_query`)
+
+A waiter parked behind another caller's control query for the mutex added
+in item 65 could be woken after the listener's `on_fail` had deleted
+`{conn}` in the meantime, and dereferenced it without revalidating: `Can't
+call method "query" on an undefined value` instead of a real
+`Async::DBD::Pg::Error::Connection`. Caught by the surrounding `eval` and
+cleaned up correctly either way, so the damage was the message, not
+corrupted state — but a caller could not distinguish "the connection went
+away" from a bug in the library.
+
+Fixed alongside item 65's teardown-cancellation fix, since both touch the
+same call site: `{conn}` is re-read immediately before use, after the
+mutex wait and the listener-stop wait, and a missing connection now dies
+with a proper `Error::Connection` naming what happened.
+
+### 69. The pool's queue branch registers no `on_cancel`
+
+**File:** `Async/DBD/Pg.pm:411-417` (the "3. Queue and wait" branch of
+`connection()`)
+
+A cancelled queued caller is spliced out of `{waiting}` only lazily, by
+`_release_to_idle_or_waiting` the next time a connection is actually
+released (`next if $waiting->{future}->is_ready` skips settled entries).
+If no connection is ever released afterward, the stale entry sits in
+`{waiting}` indefinitely and `waiting_count` reports a wrong number. It
+never hands a connection to a caller that is no longer waiting for one —
+the `is_ready` check already handles that — so the damage is a wrong
+statistic and a small, bounded leak of a hash entry, not a correctness
+bug.
+
+Not fixed here. `t/integration/pubsub.t`'s `'abandoning a queued connect
+does not leave a waiter behind'` (the comment at `:401`) depends on the
+current lazy-splice behaviour and documents it; adding a proper
+`on_cancel` will need that comment and its `waiting_count` assertions
+revisited.

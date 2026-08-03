@@ -7,6 +7,7 @@ use Future::AsyncAwait;
 use Future::IO qw(POLLIN);
 use Scalar::Util qw(refaddr weaken);
 
+use Async::DBD::Pg::Error;
 use Async::DBD::Pg::Util qw(pending_future);
 
 sub new {
@@ -21,6 +22,7 @@ sub new {
         connected        => 0,
         _listener_future => undef,
         _stopping        => 0,
+        _tearing_down    => 0,
 
         # Read from the pool, which is where an application sets them.
         reconnect              => $pool ? $pool->{reconnect}              : 0,
@@ -464,6 +466,20 @@ async sub _run_control_query {
         await $pending->without_cancel;
     }
 
+    # Checked here, immediately on exiting the loop and before claiming
+    # anything: cancelling the slot's current holder to tear it down (see
+    # disconnect()/_pool_shutdown() below) wakes a parked waiter
+    # synchronously, inside that same cancellation call -- before teardown
+    # has gone on to delete {conn}. Without this check, the woken waiter
+    # would find {conn} still looking valid, issue its own query on it, and
+    # then have teardown release that same connection out from under it a
+    # moment later -- corrupting it for whoever the pool hands it to next.
+    # {_stopping} cannot serve this purpose: _ListenerGuard::restore clears
+    # it unconditionally and can run inside this very cascade.
+    die Async::DBD::Pg::Error::Connection->new(
+        message => 'PubSub is disconnecting',
+    ) if $self->{_tearing_down};
+
     # Claimed with a fresh future rather than the query's own future: the
     # query does not exist yet, since _stop_listener below awaits before one
     # is issued. Reading the loop's exit and claiming this are not separated
@@ -486,7 +502,30 @@ async sub _run_control_query {
     # where it stands and runs nothing after the await.
     my $listener = Async::DBD::Pg::PubSub::_ListenerGuard->new($self);
 
-    my $result = eval { await $self->{conn}->query($sql, @bind) };
+    my $result = eval {
+        # Re-read here rather than trusted from before the awaits above: a
+        # waiter can be parked behind the mutex for its predecessor's whole
+        # query, and the listener's on_fail can delete {conn} while it
+        # waits. Dying with a real error here beats dereferencing undef a
+        # line further down.
+        my $conn = $self->{conn}
+            or die Async::DBD::Pg::Error::Connection->new(
+                message => 'PubSub connection is gone',
+            );
+
+        # Published where teardown can reach it: disconnect() and
+        # _pool_shutdown cancel this before releasing {conn}, the same way
+        # they already cancel {_connecting} and {_reconnect_future}.
+        # Cancelling propagates through query()'s own await into
+        # _execute_async's frame, running _StatementGuard::DESTROY there --
+        # server-side cancel and a finished handle -- before the connection
+        # goes back to the pool. Without this, teardown has no way to know a
+        # query is even in flight: the slot above is never released, and
+        # every later control query parks in the while loop forever.
+        my $query = $conn->query($sql, @bind);
+        $self->{_control_query_inflight} = $query;
+        await $query;
+    };
     my $err = $@;
 
     $listener->restore;
@@ -503,6 +542,15 @@ async sub disconnect {
     # Stop trying to come back before tearing down; otherwise a reconnect in
     # flight would re-establish the listener behind us.
     $self->{_stopping} = 1;
+
+    # Distinct from {_stopping}: that flag gets clobbered mid-teardown by
+    # _ListenerGuard::restore (see the comment in _run_control_query above),
+    # so it cannot be what tells a waiter woken during this very call that
+    # teardown is underway. This one is untouched by anything but
+    # disconnect() and _pool_shutdown(), and is what _run_control_query
+    # checks before ever claiming the slot.
+    $self->{_tearing_down} = 1;
+
     if (my $reconnecting = delete $self->{_reconnect_future}) {
         $reconnecting->cancel unless $reconnecting->is_ready;
     }
@@ -514,9 +562,24 @@ async sub disconnect {
         $connecting->cancel unless $connecting->is_ready;
     }
 
+    # A control query in flight holds {_control_query} until its guard
+    # releases, and nothing but the query's own completion or cancellation
+    # ends that frame. Left running, we release {conn} below with a query
+    # still in progress on it, and the slot stays claimed forever -- every
+    # later control query parks in _run_control_query's while loop with
+    # nothing left to wake it. Cancelling here runs _StatementGuard::DESTROY
+    # (Connection.pm), which cancels server-side and finishes the handle
+    # before {conn} is touched. Done before the _stop_listener call below
+    # rather than after, so that call catches and re-stops a listener the
+    # cancelled query's own guard may have just restarted.
+    if (my $query = delete $self->{_control_query_inflight}) {
+        $query->cancel unless $query->is_ready;
+    }
+
     unless ($self->{connected} || $self->{conn}) {
-        $self->{channels}  = {};
-        $self->{_stopping} = 0;
+        $self->{channels}      = {};
+        $self->{_stopping}     = 0;
+        $self->{_tearing_down} = 0;
         return $self;
     }
 
@@ -527,9 +590,10 @@ async sub disconnect {
         $conn->release;
     }
 
-    $self->{channels} = {};
-    $self->{connected} = 0;
-    $self->{_stopping} = 0;
+    $self->{channels}      = {};
+    $self->{connected}     = 0;
+    $self->{_stopping}     = 0;
+    $self->{_tearing_down} = 0;
 
     return $self;
 }
@@ -539,12 +603,26 @@ sub _pool_shutdown {
 
     $self->{_stopping} = 1;
 
+    # See disconnect() for why this exists separately from {_stopping}. Not
+    # reset afterward -- unlike disconnect(), this object is not expected to
+    # reconnect.
+    $self->{_tearing_down} = 1;
+
     if (my $reconnecting = delete $self->{_reconnect_future}) {
         $reconnecting->cancel unless $reconnecting->is_ready;
     }
 
     if (my $connecting = delete $self->{_connecting}) {
         $connecting->cancel unless $connecting->is_ready;
+    }
+
+    # See the matching block in disconnect() for why this exists and why it
+    # runs before the {_listener_future} cancellation below rather than
+    # after: cancelling an in-flight control query can synchronously restart
+    # the listener through its own guard, and the block below is what
+    # catches and cancels that.
+    if (my $query = delete $self->{_control_query_inflight}) {
+        $query->cancel unless $query->is_ready;
     }
 
     if (my $listener = delete $self->{_listener_future}) {
@@ -646,6 +724,12 @@ sub release {
     if ($pubsub && $pubsub->{_control_query} && refaddr($pubsub->{_control_query}) == refaddr($done)) {
         delete $pubsub->{_control_query};
     }
+
+    # Not identity-checked like the slot above: the mutex already guarantees
+    # only one control query is ever in flight at a time, so whatever is
+    # here when this guard releases can only be the query this same claim
+    # issued -- or nothing, if it never got that far before ending.
+    delete $pubsub->{_control_query_inflight} if $pubsub;
 
     $done->done unless $done->is_ready;
 }
