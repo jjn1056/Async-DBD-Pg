@@ -7,6 +7,15 @@ use Future;
 use Async::DBD::Pg;
 use Async::DBD::Pg::PubSub;
 
+# Builds a PubSub in a given phase without going through a real connection,
+# so unit tests do not have to know which keys represent which lifecycle state.
+sub _pubsub_in_phase {
+    my ($pg, $phase) = @_;
+    my $pubsub = $pg->pubsub;
+    $pubsub->{phase} = $phase;
+    return $pubsub;
+}
+
 subtest 'constructor' => sub {
     my $pubsub = Async::DBD::Pg::PubSub->new();
 
@@ -75,24 +84,28 @@ subtest 'pool returns cached pubsub instance' => sub {
 }
 
 subtest 'a failed control query leaves pub/sub usable' => sub {
-    my $pubsub = Async::DBD::Pg::PubSub->new();
+    my $pg = Async::DBD::Pg->new(
+        dsn             => 'postgresql://user:secret@localhost/test',
+        min_connections => 0,
+        max_connections => 1,
+    );
+    my $pubsub = _pubsub_in_phase($pg, 'disconnected');
 
     # Stand in for a live listener connection whose first statement fails.
-    # A listener future has to be present, because stopping it is what sets
-    # _stopping in the first place. connected stays false so the listener is
+    # A listener future has to be present so _run_control_query's own call
+    # to _stop_listener runs. phase stays 'disconnected' so the listener is
     # not restarted here, which would need a real socket; restarting it is
     # covered by t/integration/pubsub.t.
     my $conn = Test::Async::DBD::Pg::FlakyConn->new(fail_next => 1);
     $pubsub->{conn} = $conn;
-    $pubsub->{connected} = 0;
     $pubsub->{_listener_future} = Future->done(1);
 
     my $err = dies { $pubsub->_run_control_query('LISTEN failing')->get };
     ok $err, 'the failing statement is reported to the caller';
 
-    # _stopping gates the listener loop. Left set, every later listen and
+    # phase gates the listener loop. Left at 'closing', every later listen and
     # unlisten silently does nothing.
-    is $pubsub->{_stopping}, 0, 'listener not left in the stopping state';
+    isnt $pubsub->{phase}, 'closing', 'listener not left mid-teardown';
 
     ok lives { $pubsub->_run_control_query('LISTEN working')->get },
         'a later control query still runs';

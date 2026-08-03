@@ -218,6 +218,25 @@ subtest 'shutdown gives back the pub/sub listener connection' => sub {
     ok !$pubsub->is_connected, 'pub/sub reports disconnected';
 };
 
+subtest 'shutdown refuses pub/sub work permanently, not just until reconnect' => sub {
+    my $pg = make_pool(max_connections => 3);
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('shutdown_direct_seed', sub { })->get;
+    settle($pg->shutdown, 5);
+
+    # No public call shape reaches _run_control_query's teardown check here:
+    # listen()/unlisten() both gate on {phase} eq 'live' before dispatching a
+    # control query, and a fresh call is turned away earlier still, by the
+    # pool's own shut-down guard in connection(). Reaching in directly is
+    # deliberate white-box, the same idiom t/unit/pubsub.t already uses for
+    # internal mechanisms -- it's the only way to exercise the check itself
+    # rather than something further downstream.
+    my $err = dies { $pubsub->_run_control_query('LISTEN shutdown_direct_probe')->get };
+    like $err, qr/PubSub is disconnecting/,
+        'refused with the teardown error even once shutdown has fully settled';
+};
+
 subtest 'shutdown completes while a listener is trying to reconnect' => sub {
     my @logged;
     my $pg = Async::DBD::Pg->new(

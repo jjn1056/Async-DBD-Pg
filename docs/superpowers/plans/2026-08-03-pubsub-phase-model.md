@@ -247,9 +247,29 @@ remaining site — reads become `{phase} eq 'live'`, `= 1` becomes
 `{phase} = 'live'`, `= 0` becomes `{phase} = 'disconnected'`.
 
 One is easy to miss because it is not spelled `$self->`: the
-`return unless $pubsub && $pubsub->{connected};` that Task 1 moved into
-`_ControlQueryGuard::release`. Grep rather than working from this list — the
-whole point of the phase is that no site keeps its own opinion of the lifecycle.
+`return unless $pubsub && $pubsub->{connected} && !$pubsub->{_control_query};`
+that Task 1 moved into `_ControlQueryGuard::release`. Grep rather than working
+from this list — the whole point of the phase is that no site keeps its own
+opinion of the lifecycle.
+
+**That one site is a decision, not a translation.** `{connected}` is an
+incomplete gate there today: `disconnect()` cancels the in-flight control query
+*before* it sets `{connected} = 0`, so the flag is still true while the guard
+runs, and `disconnect()` compensates with a second explicit `_stop_listener`
+call — there specifically to re-stop a listener the guard may have just
+restarted.
+
+A mechanical `{connected}` → `phase eq 'live'` swap preserves that gap exactly,
+and keeps the double-stop load-bearing. But this plan sets `phase = 'closing'`
+at the point `disconnect()` currently sets its teardown flag, which is *before*
+the cancellation — so `phase eq 'live'` is strictly more precise than the
+boolean it replaces, and the double-stop may become redundant.
+
+**Do not remove the double-stop in this task.** Translate the condition, verify
+by experiment whether the guard can still restart a listener during teardown
+once the phase is set early, and record the answer in your report. Removing it
+is Task 5's business, where teardown is restructured — and only if the
+experiment says it is genuinely dead code.
 
 **One site in that grep must not be translated.** `connect()` has a *lexical*
 `my $connected = eval { await $attempt->without_cancel; 1 };` and its
@@ -521,7 +541,7 @@ grep -L '^Result: PASS' /tmp/ph-*.out | wc -l
 
 Expected: `0`. Report the count and confirm nothing else touched the database.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
 git add lib/Async/DBD/Pg/PubSub.pm t/integration/pubsub.t
@@ -646,12 +666,51 @@ test from the previous branch —
 and that the new registry subtest does too. Isolated scenario, bounded
 `timeout`, since one of them hangs.
 
-- [ ] **Step 7: Full verification**
+- [ ] **Step 7: Two debts from earlier tasks, both about teardown**
+
+**First, pin `_pool_shutdown`'s permanence.** Task 2 removed the trailing reset
+so the phase stays `closing` forever after a pool shutdown, deliberately: a
+shut-down pool never returns, and `_run_control_query`'s die-check depends on
+that permanence. Nothing tests it, so a future change reverts it silently. Add a
+behavioural assertion rather than an internal-state one:
+
+```perl
+subtest 'a control query after pool shutdown keeps being refused' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn => test_dsn(), min_connections => 0, max_connections => 3,
+    );
+    my $pubsub = $pg->pubsub;
+    $pubsub->listen('shutdown_probe', sub { })->get;
+
+    $pg->shutdown->get;
+
+    # A pool that has shut down is never coming back, so the object stays
+    # refusing rather than reopening and failing further in.
+    my $err;
+    ok !eval { $pubsub->listen('after_shutdown', sub { })->get; 1 },
+        'listen after pool shutdown fails';
+    $err = $@;
+    like $err, qr/disconnecting/,
+        'and fails by refusing, not by trying and breaking';
+};
+```
+
+Check `$pg->shutdown`'s actual name and signature in `lib/Async/DBD/Pg.pm`
+before using it; if it differs, use what is there.
+
+**Second, remove `disconnect()`'s compensating second `_stop_listener` call**
+— but only if you can still demonstrate it is dead. Task 2 established that
+`phase = 'closing'` is the first statement of both teardown paths with no
+`await` before it, so the guard's restart gate can never fire mid-teardown.
+Re-confirm that against the code as it stands after Tasks 3 and 4, then delete
+the call. If the demonstration does not hold any more, leave it and say why.
+
+- [ ] **Step 8: Full verification**
 
 Run the whole suite 8 times, alternating implementations, streams to separate
 files, and report each run's result and stderr byte count.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
 git add lib/Async/DBD/Pg/PubSub.pm t/integration/pubsub.t
