@@ -31,6 +31,14 @@ The default local test database is:
 | Password | test |
 | Database | test |
 
+If something already occupies port 5432, set `PG_PORT` to publish it
+elsewhere and point `TEST_PG_DSN` at the same port:
+
+```bash
+PG_PORT=5433 docker compose up -d
+TEST_PG_DSN="postgresql://postgres:test@localhost:5433/test" prove -r -l t/
+```
+
 ### Run the Tests
 
 ```bash

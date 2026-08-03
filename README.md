@@ -123,6 +123,9 @@ docker compose up -d
 TEST_PG_DSN='postgresql://postgres:test@localhost:5432/test' prove -r -l t/
 ```
 
+Set `PG_PORT` if 5432 is already taken on your machine, and point
+`TEST_PG_DSN` at the same port.
+
 ## Author
 
 John Napiorkowski <jjn1056@yahoo.com>

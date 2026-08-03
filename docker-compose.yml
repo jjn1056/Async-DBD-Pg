@@ -1,8 +1,11 @@
 services:
   postgres:
     image: postgres:16-alpine
+    # Host port is overridable so a machine already running PostgreSQL on 5432
+    # can bring this up without a conflict: PG_PORT=5433 docker compose up -d,
+    # then point TEST_PG_DSN at the same port.
     ports:
-      - "5432:5432"
+      - "${PG_PORT:-5432}:5432"
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: test

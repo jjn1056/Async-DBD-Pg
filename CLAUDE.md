@@ -37,6 +37,11 @@ docker compose up -d
 ```
 Default: `postgresql://postgres:test@localhost:5432/test` (PostgreSQL 16-Alpine).
 
+`PG_PORT` overrides the published host port when 5432 is already in use
+(`PG_PORT=5433 docker compose up -d`); `TEST_PG_DSN` must then name the same
+port. Check which port the container actually published before running the
+suite — `docker ps` — rather than assuming the documented default.
+
 Stop: `docker compose down` (add `-v` to destroy data volume).
 
 ### Building
