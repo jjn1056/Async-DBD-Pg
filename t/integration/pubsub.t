@@ -948,6 +948,74 @@ subtest 'a reconnect racing a listen takes only one connection' => sub {
         'no connection was orphaned by the race';
 };
 
+# A regression here fails by hanging or by a missing notification, not by a
+# clean assertion -- if the listener never comes back, that silence is the
+# failure, not infrastructure flakiness.
+subtest 'a reconnect supervisor backing off is not fooled by an ordinary listen() pausing the listener' => sub {
+    my @got_early;
+    my @logged;
+    my $pg = Async::DBD::Pg->new(
+        dsn                    => test_dsn(),
+        min_connections        => 0,
+        max_connections        => 5,
+        reconnect              => 1,
+        reconnect_min_interval => 0.5,
+        reconnect_max_interval => 0.5,
+        on_log                 => sub { push @logged, $_[1] },
+    );
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('i1_early', sub { push @got_early, $_[1] })->get;
+
+    # Delay exactly one control query well past the backoff above, so
+    # {_listener_paused} is still set when the supervisor wakes and checks
+    # {_stopping}. Real contention does this for free -- the window widens
+    # with the number of channels replayed on reconnect -- but not reliably
+    # enough to test against; forcing it makes the test deterministic. The
+    # delay lives here rather than in Connection.pm: production code does
+    # not carry test scaffolding.
+    my $orig_query = Async::DBD::Pg::Connection->can('query');
+    my $delay_one  = 1;
+    no warnings 'redefine';
+    local *Async::DBD::Pg::Connection::query = sub {
+        my ($conn, @args) = @_;
+        return $conn->$orig_query(@args) unless $delay_one;
+        $delay_one = 0;
+        return (async sub {
+            await Future::IO->sleep(1);
+            return await $conn->$orig_query(@args);
+        })->();
+    };
+
+    my $captured = capture_stderr(sub {
+        kill_backends();
+        wait_until(sub { !$pubsub->is_connected }, 'listener noticed', 5);
+    });
+    is $captured, '', 'the termination notice does not reach fd 2';
+    ok scalar(grep { /FATAL:\s+terminating connection due to administrator command/ } @logged),
+        'the termination notice reaches on_log instead';
+
+    # Reconnects on its own and issues the delayed control query above,
+    # pausing the listener for a full second -- long enough for the
+    # supervisor's 0.5s backoff to elapse while it is still paused.
+    $pubsub->listen('i1_late', sub { })->get;
+
+    ok wait_until(sub { $pubsub->is_connected }, 'reconnected', 5),
+        'pub/sub came back';
+
+    # The real proof: a channel subscribed before the race must still
+    # deliver. Before splitting {_stopping} from {_listener_paused}, the
+    # supervisor woke mid-pause, read the shared flag as true, and exited
+    # permanently believing it had been told to stop -- the listener never
+    # restarted and this channel was never re-subscribed on the new
+    # connection, with no error and no log line.
+    $pubsub->notify('i1_early', 'still here')->get;
+    ok wait_until(sub { @got_early }, 'notification arrived', 5),
+        'a channel subscribed before the race still delivers';
+
+    $pubsub->disconnect->get;
+};
+
 subtest 'a failure inside the replay is retried in place, not left to end the supervisor' => sub {
     my @logged;
     my $pg = Async::DBD::Pg->new(

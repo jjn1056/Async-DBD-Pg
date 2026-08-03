@@ -22,6 +22,7 @@ sub new {
         connected        => 0,
         _listener_future => undef,
         _stopping        => 0,
+        _listener_paused => 0,
         _tearing_down    => 0,
 
         # Read from the pool, which is where an application sets them.
@@ -148,6 +149,12 @@ async sub _establish {
     $self->{conn} = await $pool->connection;
     $self->{connected} = 1;
     $self->{_stopping} = 0;
+
+    # A stale {_listener_paused} from a previous session's disconnect()
+    # (whose own direct _stop_listener call sets it but has no
+    # _ListenerGuard to clear it) would otherwise make the listener loop
+    # this starts below refuse to ever poll, having never run once.
+    delete $self->{_listener_paused};
 
     await $self->_start_listener;
 
@@ -277,9 +284,13 @@ async sub _listener_loop {
     my $conn = $self->{conn} or return;
     my $sock = $conn->_get_socket;
 
-    while (!$self->{_stopping}) {
+    # {_stopping} means teardown; {_listener_paused} means a control query
+    # has this connection for the moment. Either is a reason to stop
+    # polling -- {_reconnect_loop} below, deliberately, checks only the
+    # first.
+    while (!($self->{_stopping} || $self->{_listener_paused})) {
         await Future::IO->poll($sock, POLLIN);
-        last if $self->{_stopping};
+        last if $self->{_stopping} || $self->{_listener_paused};
         $self->_process_notifications($conn);
     }
 
@@ -441,7 +452,12 @@ async sub _stop_listener {
 
     my $listener = delete $self->{_listener_future} or return;
 
-    $self->{_stopping} = 1;
+    # Not {_stopping}: that means teardown, and the reconnect supervisor
+    # reads it as exactly that. Setting it here for what is often just a
+    # moment's pause for one control query is what let a supervisor waking
+    # from backoff mid-query conclude it had been told to stop and exit
+    # permanently, taking the listener down with it.
+    $self->{_listener_paused} = 1;
     $listener->cancel unless $listener->is_ready;
 
     eval { await $listener };
@@ -474,8 +490,10 @@ async sub _run_control_query {
     # would find {conn} still looking valid, issue its own query on it, and
     # then have teardown release that same connection out from under it a
     # moment later -- corrupting it for whoever the pool hands it to next.
-    # {_stopping} cannot serve this purpose: _ListenerGuard::restore clears
-    # it unconditionally and can run inside this very cascade.
+    # Kept separate from {_stopping} rather than merged with it: the two
+    # mean the same thing now that {_listener_paused} below carries
+    # {_stopping}'s other, unrelated use, but consolidating them is a
+    # distinct simplification from this fix and not made here.
     die Async::DBD::Pg::Error::Connection->new(
         message => 'PubSub is disconnecting',
     ) if $self->{_tearing_down};
@@ -495,11 +513,11 @@ async sub _run_control_query {
 
     await $self->_stop_listener if $self->{_listener_future};
 
-    # Stopping the listener set _stopping, and the listener loop refuses to
-    # run while it is set. A guard puts it back and restarts the listener
-    # however this ends: on success, on a failed statement, and on a caller
-    # cancelling while the statement is in flight, which stops this sub
-    # where it stands and runs nothing after the await.
+    # Stopping the listener set {_listener_paused}, and the listener loop
+    # refuses to run while it is set. A guard puts it back and restarts the
+    # listener however this ends: on success, on a failed statement, and on
+    # a caller cancelling while the statement is in flight, which stops
+    # this sub where it stands and runs nothing after the await.
     my $listener = Async::DBD::Pg::PubSub::_ListenerGuard->new($self);
 
     my $result = eval {
@@ -543,12 +561,10 @@ async sub disconnect {
     # flight would re-establish the listener behind us.
     $self->{_stopping} = 1;
 
-    # Distinct from {_stopping}: that flag gets clobbered mid-teardown by
-    # _ListenerGuard::restore (see the comment in _run_control_query above),
-    # so it cannot be what tells a waiter woken during this very call that
-    # teardown is underway. This one is untouched by anything but
-    # disconnect() and _pool_shutdown(), and is what _run_control_query
-    # checks before ever claiming the slot.
+    # Kept separate from {_stopping} rather than merged with it -- see the
+    # comment in _run_control_query above for why. This one is untouched by
+    # anything but disconnect() and _pool_shutdown(), and is what
+    # _run_control_query checks before ever claiming the slot.
     $self->{_tearing_down} = 1;
 
     if (my $reconnecting = delete $self->{_reconnect_future}) {
@@ -580,9 +596,14 @@ async sub disconnect {
         $self->{channels}      = {};
         $self->{_stopping}     = 0;
         $self->{_tearing_down} = 0;
+        delete $self->{_listener_paused};
         return $self;
     }
 
+    # The direct call below sets {_listener_paused}, same as any other
+    # caller, but there is no _ListenerGuard here to clear it afterward --
+    # done explicitly below instead, or a later _establish would find it
+    # already set and its fresh listener loop would refuse to ever poll.
     await $self->_stop_listener if $self->{_listener_future};
 
     if (my $conn = delete $self->{conn}) {
@@ -594,6 +615,7 @@ async sub disconnect {
     $self->{connected}     = 0;
     $self->{_stopping}     = 0;
     $self->{_tearing_down} = 0;
+    delete $self->{_listener_paused};
 
     return $self;
 }
@@ -672,7 +694,12 @@ sub restore {
 
     my $pubsub = delete $self->{pubsub} or return;
 
-    $pubsub->{_stopping} = 0;
+    # Only the pause this guard put on, never {_stopping}: that flag means
+    # teardown, set only by disconnect()/_pool_shutdown()/DESTROY, and this
+    # guard has no business clearing something it did not set -- doing so
+    # unconditionally is what let a control query's own cleanup clobber a
+    # teardown in progress.
+    delete $pubsub->{_listener_paused};
     return unless $pubsub->{connected};
 
     # Starting the listener only builds the loop's future and stores it on

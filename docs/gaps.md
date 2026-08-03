@@ -125,34 +125,44 @@ All subsequent LISTEN/UNLISTEN operations silently fail.
 Fixed. `_stopping` is cleared and the listener restarted whether or not the statement
 succeeded, and the failure is still reported to the caller. Covered by t/unit/pubsub.t.
 
-### 67. PubSub `{_stopping}` is overloaded between three different meanings
+### 67. PubSub `{_stopping}` was overloaded between three different meanings — FIXED
 
-**File:** `PubSub.pm` — `_reconnect_loop` reads it as "teardown asked me to
-stop" (`:347`, `:358`); `_stop_listener` sets it for the duration of every
-control query (`:442`); `_ListenerGuard::restore` clears it unconditionally
-(`:597`). A different `_stopping` defect from item 7 above, in the same
-flag.
+**File:** `PubSub.pm` — `_reconnect_loop` read it as "teardown asked me to
+stop"; `_stop_listener` set it for the duration of every control query;
+`_ListenerGuard::restore` cleared it unconditionally. A different
+`_stopping` defect from item 7 above, in the same flag.
 
 Not theory: reproduced end to end by making one `LISTEN` slow enough that
-it is still in flight when the reconnect supervisor wakes from backoff.
-The supervisor reads `last if $self->{_stopping}` while an ordinary
-`listen()` holds the flag for its own control query, concludes it was told
-to stop, and exits permanently. `listen()` only replays the channel it was
-called for, so a channel subscribed before the interleaving is silently
-dropped: the object reports itself connected with N subscriptions and one
-of them is dead, with no error and no log line — verbatim the failure
-class item 65 exists to prevent, produced by a different mechanism than
-the one that item fixed.
+it was still in flight when the reconnect supervisor woke from backoff.
+The supervisor read `last if $self->{_stopping}` while an ordinary
+`listen()` held the flag for its own control query, concluded it was told
+to stop, and exited permanently. `listen()` only replays the channel it was
+called for, so a channel subscribed before the interleaving was silently
+dropped: the object reported itself connected with N subscriptions and one
+of them dead, with no error and no log line — verbatim the failure class
+item 65 exists to prevent, produced by a different mechanism than the one
+that item fixed.
 
 Pre-existing on `main`, not introduced by item 65's fix — the identical
-script against the commit before that work produces byte-identical
-output. Recommended fix, not yet applied: split the flag. `{_stopping}`
-should mean only "teardown asked me to stop," set by
-`disconnect`/`_pool_shutdown`/`DESTROY`. A separate `{_listener_paused}`,
-set by `_stop_listener` and cleared by `_ListenerGuard::restore`, would
-carry the "a control query has the listener stopped for a moment" meaning
-instead. `_listener_loop` would check both; `_reconnect_loop` would check
-only `{_stopping}`.
+script against the commit before that work produced byte-identical output.
+
+Fixed by splitting the flag. `{_stopping}` now means only "teardown asked
+me to stop," set by `disconnect`/`_pool_shutdown`/`DESTROY` and read by
+`_reconnect_loop`. A separate `{_listener_paused}`, set by `_stop_listener`
+and cleared only by `_ListenerGuard::restore`, carries the "a control query
+has the listener stopped for a moment" meaning instead; `_listener_loop`
+checks both. This also closes the latent second problem the flag shared:
+`restore` no longer touches `{_stopping}` at all, so it can no longer
+clobber a teardown in progress the way it unconditionally could before.
+
+One consequence the split itself introduced, caught during implementation
+rather than left for later: `_stop_listener` is called directly by
+`disconnect()`, not only through `_ListenerGuard`, so its call has no guard
+to clear `{_listener_paused}` afterward. Left alone, a later `_establish`
+would find the flag still set and its fresh listener loop would refuse to
+ever poll — reconnecting successfully while silently never delivering
+anything again. `_establish` and both of `disconnect()`'s exit points now
+clear it explicitly.
 
 The window widens with the number of channels an application re-subscribes
 on reconnect — 50 channels at roughly 2ms each against a 0.25-0.5s default
