@@ -317,9 +317,16 @@ async sub _listener_loop {
     # a paused listener resumes because the holder released, not because a
     # second code path remembered to clear a boolean.
     while ($self->{phase} eq 'live' && !$self->{_control_query}) {
+        # Drained before parking, not after waking. A control query that ran
+        # while this loop was paused consumed whatever arrived into libpq's
+        # buffer to get its own result, so by the time the pause lifts the
+        # socket can be empty while notifications are already in hand.
+        # Waiting on the socket first would strand them until unrelated
+        # traffic made it readable again.
+        $self->_process_notifications($conn);
+
         await Future::IO->poll($sock, POLLIN);
         last unless $self->{phase} eq 'live' && !$self->{_control_query};
-        $self->_process_notifications($conn);
     }
 
     return;

@@ -1796,4 +1796,91 @@ subtest 'a connect arriving during teardown does not strand a connection' => sub
     $pg->shutdown->get;
 };
 
+subtest 'a notification arriving during a control query needs no later traffic to appear' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn => test_dsn(), min_connections => 0, max_connections => 4,
+    );
+    my $pubsub = $pg->pubsub;
+
+    my @got;
+    $pubsub->listen('stall', sub { push @got, $_[1] })->get;
+    my $notifier = $pg->connection->get;
+
+    # Fire a NOTIFY inside a control query's window. The listener is stopped
+    # for the duration, so the notification's bytes are consumed off the
+    # socket by the control query's own pg_ready and land in libpq's buffer.
+    # Nothing after this sends anything else on the connection: if delivery
+    # depends on a later socket wake, it never arrives.
+    my $fired = 0;
+    no warnings 'redefine';
+    my $orig_query = Async::DBD::Pg::Connection->can('query');
+    local *Async::DBD::Pg::Connection::query = async sub {
+        my ($conn, $sql, @bind) = @_;
+        if (!$fired && $sql =~ /^LISTEN/ && $sql =~ /stall_probe/) {
+            $fired = 1;
+            await $notifier->$orig_query("SELECT pg_notify('stall', 'during')");
+
+            # Settle before the control statement is issued, so its bytes are
+            # already on the socket when the first pg_ready runs. That check
+            # consumes them and can report the result ready without ever
+            # polling -- so nothing on the query's side of the connection gets
+            # a chance to drain, and only the listener's own ordering can.
+            await Future::IO->sleep(0.3);
+        }
+        return await $conn->$orig_query($sql, @bind);
+    };
+
+    $pubsub->listen('stall_probe', sub { })->get;
+    ok $fired, 'the notification was fired inside the control query window';
+
+    ok wait_until(sub { @got }, 'notification delivered', 5),
+        'delivered without any further traffic on the connection';
+    is $got[0], 'during', 'and it is the notification sent during the window';
+
+    $pubsub->disconnect->get;
+    $notifier->release;
+    $pg->shutdown->get;
+};
+
+subtest 'a notification queued during a long control query arrives promptly after it' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn => test_dsn(), min_connections => 0, max_connections => 4,
+    );
+    my $pubsub = $pg->pubsub;
+
+    my @got;
+    $pubsub->listen('inflight', sub { push @got, { payload => $_[1], at => time } })->get;
+    my $notifier = $pg->connection->get;
+
+    # Deliberately NOT asserting delivery *during* the query: PostgreSQL does
+    # not send NOTIFY to a backend that is busy running a command, so nothing
+    # can arrive mid-statement to be delivered. Measured -- with a NOTIFY sent
+    # 50ms into a 2s query on this connection, its socket did not become
+    # readable until the query finished.
+    #
+    # What that means for us: the notification reaches the client together
+    # with the query's result, and pg_ready consumes both into libpq's buffer
+    # while the listener is paused. So the property worth pinning is that the
+    # listener drains that buffer when it resumes, bounded by the query it
+    # waited behind rather than waiting for unrelated traffic.
+    #
+    # _run_control_query rather than listen(): every public control statement
+    # is a sub-millisecond LISTEN/UNLISTEN, too short to hold the pause open.
+    my $control = $pubsub->_run_control_query('SELECT pg_sleep(0.5)');
+    $notifier->query("SELECT pg_notify('inflight', 'mid')")->get;
+    $control->get;
+    my $finished = time;
+
+    ok wait_until(sub { @got }, 'notification delivered', 3),
+        'the notification queued behind the control query is delivered';
+    is $got[0]{payload}, 'mid', 'and carries the right payload';
+
+    my $lag = $got[0]{at} - $finished;
+    ok $lag < 0.5, sprintf('delivered promptly once the pause lifted (%.3fs)', $lag);
+
+    $pubsub->disconnect->get;
+    $notifier->release;
+    $pg->shutdown->get;
+};
+
 done_testing;
