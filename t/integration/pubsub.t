@@ -1135,6 +1135,60 @@ subtest 'a failure that escapes through on_log still clears the reconnect slot' 
     $pubsub->disconnect->get;
 };
 
+subtest 'the reconnect supervisor gives up when the pool is gone' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn                    => test_dsn(),
+        min_connections        => 0,
+        max_connections        => 3,
+        reconnect              => 1,
+        # Wide enough that the backoff sleep -- during which the supervisor
+        # is suspended and _reconnect_future stays live -- comfortably spans
+        # more than one of wait_until's own 0.05s polls below. At 0.05/0.05
+        # the whole create-backoff-fail-giveup-delete cycle can complete
+        # inside a single gap between polls: giving up is the fast path this
+        # subtest exists to prove, so the future can vanish (deleted by its
+        # own on_ready cleanup) before any poll ever observes it in flight,
+        # failing the assertion below even though the supervisor behaved
+        # correctly. Reproduced deterministically under IOAsync at 0.05/0.05
+        # (5/5 runs); reliable at 0.3/0.3 (5/5 IOAsync, 3/3 UV).
+        reconnect_min_interval => 0.3,
+        reconnect_max_interval => 0.3,
+    );
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('no_pool_test', sub { })->get;
+
+    my $reconnecting;
+
+    # Once the pool is gone, _log has nowhere to send anything and falls back
+    # to warn -- so the "giving up" message lands on file descriptor 2 rather
+    # than on_log, and must be captured and asserted rather than allowed to
+    # escape. That is also the point of the subtest: the supervisor cannot
+    # ever succeed without a pool, so it must stop rather than log forever.
+    my $captured = capture_stderr(sub {
+        delete $pubsub->{pool};
+        kill_backends($dsn);
+
+        wait_until(
+            sub {
+                $reconnecting ||= $pubsub->{_reconnect_future};
+                $reconnecting && $reconnecting->is_ready;
+            },
+            'supervisor finished', 5,
+        );
+    });
+
+    ok $reconnecting && $reconnecting->is_ready,
+        'the supervisor stopped instead of retrying forever';
+
+    my @gave_up = ($captured =~ /giving up on reconnect/g);
+    is scalar @gave_up, 1, 'it said so once, on the way out';
+
+    # Put the pool back so teardown can release the connection it still holds.
+    $pubsub->{pool} = $pg;
+    $pubsub->disconnect->get;
+};
+
 subtest 'the listener keeps reading the connection it is polling' => sub {
     my $pg = Async::DBD::Pg->new(
         dsn             => test_dsn(),

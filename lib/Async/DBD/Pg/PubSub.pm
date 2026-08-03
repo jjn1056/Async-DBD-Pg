@@ -414,15 +414,16 @@ async sub _reconnect_loop {
             $conn->release;
         }
 
-        # A pool that has shut down is never going to give us a connection.
-        # Checked on the pool's own state rather than matched against $err's
-        # text, because PostgreSQL raises its own "the database system is
-        # shutting down" on a restart, which a message match would also
-        # catch and give up on permanently for a condition that will clear
-        # on its own. Shutdown fails a queued waiter before it cancels this
-        # loop, so a supervisor suspended in the connection request above
-        # really does learn about it by exception, not by cancellation.
-        if ($self->{pool} && $self->{pool}{_shutting_down}) {
+        # A pool that has shut down is never going to give us a connection, and
+        # neither is one that is gone entirely. Checked on the pool's own state
+        # rather than matched against $err's text, because PostgreSQL raises
+        # its own "the database system is shutting down" on a restart, which a
+        # message match would also catch and give up on permanently for a
+        # condition that will clear on its own. Shutdown fails a queued waiter
+        # before it cancels this loop, so a supervisor suspended in the
+        # connection request above really does learn about it by exception, not
+        # by cancellation.
+        if (!$self->{pool} || $self->{pool}{_shutting_down}) {
             $self->_log(warn => "PubSub giving up on reconnect: $err");
             return $self;
         }

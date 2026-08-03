@@ -950,7 +950,7 @@ There is no `->retain` left in the distribution.
 The general form: if a future is worth starting, something should own it and something
 should look at how it ends. `->retain` supplies neither.
 
-### 65. Pub/sub reconnect can orphan a pooled connection
+### 65. Pub/sub reconnect can orphan a pooled connection — FIXED
 
 `connect()` and `_reconnect_loop` both decide independently whether to
 reconnect, and neither consults the other. `connect()` shares concurrent
@@ -981,3 +981,14 @@ Fixing this means making the two paths coordinate — either extending the
 `_reconnect_future`, or folding both into a single slot both paths check. That
 is a design change to the reconnect coordination rather than a local fix, so it
 is deliberately not bundled with unrelated work.
+
+Fixed by giving `connect()` sole ownership of the one shared attempt, kept in
+`_connecting`. The supervisor now reaches it the same way any other caller does,
+rather than checking out a connection of its own, so the two paths can no longer
+disagree about which connection is current. Concurrent awaiters each hold a
+`without_cancel` view onto that attempt, so one caller giving up cannot fail it
+for the others still waiting on it, and a count of active awaiters cancels the
+underlying attempt only once the last of them has left. Separately, the listener
+loop was changed to read notifications from the connection it actually polls
+rather than whatever `{conn}` currently holds, closing the other route by which
+two connections could end up coexisting unnoticed.
