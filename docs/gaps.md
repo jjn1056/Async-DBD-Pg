@@ -1162,6 +1162,13 @@ in-progress signal. Anything that gates on `'closing'` — including
 `_run_control_query`'s refusal at `:479` — stops seeing a teardown that
 is still running.
 
+Note for anyone reading the review notes alongside this: `'connecting'`
+has no reader — nothing branches on that value — and was recorded
+separately as a Minor for that reason. The two records do not conflict.
+The *read* side is inert; the *write* side is not, because the assignment
+destroys `'closing'`. Do not conclude from "no reader" that the line can
+be left alone.
+
 Not demonstrated: this is a source reading, not a live reproduction. The
 reproduction needs the database to itself (`kill_backends` in the shared
 suite makes concurrent runs unreliable), so it was deferred rather than
@@ -1262,3 +1269,27 @@ Two related debts it would not have fixed either way:
   attempts to describe that as one tidy mechanism in a comment were all
   wrong; it is three mechanisms, and any future consolidation has to
   start from that.
+
+### 74. `_CheckoutGuard::DESTROY` has no `${^GLOBAL_PHASE}` check
+
+**File:** `PubSub.pm` (`_CheckoutGuard::DESTROY`)
+
+The destructor calls `$conn->release` unconditionally. During global
+destruction the pool and the connection may already have been torn down
+in an unspecified order, so a release firing then can touch objects in a
+partially destroyed state. The other guards in this file weaken their
+reference to the pub/sub object and return early when it is gone;
+`_CheckoutGuard` deliberately holds its connection strongly, because
+nothing else does, so it has no equivalent early-out.
+
+Checked, not assumed: exiting the process with a `notify` in flight and
+the guard still armed produces zero bytes of stderr under both
+`Future::IO::Impl::UV` and `::IOAsync`. The guard gained a second call
+site (`notify`, alongside `_establish`) without that changing, so the
+wider exposure did not make it bite.
+
+Left as recorded rather than fixed: adding
+`return if ${^GLOBAL_PHASE} eq 'DESTRUCT'` is a one-line change, but
+nothing currently demonstrates a failure it would prevent, and a guard
+that silently skips its release is its own hazard if the condition is
+ever wrong.
