@@ -11,6 +11,7 @@ use Test::Async::DBD::Pg qw(skip_without_postgres test_dsn);
 my $dsn = skip_without_postgres();
 
 use Future;
+use Future::AsyncAwait;
 use Future::IO;
 
 BEGIN { Future::IO->load_best_impl; }
@@ -152,10 +153,35 @@ subtest 'cancelling a listen leaves the listener running' => sub {
 
     is $pubsub->{_stopping}, 0, 'listener not left in the stopping state';
 
+    # Checked after the assertion above rather than before it: a further
+    # control query here would complete and restore {_stopping} through its
+    # own guard, masking a broken _ListenerGuard on the cancelled one.
+    is $pubsub->{_control_query}, undef, 'the cancelled control query freed its slot';
+
     $pubsub->notify('cancel_listen_a', 'still here')->get;
     wait_until(sub { @got }, 'notification after the cancelled listen', 3);
 
     is \@got, ['still here'], 'existing subscription still delivering';
+
+    $pubsub->disconnect->get;
+};
+
+subtest 'a control query queued behind a cancelled one is woken, not stranded' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 3,
+    );
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('slot_seed', sub { })->get;
+
+    my $holder = $pubsub->listen('slot_holder', sub { });   # claims the slot, suspends in its query
+    my $queued = $pubsub->listen('slot_queued', sub { });   # parks in the mutex loop
+    $holder->cancel;
+
+    ok $queued->get, 'a control query parked behind a cancelled one is woken';
+    is $pubsub->{_control_query}, undef, 'and the slot is free afterwards';
 
     $pubsub->disconnect->get;
 };
@@ -183,6 +209,235 @@ subtest 'giving up on connect leaves pub/sub usable' => sub {
     wait_until(sub { @got }, 'notification arrived', 3);
 
     is \@got, ['payload'], 'pub/sub works normally afterwards';
+
+    $pubsub->disconnect->get;
+};
+
+subtest 'a caller giving up does not fail another caller' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 3,
+    );
+    my $pubsub = $pg->pubsub;
+
+    # Both arrive before either finishes, so they share one attempt. The
+    # second gives up. The first never did, and must not be punished for it.
+    my $first  = $pubsub->connect;
+    my $second = $pubsub->connect;
+    $second->cancel;
+
+    my $err;
+    my $ok = eval { $first->get; 1 };
+    $err = $@ unless $ok;
+
+    ok $ok, 'the caller that waited still connected'
+        or diag "first caller failed with: $err";
+    ok $pubsub->is_connected, 'and the object is connected';
+
+    $pubsub->disconnect->get;
+};
+
+subtest 'abandoning the only connect releases everything' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 3,
+    );
+    my $pubsub = $pg->pubsub;
+
+    # The last awaiter leaving must cancel the attempt, or the connection is
+    # checked out for a caller that no longer exists.
+    my $abandoned = $pubsub->connect;
+    $abandoned->cancel;
+
+    # A negative property, checked with the negative form: wait_until tests
+    # its condition before ever sleeping, so asserting active_count == 0
+    # here would pass at the instant connect() was called, before the TCP
+    # handshake has run in any universe -- the leak this guards against has
+    # not had a chance to happen yet, whether or not it ever will. Giving it
+    # real wall-clock time to appear, and asserting it did not, is what
+    # actually exercises the guarantee.
+    ok !wait_until(sub { $pg->active_count > 0 }, 'a leaked checkout would appear here', 1),
+        'no connection is left checked out';
+    ok !$pubsub->is_connected, 'and the object is not left connected';
+
+    $pubsub->disconnect->get;
+};
+
+subtest 'disconnecting during a connect does not leave it running' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 3,
+    );
+    my $pubsub = $pg->pubsub;
+
+    # Start a connect and tear down before it can finish. Nothing may be left
+    # checked out to an object that has been disconnected.
+    my $connecting = $pubsub->connect;
+    $pubsub->disconnect->get;
+
+    # Give the abandoned attempt real wall-clock time to reach a terminal
+    # state before checking anything downstream of it. disconnect() never
+    # pumps the event loop here, so checking active_count/is_connected right
+    # away would pass whether or not the attempt was ever actually
+    # cancelled -- the leak this subtest is named for hasn't had a chance to
+    # happen yet in either universe.
+    ok wait_until(sub { $connecting->is_ready }, 'connect settled', 3),
+        'the waiting caller was told';
+
+    ok wait_until(sub { $pg->active_count == 0 }, 'checkout released', 3),
+        'no connection is left checked out after disconnect';
+    ok !$pubsub->is_connected, 'and the object is not connected';
+
+    # A cancelled future surfaces as "Future=HASH(0x...) was cancelled",
+    # which tells them nothing about what happened or whether it was their
+    # fault.
+    like $connecting->failure, qr/PubSub connect was cancelled/,
+        'and told something that explains it';
+
+    $connecting->cancel unless $connecting->is_ready;
+};
+
+# A regression in either of the next two subtests fails by *hanging*, not by
+# a red assertion -- if one of them never finishes, that hang is the
+# failure, not infrastructure flakiness.
+subtest 'disconnecting cancels a control query in flight, not abandons it' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 3,
+    );
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('c1_seed', sub { })->get;
+
+    # Not awaited: still suspended inside its own LISTEN query when
+    # disconnect() below runs. Without a fix, disconnect() has no way to
+    # know this query exists, releases {conn} out from under it, and the
+    # mutex slot this query claimed is never freed -- every later control
+    # query on this object parks in _run_control_query's while loop forever.
+    my $in_flight = $pubsub->listen('c1_in_flight', sub { });
+
+    $pubsub->disconnect->get;
+
+    ok wait_until(sub { $in_flight->is_ready }, 'abandoned query settled', 3),
+        'the abandoned control query settles rather than hanging forever';
+    like $in_flight->failure, qr/PubSub is disconnecting/,
+        'and says why, not a bare "Future=HASH(0x...) was cancelled"';
+    ok !$pubsub->{_control_query}, 'and the mutex slot was not left claimed';
+
+    ok $pubsub->listen('c1_after', sub { })->get,
+        'a fresh listen() after disconnect is not stuck behind the abandoned one';
+
+    $pubsub->disconnect->get;
+};
+
+subtest 'a control query queued behind one abandoned by disconnect is also woken cleanly' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 3,
+    );
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('c1q_seed', sub { })->get;
+
+    # $holder claims the mutex slot and suspends in its own query; $queued
+    # parks behind it in _run_control_query's while loop. Cancelling
+    # $holder's query -- what disconnect() does below -- wakes $queued
+    # synchronously, inside that same cancellation call, before disconnect()
+    # has gone on to release {conn}. A waiter woken this way that cannot
+    # tell teardown is underway would see {conn} still looking valid, issue
+    # its own query on it, and then have disconnect() release that same
+    # connection a moment later with the query still running -- corrupting
+    # it for whichever caller the pool hands it to next.
+    my $holder = $pubsub->listen('c1q_holder', sub { });
+    my $queued = $pubsub->listen('c1q_queued', sub { });
+
+    $pubsub->disconnect->get;
+
+    # Unbounded rather than wait_until: this is the assertion that hangs,
+    # not merely fails, if the queued waiter is left unable to tell
+    # teardown is underway.
+    my $ok  = eval { $queued->get; 1 };
+    my $err = $@;
+    ok !$ok, 'the queued query does not silently succeed once teardown is underway';
+    like $err, qr/PubSub is disconnecting/, 'and reports why';
+    ok !$pubsub->{_control_query}, 'and the mutex slot was not left claimed';
+
+    # The real proof: a completely unrelated connection must still work.
+    my $probe = $pg->connection->get;
+    my $result = $probe->query('SELECT 1 AS n')->get;
+    is $result->first->{n}, 1,
+        'an unrelated connection from the pool is not corrupted by the abandoned query';
+    $probe->release;
+};
+
+subtest 'abandoning a queued connect does not leave a waiter behind' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 1,
+    );
+    my $pubsub = $pg->pubsub;
+
+    # With the only slot held, connect() has to queue behind it in the
+    # pool rather than create a second connection -- this is the branch the
+    # single-attempt version of this test above never reaches, where the
+    # pool's own {waiting} array holds a reference to the queued future
+    # independent of anything connect() itself is holding. Cancelling the
+    # top-level future alone cannot free that entry; only the guard's
+    # explicit ->cancel, propagating back through _establish and
+    # connection(), reaches it.
+    my $held = $pg->connection->get;
+
+    my $queued = $pubsub->connect;
+    ok wait_until(sub { $pg->waiting_count == 1 }, 'connect queued', 3),
+        'connect actually queued behind the held connection';
+
+    $queued->cancel;
+    ok !$pubsub->is_connected, 'not left connected';
+
+    # A cancelled waiter is only spliced out of {waiting} the next time the
+    # pool has a connection to hand out -- _return_connection skips settled
+    # entries lazily rather than the cancellation itself editing the array.
+    # Releasing the held connection is what proves the guard's cancellation
+    # actually reached the queued future, not just this object's own state.
+    $held->release;
+
+    ok wait_until(sub { $pg->waiting_count == 0 }, 'stale waiter cleared', 3),
+        'no waiter left behind for the abandoned caller';
+    ok wait_until(sub { $pg->active_count == 0 }, 'not handed to a ghost', 3),
+        'the connection was not checked out to nobody';
+    is $pg->idle_count, 1, 'the connection went back to idle instead';
+
+    $pubsub->disconnect->get;
+};
+
+subtest 'a queued connect can be ->get directly, without polling first' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 1,
+    );
+    my $pubsub = $pg->pubsub;
+
+    my $held = $pg->connection->get;
+
+    # Release from a timer, so connect() below is still queued behind the
+    # held connection -- not yet ready -- when ->get is called on it
+    # directly. connect()'s shared attempt is _establish()'s own returned
+    # future, whose class comes from whatever it first suspends on: before
+    # the pool's queue branch was fixed to use pending_future, a caller
+    # queued this way got back a future that could never block on ->get,
+    # only croak "is not yet complete and does not provide ->await".
+    my $releaser = Future::IO->sleep(0.1);
+    $releaser->on_done(sub { $held->release });
+
+    ok $pubsub->connect->get,
+        'a connect queued behind pool exhaustion can be ->get directly';
 
     $pubsub->disconnect->get;
 };
@@ -590,6 +845,179 @@ subtest 'listen() during the reconnect backoff does not orphan a connection' => 
         'no orphaned connection left checked out';
 };
 
+subtest 'concurrent control queries on one connection are serialized, not raced' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 5,
+    );
+    my $pubsub = $pg->pubsub;
+
+    # Establishes the connection and its listener loop before the race, so
+    # both calls below reach _run_control_query with nothing else left to
+    # await first.
+    $pubsub->listen('serial_seed', sub { })->get;
+
+    # Two first-subscriptions fired back to back, with neither awaited before
+    # the second is issued: each reaches _run_control_query wanting the same
+    # connection at the same moment. Without serialization, DBD::Pg refuses
+    # the second async query while the first is still in flight and this
+    # fails outright rather than merely racing -- see the mutation check
+    # below.
+    my $f1 = $pubsub->listen('concurrent_a', sub { });
+    my $f2 = $pubsub->listen('concurrent_b', sub { });
+
+    my $ok1  = eval { $f1->get; 1 };
+    my $err1 = $@;
+    ok $ok1, 'first concurrent listen succeeded' or diag $err1;
+
+    my $ok2  = eval { $f2->get; 1 };
+    my $err2 = $@;
+    ok $ok2, 'second concurrent listen succeeded' or diag $err2;
+
+    is $pubsub->subscribed_channels, 3, 'all three channels registered';
+
+    $pubsub->disconnect->get;
+};
+
+subtest 'a reconnect racing a listen takes only one connection' => sub {
+    my @got_before;
+    my @logged;
+    my $pg = Async::DBD::Pg->new(
+        dsn                    => test_dsn(),
+        min_connections        => 0,
+        max_connections        => 5,
+        reconnect              => 1,
+        reconnect_min_interval => 0.1,
+        reconnect_max_interval => 0.1,
+        on_log                 => sub { push @logged, $_[1] },
+    );
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('race_before', sub { push @got_before, $_[1] })->get;
+
+    # Delay exactly one pool checkout, so the listen() below is still in
+    # flight when the supervisor wakes from its backoff. Real contention does
+    # this for free but not reliably; forcing it makes the test deterministic.
+    # The delay lives here rather than in the pool: production code does not
+    # carry test scaffolding.
+    my $orig      = Async::DBD::Pg->can('connection');
+    my $delay_one = 1;
+    no warnings 'redefine';
+    local *Async::DBD::Pg::connection = sub {
+        my ($pool) = @_;
+        return $pool->$orig unless $delay_one;
+        $delay_one = 0;
+        return (async sub {
+            await Future::IO->sleep(0.3);
+            return await $pool->$orig;
+        })->();
+    };
+
+    my $captured = capture_stderr(sub {
+        kill_backends();
+
+        # kill_backends is synchronous DBI and never turns the reactor, so
+        # {connected} still reads stale here. Waiting for the listener to
+        # notice is what actually starts the race: without it, the listen()
+        # below would read the same stale flag, skip connect() entirely, and
+        # try to issue LISTEN on the connection whose backend was just
+        # killed.
+        wait_until(sub { !$pubsub->is_connected }, 'listener noticed', 5);
+    });
+    is $captured, '', 'the termination notice does not reach fd 2';
+    ok scalar(grep { /FATAL:\s+terminating connection due to administrator command/ } @logged),
+        'the termination notice reaches on_log instead';
+
+    # The supervisor is now backing off; this listen races it.
+    $pubsub->listen('race_during', sub { })->get;
+
+    ok wait_until(sub { $pubsub->is_connected }, 'reconnected', 5),
+        'pub/sub came back';
+
+    # A channel subscribed before the race must still deliver afterwards. If
+    # two connections were taken, the listener loop polls one socket while
+    # _process_notifications reads the other, and this notification is dropped
+    # silently -- no error, no log line, and the subscription still reports
+    # itself as active.
+    $pubsub->notify('race_before', 'still here')->get;
+    ok wait_until(sub { @got_before }, 'notification arrived', 5),
+        'a channel subscribed before the race still delivers';
+
+    $pubsub->disconnect->get;
+
+    is $pg->active_count, 0,
+        'no connection was orphaned by the race';
+};
+
+# A regression here fails by hanging or by a missing notification, not by a
+# clean assertion -- if the listener never comes back, that silence is the
+# failure, not infrastructure flakiness.
+subtest 'a reconnect supervisor backing off is not fooled by an ordinary listen() pausing the listener' => sub {
+    my @got_early;
+    my @logged;
+    my $pg = Async::DBD::Pg->new(
+        dsn                    => test_dsn(),
+        min_connections        => 0,
+        max_connections        => 5,
+        reconnect              => 1,
+        reconnect_min_interval => 0.5,
+        reconnect_max_interval => 0.5,
+        on_log                 => sub { push @logged, $_[1] },
+    );
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('i1_early', sub { push @got_early, $_[1] })->get;
+
+    # Delay exactly one control query well past the backoff above, so
+    # {_listener_paused} is still set when the supervisor wakes and checks
+    # {_stopping}. Real contention does this for free -- the window widens
+    # with the number of channels replayed on reconnect -- but not reliably
+    # enough to test against; forcing it makes the test deterministic. The
+    # delay lives here rather than in Connection.pm: production code does
+    # not carry test scaffolding.
+    my $orig_query = Async::DBD::Pg::Connection->can('query');
+    my $delay_one  = 1;
+    no warnings 'redefine';
+    local *Async::DBD::Pg::Connection::query = sub {
+        my ($conn, @args) = @_;
+        return $conn->$orig_query(@args) unless $delay_one;
+        $delay_one = 0;
+        return (async sub {
+            await Future::IO->sleep(1);
+            return await $conn->$orig_query(@args);
+        })->();
+    };
+
+    my $captured = capture_stderr(sub {
+        kill_backends();
+        wait_until(sub { !$pubsub->is_connected }, 'listener noticed', 5);
+    });
+    is $captured, '', 'the termination notice does not reach fd 2';
+    ok scalar(grep { /FATAL:\s+terminating connection due to administrator command/ } @logged),
+        'the termination notice reaches on_log instead';
+
+    # Reconnects on its own and issues the delayed control query above,
+    # pausing the listener for a full second -- long enough for the
+    # supervisor's 0.5s backoff to elapse while it is still paused.
+    $pubsub->listen('i1_late', sub { })->get;
+
+    ok wait_until(sub { $pubsub->is_connected }, 'reconnected', 5),
+        'pub/sub came back';
+
+    # The real proof: a channel subscribed before the race must still
+    # deliver. Before splitting {_stopping} from {_listener_paused}, the
+    # supervisor woke mid-pause, read the shared flag as true, and exited
+    # permanently believing it had been told to stop -- the listener never
+    # restarted and this channel was never re-subscribed on the new
+    # connection, with no error and no log line.
+    $pubsub->notify('i1_early', 'still here')->get;
+    ok wait_until(sub { @got_early }, 'notification arrived', 5),
+        'a channel subscribed before the race still delivers';
+
+    $pubsub->disconnect->get;
+};
+
 subtest 'a failure inside the replay is retried in place, not left to end the supervisor' => sub {
     my @logged;
     my $pg = Async::DBD::Pg->new(
@@ -854,6 +1282,94 @@ subtest 'a failure that escapes through on_log still clears the reconnect slot' 
     }, 'a new supervisor starts after the next death', 5),
         'reconnect re-arms rather than staying permanently dead';
 
+    $pubsub->disconnect->get;
+};
+
+subtest 'the reconnect supervisor gives up when the pool is gone' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn                    => test_dsn(),
+        min_connections        => 0,
+        max_connections        => 3,
+        reconnect              => 1,
+        # Wide enough that the backoff sleep -- during which the supervisor
+        # is suspended and _reconnect_future stays live -- comfortably spans
+        # more than one of wait_until's own 0.05s polls below. At 0.05/0.05
+        # the whole create-backoff-fail-giveup-delete cycle can complete
+        # inside a single gap between polls: giving up is the fast path this
+        # subtest exists to prove, so the future can vanish (deleted by its
+        # own on_ready cleanup) before any poll ever observes it in flight,
+        # failing the assertion below even though the supervisor behaved
+        # correctly. Reproduced deterministically under IOAsync at 0.05/0.05
+        # (5/5 runs); reliable at 0.3/0.3 (5/5 IOAsync, 3/3 UV).
+        reconnect_min_interval => 0.3,
+        reconnect_max_interval => 0.3,
+    );
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('no_pool_test', sub { })->get;
+
+    my $reconnecting;
+
+    # Once the pool is gone, _log has nowhere to send anything and falls back
+    # to warn -- so the "giving up" message lands on file descriptor 2 rather
+    # than on_log, and must be captured and asserted rather than allowed to
+    # escape. That is also the point of the subtest: the supervisor cannot
+    # ever succeed without a pool, so it must stop rather than log forever.
+    my $captured = capture_stderr(sub {
+        delete $pubsub->{pool};
+        kill_backends();
+
+        wait_until(
+            sub {
+                $reconnecting ||= $pubsub->{_reconnect_future};
+                $reconnecting && $reconnecting->is_ready;
+            },
+            'supervisor finished', 5,
+        );
+    });
+
+    ok $reconnecting && $reconnecting->is_ready,
+        'the supervisor stopped instead of retrying forever';
+
+    my @gave_up = ($captured =~ /giving up on reconnect/g);
+    is scalar @gave_up, 1, 'it said so once, on the way out';
+
+    # Restore the weak pool reference so the object is left in its ordinary
+    # shape. disconnect() below never actually touches {pool}: {connected} and
+    # {conn} are already both false here, cleared by the failed attempt's own
+    # cleanup above, so it takes the early-return path with nothing left to
+    # release.
+    $pubsub->{pool} = $pg;
+    $pubsub->disconnect->get;
+};
+
+subtest 'the listener keeps reading the connection it is polling' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 4,
+    );
+    my $pubsub = $pg->pubsub;
+
+    my @got;
+    $pubsub->listen('stale_conn_test', sub { push @got, $_[1] })->get;
+
+    # Simulate what a reconnect does: replace the tracked connection while a
+    # listener loop is already running against the original one. The loop
+    # polls the original socket, so it must also read notifications from the
+    # original connection, not from whatever {conn} happens to hold now.
+    my $original = $pubsub->conn;
+    my $usurper  = $pg->connection->get;
+    $pubsub->{conn} = $usurper;
+
+    $pubsub->notify('stale_conn_test', 'delivered')->get;
+    wait_until(sub { @got }, 'notification arrived', 3);
+
+    is \@got, ['delivered'],
+        'a notification on the polled connection is still delivered';
+
+    $pubsub->{conn} = $original;
+    $usurper->release;
     $pubsub->disconnect->get;
 };
 

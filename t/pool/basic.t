@@ -128,9 +128,10 @@ subtest 'on_connect callback' => sub {
     $conn->release;
 };
 
-# A caller that has to queue waits on a plain Future, which cannot drive the
-# event loop the way a Future::IO one can, so the loop is pumped here until
-# the future settles.
+# Drives the loop until a future settles, without propagating its result
+# the way ->get would. Several tests below want to observe that a queued
+# future has become ready -- for example to assert on the pool's state at
+# that exact point -- before going on to read the value themselves.
 sub settle {
     my ($f, $timeout) = @_;
 
@@ -196,6 +197,32 @@ subtest 'a queued caller is served when a connection frees up' => sub {
 
     my $r = $conn->query('SELECT 1 AS n')->get;
     is $r->first->{n}, 1, 'handed over connection works';
+
+    $conn->release;
+};
+
+subtest 'a queued caller can ->get its future directly, without settling first' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 1,
+        queue_timeout   => 5,
+    );
+
+    my $held = $pg->connection->get;
+
+    # Release from a timer, so the request below is still queued -- not yet
+    # ready -- at the moment ->get is called on it directly. This is the
+    # documented, synchronous way every other example in this file acquires
+    # a connection; a caller genuinely queued behind another needs to be
+    # able to use it too, blocking on pending_future's reactor-aware ->await
+    # (see Async::DBD::Pg::Util) rather than only succeeding when the future
+    # happens to already be ready.
+    my $releaser = Future::IO->sleep(0.1);
+    $releaser->on_done(sub { $held->release });
+
+    my $conn = $pg->connection->get;
+    ok $conn, 'a queued connection request can be ->get directly';
 
     $conn->release;
 };

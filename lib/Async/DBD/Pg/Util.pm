@@ -3,8 +3,9 @@ package Async::DBD::Pg::Util;
 use strict;
 use warnings;
 use Exporter 'import';
+use Future::IO;
 
-our @EXPORT_OK = qw(convert_placeholders parse_dsn safe_dsn);
+our @EXPORT_OK = qw(convert_placeholders parse_dsn safe_dsn pending_future);
 
 # Convert named placeholders (:name) to positional ($1, $2, ...)
 sub convert_placeholders {
@@ -144,6 +145,33 @@ sub safe_dsn {
     return $uri;
 }
 
+# A leaf future for a caller to be manually completed later, e.g. a queued
+# pool waiter or a mutex slot -- anything that has to hand a Future to a
+# caller before the real work it represents exists yet.
+#
+# Future::AsyncAwait builds the pending placeholder an async sub returns when
+# it suspends by cloning whatever future it is suspended on (Future's own
+# AWAIT_CLONE is "shift->new"), so that placeholder is always the same class
+# as the thing being awaited. A plain Future->new has no event-loop of its
+# own, so a caller suspended on one -- even several calls down, since the
+# cloning nests through every suspended async sub in the chain -- gets back a
+# future whose ->get can never block, only croak once it isn't already ready.
+# Cloning from a real Future::IO future instead gives every future this
+# returns the reactor-aware ->await a caller's top-level ->get needs.
+#
+# Built fresh each call rather than cloned from a cached prototype: caching
+# would fix the class at whichever implementation was loaded on first use,
+# and a consumer that installs a mock implementation later via
+# Future::IO->override_impl -- the documented way to test Future::IO code --
+# would silently get a real-implementation future back from a mocked
+# reactor. The cost of not caching is one timer create-and-cancel per call,
+# noise beside the database round trip this is used around.
+sub pending_future {
+    my $f = Future::IO->sleep(0);
+    $f->cancel;
+    return $f->new;
+}
+
 1;
 
 __END__
@@ -206,6 +234,23 @@ so options such as C<?sslmode=require> reach the driver.
 Replaces the password in a URI with C<***>, for a DSN about to be logged or
 put into an error message. Anything that reports a DSN should pass it through
 here first.
+
+=head2 pending_future
+
+    my $f = pending_future();
+    ...
+    $f->done($result);   # or $f->fail($error), or $f->cancel
+
+Returns a new, not-yet-ready L<Future>, for code that must hand a caller a
+future before the work it represents exists yet -- a queued pool waiter, or a
+mutex slot a later caller will complete.
+
+Unlike a bare C<< Future->new >>, a future from here is safe to C<get> or
+top-level C<await> directly, even while a caller is suspended on nothing but
+this future several C<async sub> calls deep: it is cloned from a real
+L<Future::IO> future, so it carries the same event-loop-aware C<await> that
+blocking on it requires, rather than the plain L<Future> base class's, which
+can only croak if asked to block on something not yet ready.
 
 =head1 AUTHOR
 

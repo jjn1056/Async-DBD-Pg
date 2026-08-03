@@ -138,6 +138,38 @@ subtest 'backoff delay is jittered within its ceiling' => sub {
     }
 };
 
+subtest '_AwaiterGuard checks identity before touching a different attempt' => sub {
+    my $pubsub = Async::DBD::Pg::PubSub->new();
+
+    my $attempt_a = Future->new;
+    my $attempt_b = Future->new;
+
+    # Attempt A in flight, one guard holding it -- the same pattern
+    # connect() uses: set the slot, then construct the guard.
+    $pubsub->{_connecting}         = $attempt_a;
+    $pubsub->{_connecting_waiters} = 0;
+    my $guard = Async::DBD::Pg::PubSub::_AwaiterGuard->new($pubsub, $attempt_a);
+
+    # Simulate A being cleared and a later connect() starting attempt B,
+    # with a real waiter of its own -- the ordering the identity check
+    # exists to defend even though nothing in today's call patterns can
+    # currently produce it (see task-2-review.md). A's guard, above, has
+    # not been destroyed yet.
+    $pubsub->{_connecting}         = $attempt_b;
+    $pubsub->{_connecting_waiters} = 1;
+
+    # A's guard is destroyed now, belatedly, after B has already taken
+    # over the slot.
+    undef $guard;
+
+    ok defined $pubsub->{_connecting}, 'the current attempt was not deleted';
+    is refaddr($pubsub->{_connecting}), refaddr($attempt_b),
+        'the current attempt is still attempt B, untouched';
+    is $pubsub->{_connecting_waiters}, 1,
+        "attempt B's own waiter count is untouched";
+    ok !$attempt_b->is_cancelled, 'attempt B was not cancelled';
+};
+
 subtest 'reconnect settings are taken from the pool' => sub {
     my $off = Async::DBD::Pg->new(
         dsn             => 'postgresql://user:secret@localhost/test',

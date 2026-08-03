@@ -65,7 +65,7 @@ DATABASE_URL="postgresql://postgres:test@localhost:5432/test" perl -Ilib example
 
 - **Async::DBD::Pg::Error** (`lib/Async/DBD/Pg/Error.pm`) - Error class hierarchy with stringification overload. Subclasses: `Error::Query` (with SQLSTATE), `Error::Connection`, `Error::PoolExhausted`, `Error::Timeout`.
 
-- **Async::DBD::Pg::Util** (`lib/Async/DBD/Pg/Util.pm`) - Pure functions: `parse_dsn()`, `convert_placeholders()` (`:name` to `$1`), `safe_dsn()` (password masking).
+- **Async::DBD::Pg::Util** (`lib/Async/DBD/Pg/Util.pm`) - Shared helpers: `parse_dsn()`, `convert_placeholders()` (`:name` to `$1`), `safe_dsn()` (password masking), `pending_future()` (a reactor-safe leaf `Future` for queued waiters and mutex slots).
 
 ### Key Design Decisions
 
