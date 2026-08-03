@@ -150,10 +150,12 @@ async sub _establish {
     $self->{connected} = 1;
     $self->{_stopping} = 0;
 
-    # A stale {_listener_paused} from a previous session's disconnect()
-    # (whose own direct _stop_listener call sets it but has no
-    # _ListenerGuard to clear it) would otherwise make the listener loop
-    # this starts below refuse to ever poll, having never run once.
+    # A stale {_listener_paused} from a previous session's disconnect() --
+    # whose own _stop_listener call sets it, relying on an explicit delete
+    # further down rather than a guard, so a disconnect cancelled before
+    # reaching that delete leaves it set -- would otherwise make the
+    # listener loop this starts below refuse to ever poll, having never run
+    # once.
     delete $self->{_listener_paused};
 
     await $self->_start_listener;
@@ -516,13 +518,6 @@ async sub _run_control_query {
 
     await $self->_stop_listener if $self->{_listener_future};
 
-    # Stopping the listener set {_listener_paused}, and the listener loop
-    # refuses to run while it is set. A guard puts it back and restarts the
-    # listener however this ends: on success, on a failed statement, and on
-    # a caller cancelling while the statement is in flight, which stops
-    # this sub where it stands and runs nothing after the await.
-    my $listener = Async::DBD::Pg::PubSub::_ListenerGuard->new($self);
-
     # Held outside the eval so it can be asked about after: a cancelled
     # future reaches its awaiter as "Future=HASH(0x...) was cancelled" -- an
     # address and no explanation, same as connect() guards against for its
@@ -554,7 +549,6 @@ async sub _run_control_query {
     };
     my $err = $@;
 
-    $listener->restore;
     $query_guard->release;
 
     # $query->is_cancelled here can only mean teardown cancelled it: a
@@ -615,10 +609,11 @@ async sub disconnect {
         return $self;
     }
 
-    # The direct call below sets {_listener_paused}, same as any other
-    # caller, but there is no _ListenerGuard here to clear it afterward --
-    # done explicitly below instead, or a later _establish would find it
-    # already set and its fresh listener loop would refuse to ever poll.
+    # The call below sets {_listener_paused}, same as any other caller, but
+    # unlike _run_control_query's call -- where releasing the guard clears it
+    # again -- nothing here does that automatically. Cleared explicitly below
+    # instead, or a later _establish would find it already set and its fresh
+    # listener loop would refuse to ever poll.
     await $self->_stop_listener if $self->{_listener_future};
 
     if (my $conn = delete $self->{conn}) {
@@ -684,59 +679,12 @@ sub DESTROY {
     $self->_pool_shutdown;
 }
 
-package Async::DBD::Pg::PubSub::_ListenerGuard;
-
-# Clears the stopping flag and starts the listener again. Restoring from a
-# destructor as well as explicitly covers a caller cancelling the control
-# query, which would otherwise leave the flag set and the listener stopped,
-# so notifications would stop arriving with nothing to say why.
-
-use strict;
-use warnings;
-use Scalar::Util qw(weaken);
-
-sub new {
-    my ($class, $pubsub) = @_;
-
-    my $self = bless { pubsub => $pubsub }, $class;
-    weaken($self->{pubsub});
-
-    return $self;
-}
-
-sub restore {
-    my ($self) = @_;
-
-    my $pubsub = delete $self->{pubsub} or return;
-
-    # Only the pause this guard put on, never {_stopping}: that flag means
-    # teardown, set only by disconnect()/_pool_shutdown()/DESTROY, and this
-    # guard has no business clearing something it did not set -- doing so
-    # unconditionally is what let a control query's own cleanup clobber a
-    # teardown in progress.
-    delete $pubsub->{_listener_paused};
-    return unless $pubsub->{connected};
-
-    # Starting the listener only builds the loop's future and stores it on
-    # the object; it awaits nothing itself, so it completes at once and is
-    # safe to call from a destructor. The loop it starts is held as
-    # _listener_future, so there is nothing here to retain, only a failure
-    # worth reporting rather than dropping.
-    my $started = $pubsub->_start_listener;
-
-    $started->on_fail(sub {
-        my ($err) = @_;
-        $pubsub->_log(warn => "Could not restart listener: $err");
-    });
-}
-
-sub DESTROY { shift->restore }
-
 # Releases the one-at-a-time slot _run_control_query claims on {_control_query}
-# before touching the connection. Released from a destructor as well as
-# explicitly, so a caller cancelling mid-query still frees the slot for
-# whoever is waiting instead of leaving them stuck forever -- the same reason
-# _ListenerGuard above restores from both places.
+# and restarts the listener, in that order: the listener's own run condition
+# reads that slot, so restarting it first would start a loop that exits on
+# its first check with nothing left to restart it. Released from a destructor
+# as well as explicitly, so a caller cancelling mid-query still frees the slot
+# and restarts the listener instead of leaving both stuck.
 package Async::DBD::Pg::PubSub::_ControlQueryGuard;
 
 use strict;
@@ -755,25 +703,36 @@ sub new {
 sub release {
     my ($self) = @_;
 
-    my $done = delete $self->{done} or return;
+    my $done   = delete $self->{done} or return;
     my $pubsub = delete $self->{pubsub};
 
-    # Cleared before $done is marked ready: a waiter's while loop resumes as
-    # soon as that happens, possibly synchronously in this same call, and
-    # would otherwise see the slot still occupied and await the same future
-    # again for nothing. Checked against $done's identity in case this guard
-    # somehow outlives its slot, so it can never clear a claim it didn't make.
-    if ($pubsub && $pubsub->{_control_query} && refaddr($pubsub->{_control_query}) == refaddr($done)) {
+    # Slot first, listener second. The listener's own run condition reads
+    # this slot, so restarting it while the slot is still claimed would start
+    # a loop that exits on its first check with nothing left to restart it.
+    if ($pubsub && $pubsub->{_control_query}
+        && refaddr($pubsub->{_control_query}) == refaddr($done)) {
         delete $pubsub->{_control_query};
     }
-
-    # Not identity-checked like the slot above: the mutex already guarantees
-    # only one control query is ever in flight at a time, so whatever is
-    # here when this guard releases can only be the query this same claim
-    # issued -- or nothing, if it never got that far before ending.
     delete $pubsub->{_control_query_inflight} if $pubsub;
-
     $done->done unless $done->is_ready;
+
+    # Only the pause this guard's _stop_listener call put on, never
+    # {_stopping}: that flag means teardown, set only by
+    # disconnect()/_pool_shutdown()/DESTROY, and this guard has no business
+    # clearing something it did not set -- doing so unconditionally is what
+    # let a control query's own cleanup clobber a teardown in progress. The
+    # listener loop refuses to run while this is set, so leaving it here
+    # would make _start_listener below build a loop that exits on its first
+    # check with nothing left to restart it.
+    delete $pubsub->{_listener_paused} if $pubsub;
+
+    return unless $pubsub && $pubsub->{connected};
+
+    my $started = $pubsub->_start_listener;
+    $started->on_fail(sub {
+        my ($err) = @_;
+        $pubsub->_log(warn => "Could not restart listener: $err");
+    });
 }
 
 sub DESTROY { shift->release }

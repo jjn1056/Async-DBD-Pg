@@ -155,7 +155,7 @@ subtest 'cancelling a listen leaves the listener running' => sub {
 
     # Checked after the assertion above rather than before it: a further
     # control query here would complete and restore {_stopping} through its
-    # own guard, masking a broken _ListenerGuard on the cancelled one.
+    # own guard, masking a broken restart on the cancelled one.
     is $pubsub->{_control_query}, undef, 'the cancelled control query freed its slot';
 
     $pubsub->notify('cancel_listen_a', 'still here')->get;
@@ -1370,6 +1370,35 @@ subtest 'the listener keeps reading the connection it is polling' => sub {
 
     $pubsub->{conn} = $original;
     $usurper->release;
+    $pubsub->disconnect->get;
+};
+
+subtest 'the slot is free before the listener is restarted' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn => test_dsn(), min_connections => 0, max_connections => 3,
+    );
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('order_seed', sub { })->get;
+
+    # Whatever restarts the listener must see a free slot. Two guards
+    # destroyed in reverse declaration order restart it while the slot is
+    # still claimed, which Task 3's derived pause turns into a listener that
+    # exits immediately and is never started again.
+    my $slot_at_restart = 'unset';
+    no warnings 'redefine';
+    my $orig = Async::DBD::Pg::PubSub->can('_start_listener');
+    local *Async::DBD::Pg::PubSub::_start_listener = sub {
+        my ($ps) = @_;
+        $slot_at_restart = $ps->{_control_query} ? 'HELD' : 'free';
+        return $ps->$orig;
+    };
+
+    $pubsub->listen('order_probe', sub { })->get;
+
+    is $slot_at_restart, 'free',
+        'the control-query slot was released before the listener restarted';
+
     $pubsub->disconnect->get;
 };
 
