@@ -1126,7 +1126,7 @@ current lazy-splice behaviour and documents it; adding a proper
 `on_cancel` will need that comment and its `waiting_count` assertions
 revisited.
 
-### 70. `connect()` racing `disconnect()`'s `UNLISTEN *` can leave a connection checked out to an object reporting itself disconnected
+### 70. `connect()` racing `disconnect()`'s `UNLISTEN *` can leave a connection checked out to an object reporting itself disconnected — FIXED
 
 **File:** `PubSub.pm` (`disconnect`, `_establish`)
 
@@ -1169,65 +1169,81 @@ The *read* side is inert; the *write* side is not, because the assignment
 destroys `'closing'`. Do not conclude from "no reader" that the line can
 be left alone.
 
-Not demonstrated: this is a source reading, not a live reproduction. The
-reproduction needs the database to itself (`kill_backends` in the shared
-suite makes concurrent runs unreliable), so it was deferred rather than
-run alongside other work. Confirm before fixing.
+**Demonstrated, then fixed.** The source reading above was confirmed by
+reproduction under both `Future::IO::Impl::UV` and `::IOAsync`: widening
+the `UNLISTEN *` await and letting an ordinary `connect()` arrive in the
+window leaves `active=1 idle=1`, `is_connected` false, and `{conn}` still
+holding a connection — a live checkout behind an object reporting itself
+disconnected, with no error and no log line. `shutdown` still returns, so
+the symptom is the stranded checkout rather than a wedged pool.
 
-### 71. The listener's pause around control queries may be defensive rather than load-bearing
+Fixed in `connect()`, the only route into `_establish`: it now refuses
+with `Error::Connection` while `{phase}` is `'closing'`, matching
+`_run_control_query`, which already declines the same way and with the
+same message once teardown has begun. Refusing rather than queueing keeps
+the two teardown-time refusals identical, and `'closing'` stays
+non-terminal — once the disconnect settles, `{phase}` is `'disconnected'`
+and connecting works again.
 
-**File:** `PubSub.pm:303-305` (`_listener_loop`), `_stop_listener` /
-`_start_listener`, `_ControlQueryGuard::release` (`:748`)
+This also closes the wrinkle above by construction: `_establish` was the
+only writer of `{phase} = 'connecting'`, and it is now unreachable while
+teardown holds `'closing'`, so the assignment can no longer destroy the
+in-progress signal.
 
-Every control query stops the listener, runs, and restarts it. The stated
-reason is that the listener and the query would otherwise collide on one
-DBD::Pg handle. That collision may not exist.
+Covered by `t/integration/pubsub.t`'s `'a connect arriving during
+teardown does not strand a connection'`, which asserts the invariant
+(nothing checked out, nothing held) separately from this build's chosen
+resolution (the refusal), and pins that a connect after teardown settles
+still works. Mutation-verified: removing the refusal reds the
+stranded-checkout assertions, not merely the refusal ones.
 
-**The evidence it does not.** A mutation stripping *both* slot checks
-from `_listener_loop` — so the listener calls `_process_notifications`
-(and thus `PQconsumeInput`) on a handle with an async query in flight —
-survives the entire suite under both `Future::IO::Impl::UV` and
-`::IOAsync`, including the subtest that deliberately widens the window
-with a 1s-delayed control query. A reviewer then traced DBD::Pg's C
-implementation and found no mechanism for the collision:
+### 71. The listener's pause around control queries is load-bearing — RESOLVED, and it exposed item 75
 
-- `_process_notifications` calls exactly one DBD::Pg method, `pg_notifies`
-  = `PQconsumeInput()` + `PQnotifies()`. It never touches
-  `imp_dbh->async_status` (the per-connection outstanding-async-command
-  flag) and never calls `PQgetResult` or `PQsendQuery`.
-- `pg_ready` is gated on the *statement's* own `async_status`, which only
-  `_execute_async` sets. The listener path never touches it.
-- The actually-forbidden operation — a second `PQsendQuery`-class call
-  before the first's result is drained — is what `{_control_query}`'s
-  mutex already prevents, and `_process_notifications` issues no query.
-- `PQconsumeInput` from two alternating call sites is libpq's documented
-  mechanism for this exact combination: checking an outstanding async
-  command's progress while draining pending NOTIFYs on one connection. A
-  message split across reads stays buffered until complete regardless of
-  which call site reads it; there is no per-caller state to corrupt.
+**File:** `PubSub.pm` (`_listener_loop`, `_stop_listener`, `_ControlQueryGuard::release`)
 
-**Why it is not settled.** The reviewer attached three caveats and
-stopped short of a verdict, landing on "probably not load-bearing for the
-collision the comments name":
+This item previously recorded that the pause was "probably not load-bearing"
+and that the stop/restart dance could likely be deleted. **That conclusion was
+wrong.** The fragmentation experiment it called for was run, and it reversed
+the verdict.
 
-1. It read DBD::Pg 3.16.3's `dbdimp.c` from a stale build cache, not the
-   installed 3.20.2 the suite runs against, and did not diff the two.
-2. It reasoned about protocol demultiplexing, not DBD::Pg-internal
-   bookkeeping, and traced only the success path — not whether either
-   call site could stomp the other's view of `errstr`.
-3. Three conditions would have to hold for the pause to matter, none
-   confirmed: (a) a result or notification split across multiple socket
-   reads (slow link, large payload); (b) a window where both pollers
-   genuinely race rather than one finishing before the other wakes;
-   (c) `PQconsumeInput` / `pg_ready` / `pg_notifies` interleaving safely
-   in the DBD::Pg and libpq versions actually in use.
+Removing the pause entirely — no `_stop_listener`, no restart, no slot checks
+in `_listener_loop` — deadlocks the *first* control query, reproducibly, under
+both `Future::IO::Impl::UV` and `::IOAsync`:
 
-**Before acting on this**, run the fragmentation experiment: split a
-response across several small writes with a delay, mirroring the existing
-1s-delay trick, and exercise the error path. That converts source-level
-reasoning into an observed result. If it confirms the reading, the whole
-stop/restart dance and both slot checks in `_listener_loop` can go — the
-single largest simplification available in this file.
+    [ctl] issuing: LISTEN frag
+    [listener] poll woke, consuming
+        ...the query never completes
+
+Both the listener and the in-flight query poll the same fd. Whichever wakes
+first calls `PQconsumeInput` and drains the socket; the other is parked in
+`Future::IO->poll` waiting for readability that has already been consumed, and
+nothing will make that fd readable again. The collision is **readiness theft**,
+not data corruption.
+
+That is why the earlier source analysis missed it. It examined protocol
+demultiplexing and payload integrity, and was correct about both — libpq does
+buffer partial messages safely, and two call sites consuming input do not
+corrupt each other. It simply never asked who owns the socket's *readiness*.
+
+It also explains why the earlier mutation survived the whole suite. That
+mutation stripped only `_listener_loop`'s slot checks while leaving
+`_stop_listener` in place, so the listener was still stopped for the duration
+of every control query and the collision was never reachable. It was testing
+the second line of defence while the first still held — an equivalent mutant,
+for a reason that could not be seen without removing both.
+
+**The pause stays. Do not delete the stop/restart dance.** Its cost was
+measured and is not the problem: during a real `LISTEN`, delivery latency is
+1.7 ms against a 1.2 ms idle baseline. It is not a sleep — `_stop_listener`
+cancels the poll and awaits the teardown, and the event loop is never blocked.
+
+The comparison that settled the design is Mojo::Pg, which has no pause because
+it has no second reader: one `io` watcher on the socket drains notifications
+first and then checks whether the in-flight query's result is ready. Collapsing
+to a single reader remains the only way to remove the pause, and it is a real
+refactor of `_run_control_query` and the listener rather than a deletion —
+`Connection` is shared with ordinary pooled queries, so it would either
+special-case the pub/sub connection or change the generic query path.
 
 ### 72. The `closing` phase does double duty
 
@@ -1293,3 +1309,61 @@ Left as recorded rather than fixed: adding
 nothing currently demonstrates a failure it would prevent, and a guard
 that silently skips its release is its own hazard if the condition is
 ever wrong.
+
+### 75. Notifications arriving during a control query stalled indefinitely — FIXED
+
+**File:** `PubSub.pm` (`_listener_loop`)
+
+Found by the experiment item 71 called for, not by the review that
+requested it.
+
+`Future::IO->poll` reports on the **socket**; `pg_notifies` and `pg_ready`
+both consume from the socket into **libpq's internal buffer**. Those are
+different places, and the listener waited on the wrong one.
+
+A notification arriving while a control query held the pause was consumed
+off the socket by that query's own `pg_ready`, together with the result it
+was waiting for. When the query finished and the guard restarted the
+listener, the loop's first act was `await Future::IO->poll($sock, POLLIN)`
+— on a socket with nothing left on it. `pg_notifies` was never called, so
+the notification sat in the buffer, invisible, until unrelated later
+traffic happened to make the socket readable again. On a quiet connection
+— the ordinary pub/sub case — that is never.
+
+Silent and unbounded: no error, no log line, and the notification is not
+lost, merely undeliverable. Measured before the fix, 4 rounds of 40
+notifications each: 120/160 delivered, and still 120/160 after a 25-second
+uncontended drain. One further unrelated `NOTIFY` then released the entire
+backlog at once — 161 — which is what proved they were buffered rather
+than dropped.
+
+Fixed by draining before parking rather than after waking:
+
+    while ($self->{phase} eq 'live' && !$self->{_control_query}) {
+        $self->_process_notifications($conn);
+        await Future::IO->poll($sock, POLLIN);
+        last unless $self->{phase} eq 'live' && !$self->{_control_query};
+    }
+
+The pause now always ends in a drain, so nothing can be stranded across
+one. The connection's own query path already had this ordering right —
+`_wait_for_result` checks `pg_ready` before polling — and the listener was
+the only reader doing it backwards. 160/160 after, both implementations.
+
+**Why there is no delivery *during* a control query, and no test asserting
+it.** An earlier version of this fix added a `Connection` input-observer
+hook so the query's own poll loop would drain notifications while it ran.
+It was removed: PostgreSQL does not send `NOTIFY` to a backend that is
+busy executing a command. Measured — with a `NOTIFY` sent 50 ms into a 2 s
+query on the listening connection, that connection's socket did not become
+readable until the query completed. There is nothing to deliver mid-query,
+so the hook could only ever repeat, a few milliseconds earlier, what the
+listener restart already does. Delivery latency during a real `LISTEN` is
+1.7 ms against a 1.2 ms idle baseline.
+
+Covered by `t/integration/pubsub.t`'s `'a notification arriving during a
+control query needs no later traffic to appear'` — which sends nothing
+after the notification, so a build that depends on a later socket wake
+fails — and `'a notification queued during a long control query arrives
+promptly after it'`. Mutation-verified: restoring the old ordering reds
+both.

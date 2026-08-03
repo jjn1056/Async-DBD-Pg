@@ -1735,4 +1735,152 @@ subtest 'phase reports the lifecycle, and teardown cannot disagree with itself' 
     ok !$pubsub->is_connected, 'and is_connected agrees';
 };
 
+subtest 'a connect arriving during teardown does not strand a connection' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn => test_dsn(), min_connections => 0, max_connections => 4,
+    );
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('teardown_race', sub { })->get;
+    is $pg->active_count, 1, 'the pub/sub holds its connection to start with';
+
+    # disconnect() has one real suspension between deciding to tear down and
+    # finishing -- the UNLISTEN * it issues on the way out. Widening it opens
+    # the window a caller has to arrive in; the flag lets the test wait for
+    # teardown to actually reach it rather than guessing with a sleep.
+    my $unlisten_started = 0;
+    no warnings 'redefine';
+    my $orig_query = Async::DBD::Pg::Connection->can('query');
+    local *Async::DBD::Pg::Connection::query = async sub {
+        my ($conn, $sql, @bind) = @_;
+        if ($sql eq 'UNLISTEN *') {
+            $unlisten_started = 1;
+            await Future::IO->sleep(0.5);
+        }
+        return await $conn->$orig_query($sql, @bind);
+    };
+
+    my $disconnecting = $pubsub->disconnect;
+    ok wait_until(sub { $unlisten_started }, 'teardown reached UNLISTEN *', 3),
+        'teardown is suspended mid-UNLISTEN, with the window open';
+
+    # An ordinary caller -- a listen(), or the reconnect supervisor -- arriving
+    # now. Teardown has already passed the point where it cancels an in-flight
+    # attempt, so nothing downstream of here will clean this one up.
+    my $connecting  = $pubsub->connect;
+    $disconnecting->get;
+    my $established = eval { $connecting->get; 1 };
+    my $err         = $@;
+
+    # The invariant, independent of how the race is resolved: teardown must not
+    # leave a live checkout behind an object that reports itself disconnected.
+    ok !$pubsub->is_connected, 'the pub/sub reports itself disconnected';
+    ok !defined $pubsub->{conn},
+        'no connection is held by a pub/sub that reports itself disconnected';
+    ok wait_until(sub { $pg->active_count == 0 }, 'checkout released', 3),
+        'no connection is left checked out to the torn-down pub/sub';
+
+    # How this build resolves it: refuse, matching _run_control_query, which
+    # already declines to start work once {phase} is 'closing'.
+    ok !$established, 'the racing connect is refused rather than establishing';
+    like $err, qr/disconnect/i, 'the caller is told teardown was in progress';
+
+    # Teardown finishing must leave the object usable again, not permanently
+    # wedged -- 'closing' is a phase, not a terminal state for a fresh connect.
+    $pubsub->listen('teardown_race_after', sub { })->get;
+    ok $pubsub->is_connected, 'a connect after teardown settles still works';
+    $pubsub->disconnect->get;
+    ok wait_until(sub { $pg->active_count == 0 }, 'released again', 3),
+        'and that connection is released too';
+
+    $pg->shutdown->get;
+};
+
+subtest 'a notification arriving during a control query needs no later traffic to appear' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn => test_dsn(), min_connections => 0, max_connections => 4,
+    );
+    my $pubsub = $pg->pubsub;
+
+    my @got;
+    $pubsub->listen('stall', sub { push @got, $_[1] })->get;
+    my $notifier = $pg->connection->get;
+
+    # Fire a NOTIFY inside a control query's window. The listener is stopped
+    # for the duration, so the notification's bytes are consumed off the
+    # socket by the control query's own pg_ready and land in libpq's buffer.
+    # Nothing after this sends anything else on the connection: if delivery
+    # depends on a later socket wake, it never arrives.
+    my $fired = 0;
+    no warnings 'redefine';
+    my $orig_query = Async::DBD::Pg::Connection->can('query');
+    local *Async::DBD::Pg::Connection::query = async sub {
+        my ($conn, $sql, @bind) = @_;
+        if (!$fired && $sql =~ /^LISTEN/ && $sql =~ /stall_probe/) {
+            $fired = 1;
+            await $notifier->$orig_query("SELECT pg_notify('stall', 'during')");
+
+            # Settle before the control statement is issued, so its bytes are
+            # already on the socket when the first pg_ready runs. That check
+            # consumes them and can report the result ready without ever
+            # polling -- so nothing on the query's side of the connection gets
+            # a chance to drain, and only the listener's own ordering can.
+            await Future::IO->sleep(0.3);
+        }
+        return await $conn->$orig_query($sql, @bind);
+    };
+
+    $pubsub->listen('stall_probe', sub { })->get;
+    ok $fired, 'the notification was fired inside the control query window';
+
+    ok wait_until(sub { @got }, 'notification delivered', 5),
+        'delivered without any further traffic on the connection';
+    is $got[0], 'during', 'and it is the notification sent during the window';
+
+    $pubsub->disconnect->get;
+    $notifier->release;
+    $pg->shutdown->get;
+};
+
+subtest 'a notification queued during a long control query arrives promptly after it' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn => test_dsn(), min_connections => 0, max_connections => 4,
+    );
+    my $pubsub = $pg->pubsub;
+
+    my @got;
+    $pubsub->listen('inflight', sub { push @got, { payload => $_[1], at => time } })->get;
+    my $notifier = $pg->connection->get;
+
+    # Deliberately NOT asserting delivery *during* the query: PostgreSQL does
+    # not send NOTIFY to a backend that is busy running a command, so nothing
+    # can arrive mid-statement to be delivered. Measured -- with a NOTIFY sent
+    # 50ms into a 2s query on this connection, its socket did not become
+    # readable until the query finished.
+    #
+    # What that means for us: the notification reaches the client together
+    # with the query's result, and pg_ready consumes both into libpq's buffer
+    # while the listener is paused. So the property worth pinning is that the
+    # listener drains that buffer when it resumes, bounded by the query it
+    # waited behind rather than waiting for unrelated traffic.
+    #
+    # _run_control_query rather than listen(): every public control statement
+    # is a sub-millisecond LISTEN/UNLISTEN, too short to hold the pause open.
+    my $control = $pubsub->_run_control_query('SELECT pg_sleep(0.5)');
+    $notifier->query("SELECT pg_notify('inflight', 'mid')")->get;
+    $control->get;
+    my $finished = time;
+
+    ok wait_until(sub { @got }, 'notification delivered', 3),
+        'the notification queued behind the control query is delivered';
+    is $got[0]{payload}, 'mid', 'and carries the right payload';
+
+    my $lag = $got[0]{at} - $finished;
+    ok $lag < 0.5, sprintf('delivered promptly once the pause lifted (%.3fs)', $lag);
+
+    $pubsub->disconnect->get;
+    $notifier->release;
+    $pg->shutdown->get;
+};
+
 done_testing;
