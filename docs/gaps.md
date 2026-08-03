@@ -1131,19 +1131,134 @@ revisited.
 **File:** `PubSub.pm` (`disconnect`, `_establish`)
 
 `disconnect()` has one real suspension between deciding to tear down and
-finishing: `await $conn->query('UNLISTEN *')`. A `connect()` (via an
-ordinary `listen()`, or the reconnect supervisor) arriving during that
-window runs `_establish`, which sets `connected = 1` and checks out a
-fresh connection independently of what `disconnect()` is doing. When
-`disconnect()` resumes and finishes, it unconditionally sets
-`connected = 0` — clobbering the `connect()` that ran concurrently. The
-result: `connected` reads false, `{conn}` still holds a real, checked-out
-connection, and `active_count` stays at 1. A connection is held by an
-object that reports itself disconnected, with no error and no log line —
-item 65's failure mode, arriving through a different door than the one
-that item closed.
+finishing: `await $conn->query('UNLISTEN *')` (`:583`). A `connect()` (via
+an ordinary `listen()`, or the reconnect supervisor) arriving during that
+window runs `_establish`, which checks out a fresh connection
+independently of what `disconnect()` is doing. When `disconnect()`
+resumes it unconditionally sets the terminal state (`:590`) — clobbering
+the `connect()` that ran concurrently. The result: the object reports
+itself disconnected, `{conn}` still holds a real checked-out connection,
+and `active_count` stays at 1, with no error and no log line — item 65's
+failure mode, arriving through a different door than the one that item
+closed.
 
-Pre-existing, not introduced by this branch's fix wave — identical at
-`781bc9b`, the commit before it. Not fixed here; recorded because
-`docs/gaps.md` is now the register and this was found while verifying
-adjacent work, not because it is in scope for this branch.
+Pre-existing, not introduced by the fix wave that found it — identical at
+`781bc9b`, the commit before it.
+
+**Survives the phase model, and gained a wrinkle.** The mechanism above
+was originally written in terms of a `connected` boolean; the phase-model
+branch replaced that boolean with `{phase}` and the race came through
+unchanged, so the description is restated here against the current code.
+`disconnect()` now cancels an in-flight `{_connecting}` early (`:566`),
+which closes the case where an attempt was *already* running — but a
+`connect()` arriving later, at the `UNLISTEN *` await, creates a fresh
+attempt that teardown has already passed. `disconnect()` deletes `{conn}`
+before that await and releases only the connection it captured, so the
+new checkout is the one left stranded.
+
+The wrinkle: `_establish` opens by setting `{phase} = 'connecting'`
+(`:146`), overwriting the `'closing'` that teardown set as its
+in-progress signal. Anything that gates on `'closing'` — including
+`_run_control_query`'s refusal at `:479` — stops seeing a teardown that
+is still running.
+
+Not demonstrated: this is a source reading, not a live reproduction. The
+reproduction needs the database to itself (`kill_backends` in the shared
+suite makes concurrent runs unreliable), so it was deferred rather than
+run alongside other work. Confirm before fixing.
+
+### 71. The listener's pause around control queries may be defensive rather than load-bearing
+
+**File:** `PubSub.pm:303-305` (`_listener_loop`), `_stop_listener` /
+`_start_listener`, `_ControlQueryGuard::release` (`:748`)
+
+Every control query stops the listener, runs, and restarts it. The stated
+reason is that the listener and the query would otherwise collide on one
+DBD::Pg handle. That collision may not exist.
+
+**The evidence it does not.** A mutation stripping *both* slot checks
+from `_listener_loop` — so the listener calls `_process_notifications`
+(and thus `PQconsumeInput`) on a handle with an async query in flight —
+survives the entire suite under both `Future::IO::Impl::UV` and
+`::IOAsync`, including the subtest that deliberately widens the window
+with a 1s-delayed control query. A reviewer then traced DBD::Pg's C
+implementation and found no mechanism for the collision:
+
+- `_process_notifications` calls exactly one DBD::Pg method, `pg_notifies`
+  = `PQconsumeInput()` + `PQnotifies()`. It never touches
+  `imp_dbh->async_status` (the per-connection outstanding-async-command
+  flag) and never calls `PQgetResult` or `PQsendQuery`.
+- `pg_ready` is gated on the *statement's* own `async_status`, which only
+  `_execute_async` sets. The listener path never touches it.
+- The actually-forbidden operation — a second `PQsendQuery`-class call
+  before the first's result is drained — is what `{_control_query}`'s
+  mutex already prevents, and `_process_notifications` issues no query.
+- `PQconsumeInput` from two alternating call sites is libpq's documented
+  mechanism for this exact combination: checking an outstanding async
+  command's progress while draining pending NOTIFYs on one connection. A
+  message split across reads stays buffered until complete regardless of
+  which call site reads it; there is no per-caller state to corrupt.
+
+**Why it is not settled.** The reviewer attached three caveats and
+stopped short of a verdict, landing on "probably not load-bearing for the
+collision the comments name":
+
+1. It read DBD::Pg 3.16.3's `dbdimp.c` from a stale build cache, not the
+   installed 3.20.2 the suite runs against, and did not diff the two.
+2. It reasoned about protocol demultiplexing, not DBD::Pg-internal
+   bookkeeping, and traced only the success path — not whether either
+   call site could stomp the other's view of `errstr`.
+3. Three conditions would have to hold for the pause to matter, none
+   confirmed: (a) a result or notification split across multiple socket
+   reads (slow link, large payload); (b) a window where both pollers
+   genuinely race rather than one finishing before the other wakes;
+   (c) `PQconsumeInput` / `pg_ready` / `pg_notifies` interleaving safely
+   in the DBD::Pg and libpq versions actually in use.
+
+**Before acting on this**, run the fragmentation experiment: split a
+response across several small writes with a delay, mirroring the existing
+1s-delay trick, and exercise the error path. That converts source-level
+reasoning into an observed result. If it confirms the reading, the whole
+stop/restart dance and both slot checks in `_listener_loop` can go — the
+single largest simplification available in this file.
+
+### 72. The `closing` phase does double duty
+
+**File:** `PubSub.pm` (`{phase}`)
+
+`closing` means both "teardown is in progress" and "terminally shut". The
+phase model replaced booleans whose overloading caused item 67, and this
+is the one place where the same ambiguity survives in the new field.
+Nothing depends on distinguishing the two today, which is why it was left
+alone. It matters if a caller ever needs to tell "wait for teardown, then
+retry" from "this object is finished" — a `shut` phase would separate
+them.
+
+### 73. Teardown cancels in-flight work by name, not from a registry
+
+**File:** `PubSub.pm` (`disconnect`, `_pool_shutdown`)
+
+`disconnect()` cancels four things by explicitly naming each one:
+`{_reconnect_future}`, `{_connecting}`, `{_control_query_inflight}`, and
+the listener. A fifth mechanism added later gets cleaned up only if
+whoever adds it remembers to extend teardown.
+
+A design for a single `{_inflight}` registry was written and deliberately
+not built (see the phase-model spec). The reasoning for skipping it: a
+registry makes forgetting *benign* rather than impossible — a future
+nobody registers is exactly as orphaned as one nobody names — so it
+softens the failure mode without preventing it, at the cost of another
+indirection over four call sites that are currently explicit and
+readable. Recorded here so the option is not re-derived from scratch.
+
+Two related debts it would not have fixed either way:
+
+- Item 70's race is a *checkout* leak, not a future leak; a registry of
+  futures does not see it.
+- `_pool_shutdown` and `disconnect` reach the same terminal state by
+  three unrelated routes — `listen()` gates on `{phase}`, `unlisten()` and
+  `unlisten_all()` check `{channels}` and `{conn}`, and the reconnect
+  loop's replay is aborted by cancelling `{_reconnect_future}`. Four
+  attempts to describe that as one tidy mechanism in a comment were all
+  wrong; it is three mechanisms, and any future consolidation has to
+  start from that.
