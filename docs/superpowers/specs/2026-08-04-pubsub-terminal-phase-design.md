@@ -81,8 +81,9 @@ and is the more robust shape. But that is a defensive change, not a fix for a
 demonstrated defect, and this spec claimed otherwise before it was measured.
 
 The audit itself remains the point — the refusal sites genuinely do need
-updating, and the mutation proves it. Introduce one predicate rather than repeating the
-disjunction:
+updating, and the mutation proves it.
+
+Introduce one predicate rather than repeating the disjunction:
 
 ```perl
 # True once teardown has begun, whether it will finish in a reconnectable
@@ -108,8 +109,8 @@ inside a comment, not a test.
 | `:319` | `_listener_loop`: `while eq 'live'` | unchanged | already positive |
 | `:356` | `_start_listener`: `eq 'live'` | unchanged | already positive |
 | `:366` | on_fail: `ne 'live'` | unchanged | positive in effect |
-| `:415` | `_reconnect_loop`: `while ne 'closing'` | `while !_tearing_down` | **would spin** |
-| `:426` | `_reconnect_loop`: `last if eq 'closing'` | `last if _tearing_down` | **would not stop** |
+| `:415` | `_reconnect_loop`: `while ne 'closing'` | `while !_tearing_down` | defensive; cancellation already stops it |
+| `:426` | `_reconnect_loop`: `last if eq 'closing'` | `last if _tearing_down` | defensive; see above |
 | `:520` | `_run_control_query` refuses | `_tearing_down`, message by phase | must refuse in both |
 | `:621` | `disconnect` early return | see below | **would resurrect** |
 
