@@ -1995,7 +1995,7 @@ subtest 'cancelling a control query leaves no stale waiter' => sub {
     $pg->shutdown->get;
 };
 
-subtest 'a listener that stops fails a query still waiting on it' => sub {
+subtest 'a query parked on the listener is failed when its connection dies' => sub {
     my @logged;
     my $pg = Async::DBD::Pg->new(
         dsn             => test_dsn(),
@@ -2012,12 +2012,27 @@ subtest 'a listener that stops fails a query still waiting on it' => sub {
         'the query is waiting on the listener';
 
     # NOT disconnect(): teardown cancels an in-flight control query itself, so
-    # the query would settle by cancellation and the guard would never be the
-    # thing that finished it -- a test that passes without exercising what it
-    # names. Killing the backend takes the listener down underneath a query
-    # that is parked on the delegate, which is the only path by which the
-    # guard is what settles it, and is also the realistic case: a dropped
-    # connection.
+    # the query would settle by cancellation rather than by whatever fails a
+    # query still parked on a dead listener -- a test that passes without
+    # exercising that. Killing the backend takes the listener down underneath
+    # a query that is parked on the delegate, and is also the realistic case:
+    # a dropped connection.
+    #
+    # This does NOT reach _ReaderGuard's own waiter-failing code, despite the
+    # name this subtest used to have. Traced: kill_backends() makes the
+    # socket readable: _process_notifications runs first and does not throw
+    # (pg_notifies on a connection carrying a queued FATAL, not yet fully
+    # closed, returns without notifications rather than dying); the loop's
+    # own ordinary completion check runs next -- _result_ready
+    # (Connection.pm) is documented to report "ready" on any internal error
+    # rather than throw, specifically so a query's own error surfaces through
+    # its own pg_result -- so the loop takes the ordinary `$waiter->done`
+    # branch, same as any successful control query, and the resumed query
+    # discovers the dead connection itself when it calls pg_result. The guard
+    # does fire later, once the loop's frame is actually torn down, but by
+    # then {_query_waiter} is already gone. See 'a query parked on the
+    # listener is failed when the loop itself dies' below for the path that
+    # does reach the guard, and why this one does not.
     my $captured = capture_stderr(sub {
         kill_backends();
 
@@ -2033,6 +2048,69 @@ subtest 'a listener that stops fails a query still waiting on it' => sub {
         'it was failed by the listener stopping, not cancelled by teardown';
 
     $pubsub->disconnect->get;
+    $pg->shutdown->get;
+};
+
+subtest 'a query parked on the listener is failed when the loop itself dies' => sub {
+    my @logged;
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 4,
+        on_log          => sub { push @logged, $_[1] },
+    );
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('reaper_probe', sub { })->get;
+
+    # _process_notifications runs unguarded at the top of every iteration of
+    # the listener loop, before the waiter is ever checked. If it throws, the
+    # loop's async sub fails and its frame unwinds, tearing down
+    # _ReaderGuard while {_query_waiter} is still live -- the one path that
+    # reaches the guard's own waiter-failing code, as opposed to the loop's
+    # ordinary $waiter->done completion that the previous subtest actually
+    # exercises. Guarded on {_query_waiter} being set so the listener starts
+    # up normally; it only dies once a query is genuinely parked on it.
+    my $orig_notify = Async::DBD::Pg::PubSub->can('_process_notifications');
+    no warnings 'redefine';
+    local *Async::DBD::Pg::PubSub::_process_notifications = sub {
+        my ($self, @rest) = @_;
+        die "simulated: the listener loop died\n" if $self->{_query_waiter};
+        return $self->$orig_notify(@rest);
+    };
+
+    my $slow = $pubsub->_run_control_query('SELECT pg_sleep(0.2)');
+    ok wait_until(sub { $pubsub->{_query_waiter} }, 'query parked', 3),
+        'the query is waiting on the listener';
+
+    my $captured = capture_stderr(sub {
+        ok wait_until(sub { $slow->is_ready }, 'parked query settled', 5),
+            'the parked query is failed once the loop dies underneath it';
+    });
+    is $captured, '', 'the simulated death does not reach fd 2';
+    ok scalar(grep { /listener stopped/i } @logged),
+        'it reaches on_log instead';
+
+    ok !$slow->is_done, 'and it did not falsely report success';
+    ok !$slow->is_cancelled, 'it was failed by the guard, not cancelled';
+
+    # ->failure blocks until the future is ready, the same as ->get -- calling
+    # it unconditionally would hang the whole suite rather than fail cleanly
+    # if the guard were ever broken and the wait_until bound above had timed
+    # out instead of observing the query settle.
+    if ($slow->is_ready) {
+        my $err = $slow->failure;
+        isa_ok $err, 'Async::DBD::Pg::Error::Connection';
+        like "$err", qr/PubSub listener stopped while a query was waiting/,
+            'and the guard-s own message, not a bare cancellation';
+    }
+    else {
+        ok 0, 'failed with the guard-s own error class -- skipped, query never settled';
+        ok 0, 'and the guard-s own message -- skipped, query never settled';
+    }
+
+    ok !$pubsub->is_connected, 'the dead listener reports itself disconnected too';
+
     $pg->shutdown->get;
 };
 
