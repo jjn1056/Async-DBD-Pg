@@ -172,7 +172,7 @@ prevent thundering herd when many connections reach max lifetime simultaneously.
 
 ---
 
-### 51. No type binding control
+### 51. No type binding control — FIXED (silent bytea data loss)
 
 No way to set `pg_type` on bind params (needed for BYTEA, JSON/JSONB). No way to configure
 `pg_bool_tf`, `pg_expand_array`, `pg_int8_as_string`, or `pg_enable_utf8` at connection
@@ -340,3 +340,26 @@ the predicate reds only the refusal tests — `_pool_shutdown` cancels the
 supervisor outright, so those phase tests sit behind the cancellation as a
 second line of defence. They were still made positive, as defence rather than
 as a proven fix.
+
+**Fixed 2026-08-04.** The title understated it: without a way to state a
+parameter's type, `bytea` was sent as text and **truncated at the first NUL
+with the write reporting success**. Measured before the fix — 256 bytes in, 0
+stored; `"abc\0def"` in, 3 stored.
+
+A bind value may now carry its own type as `{ type => PG_BYTEA, value => $x }`,
+Mojo::Pg's convention adopted verbatim. Works positionally, through named
+placeholders, and mixed with untyped parameters; `undef` still stores NULL.
+
+Two things the research settled, in
+`docs/superpowers/specs/2026-08-04-typed-bind-parameters-design.md`:
+node-postgres, psycopg and asyncpg all dispatch on their language's native
+binary type — `Buffer`, `bytes` — which Perl does not have, so annotation is
+the only mechanism available rather than a wart. And a lone hashref is
+disambiguated from a named-bind map by the *statement*: no `:name`
+placeholders means it cannot be one. That is psycopg's principle, and it keeps
+a genuine `:type`/`:value` query working.
+
+Covered by seven subtests in `t/integration/connection.t`, two of which guard
+existing behaviour rather than the new. Mutation-verified separately: removing
+the sentinel unwrapping reds four, removing the SQL disambiguation reds only
+the lone-hashref one.

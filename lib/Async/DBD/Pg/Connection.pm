@@ -50,7 +50,19 @@ async sub query {
     my ($bind, $opts) = $self->_parse_query_args(@args);
 
     if (ref $bind eq 'HASH') {
-        ($sql, $bind) = convert_placeholders($sql, $bind);
+        my ($converted, $named) = convert_placeholders($sql, $bind);
+
+        if (@$named || $converted ne $sql) {
+            ($sql, $bind) = ($converted, $named);
+        }
+        else {
+            # No :name placeholders in the statement, so this hashref cannot
+            # be a map of named binds -- it is a single positional value,
+            # which is how a lone typed parameter arrives. Deciding from the
+            # SQL rather than from the hash's keys is what lets a genuine
+            # named-bind hash for :type and :value keep working.
+            $bind = [$bind];
+        }
     }
 
     # Once per checkout, and only for a connection that was idle.
@@ -280,12 +292,24 @@ async sub _execute_async {
 
     my $rv = eval {
         $self->_capture_pg_notices(sub {
-            if (ref $bind eq 'ARRAY' && @$bind) {
-                $sth->execute(@$bind);
+            # Bound one at a time rather than handed to execute() as a
+            # list, so a value can carry its own PostgreSQL type. Without
+            # that, DBD::Pg sends everything as text -- and bytea sent as
+            # text is truncated at the first NUL, with the write reporting
+            # success. See the typed-bind-parameters design spec.
+            for my $i (0 .. $#$bind) {
+                my $value = $bind->[$i];
+                my $attrs;
+
+                if (ref $value eq 'HASH'
+                    && exists $value->{type} && exists $value->{value}) {
+                    $attrs = { pg_type => $value->{type} };
+                    $value = $value->{value};
+                }
+
+                $sth->bind_param($i + 1, $value, $attrs);
             }
-            else {
-                $sth->execute;
-            }
+            $sth->execute;
         });
     };
 
@@ -466,7 +490,19 @@ async sub cursor {
     my ($bind, $opts) = $self->_parse_cursor_args(@args);
 
     if (ref $bind eq 'HASH') {
-        ($sql, $bind) = convert_placeholders($sql, $bind);
+        my ($converted, $named) = convert_placeholders($sql, $bind);
+
+        if (@$named || $converted ne $sql) {
+            ($sql, $bind) = ($converted, $named);
+        }
+        else {
+            # No :name placeholders in the statement, so this hashref cannot
+            # be a map of named binds -- it is a single positional value,
+            # which is how a lone typed parameter arrives. Deciding from the
+            # SQL rather than from the hash's keys is what lets a genuine
+            # named-bind hash for :type and :value keep working.
+            $bind = [$bind];
+        }
     }
 
     # Both are interpolated into the statements below, so they are checked
@@ -693,6 +729,7 @@ the pool instead.
     my $r = await $conn->query($sql, @bind);
     my $r = await $conn->query($sql, \%params);
     my $r = await $conn->query($sql, @bind, { timeout => 5 });
+    my $r = await $conn->query($sql, { type => PG_BYTEA, value => $bytes });
 
 Runs a statement and returns an L<Async::DBD::Pg::Results>.
 
@@ -702,6 +739,34 @@ take theirs from a hashref, and are rewritten to positional form before the
 statement is sent; naming a placeholder with no matching key is an error
 rather than something passed through to the server. The two forms cannot be
 mixed in one statement.
+
+=head3 Typed bind parameters
+
+A bind value may state its own PostgreSQL type by being a hashref with
+C<type> and C<value>:
+
+    use DBD::Pg qw(:pg_types);
+
+    await $conn->query('INSERT INTO files (name, body) VALUES ($1, $2)',
+        $name, { type => PG_BYTEA, value => $bytes });
+
+    await $conn->query('INSERT INTO files (name, body) VALUES (:name, :body)',
+        { name => $name, body => { type => PG_BYTEA, value => $bytes } });
+
+This is required for C<bytea>, and is not optional in the way it may appear.
+Without it the value is sent as text, and PostgreSQL's text form for C<bytea>
+is not a Perl string: a value containing a NUL byte is B<truncated at that
+byte, and the statement reports success>. Anything with a zero in it — an
+image, a compressed or encrypted payload, a serialized structure — is lost on
+the way in. The same applies to any type whose wire form differs from the
+scalar you hold; C<bytea> is simply the case where the loss is silent.
+
+Perl has no distinct binary type to detect, which is why the type has to be
+stated rather than inferred. The convention is L<Mojo::Pg>'s, so it should be
+familiar if you have used that.
+
+A value that is a hashref without both keys is not a typed parameter, and
+reaches DBD::Pg as a reference, which it refuses.
 
 A trailing hashref containing C<timeout> is read as options rather than as
 named parameters:
