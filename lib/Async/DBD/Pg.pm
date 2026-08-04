@@ -183,7 +183,13 @@ async sub shutdown {
     $_->_close_dbh for splice @{$self->{idle}};
 
     if (!$opts{force} && $self->active_count) {
-        my $drained = $self->{_drained} = Future->new;
+        # pending_future rather than a bare Future->new, for the same reason
+        # the queue branch of connection() uses it: this is what the caller's
+        # future ends up awaiting, and a bare Future gives back one whose
+        # top-level ->get can never block, only croak once it isn't already
+        # ready. That made `$pg->shutdown->get` work only when the pool had
+        # nothing to wait for -- which is precisely when it is not needed.
+        my $drained = $self->{_drained} = pending_future();
 
         if (my $timeout = $opts{timeout}) {
             my $timer = Future::IO->sleep($timeout);
