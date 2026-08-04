@@ -1449,92 +1449,50 @@ A green suite is not evidence the notification path is correct. Run the
 fragmentation experiment — not just the ordinary suite — against any future
 change to `_listener_loop`.
 
-### 76. The test suite fails intermittently because `kill_backends()` is database-wide
+### 76. The backend-kill helpers terminated every connection on the database — FIXED
 
-**File:** `t/integration/pubsub.t`, `t/pool/basic.t` (the helper is defined per-file)
+**File:** `t/integration/pubsub.t`, `t/pool/basic.t`, `t/pool/shutdown.t`,
+`t/lib/Test/Async/DBD/Pg.pm`
 
-`kill_backends()` issues `pg_terminate_backend` against **every** backend on
-the test database, not just the connections the calling subtest owns. Tests
-that use it to simulate a dropped connection therefore also kill connections
-belonging to other parts of the same run.
+Three test helpers simulated a dropped connection with
 
-Observed at `c59364c` under `Future::IO::Impl::UV`: across nine consecutive
-full-suite runs, one failed and eight were clean. **That is not a measured
-failure rate and must not be quoted as one** — a second agent was running the
-same suite against the same database during part of that window, which is
-itself the hazard this item describes. The honest reading is narrower: the
-suite passes repeatedly at this commit, and it can fail this way. The rate is
-unknown.
+    SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+     WHERE datname = current_database() AND pid <> pg_backend_pid()
 
-The failure took out two files at once with the same cause:
+which terminates **every** connection to that database, with no notion of
+ownership. Pointing `TEST_PG_DSN` at a PostgreSQL instance shared with anything
+else — a contributor's own service, another project — meant running the suite
+killed that software's connections. Not a flaky test: destructive behaviour in
+someone else's environment.
 
-    t/integration/pubsub.t  'a reconnect supervisor backing off is not fooled
-                             by an ordinary listen() pausing the listener'
-    t/pool/basic.t          'a healed connection does not busy-wait on its
-                             old socket'
-    FATAL: terminating connection due to administrator command
+CI never saw it, because the workflow provisions a dedicated `services:
+postgres` container. Only humans hit it.
 
-Both are tests that deliberately kill backends and then assert on recovery,
-and both leaked the FATAL to stderr — so the run breaches the pristine-output
-rule as well as failing.
+**This was previously recorded here as intermittent suite flakiness. That was
+wrong.** Eighteen consecutive full-suite runs on a quiet database produced zero
+failures and zero collision signatures. Every failure ever observed carried the
+`terminating connection due to administrator command` signature and occurred
+while something else was using the database — mostly a second agent, and mostly
+put there by me.
 
-This matters for release, not just for us. A CPAN tester running the suite
-against a shared PostgreSQL instance would see intermittent red through no
-fault of their own, and anyone running two copies of the suite concurrently
-sabotages both.
+Fixed by tagging the suite's own connections and scoping the kills to them.
+`Test::Async::DBD::Pg` sets `PGAPPNAME` at load:
 
-Not fixed here — it is a test-infrastructure problem, not a library defect,
-and fixing it properly means scoping termination to the connections a subtest
-actually owns (by pid, captured at checkout) rather than issuing a
-database-wide sweep. Recorded because the flakiness has already cost real time
-this session: four separate conclusions were drawn from samples too thin or
-too contaminated to support them, two of them reported as fact and later
-retracted.
+    BEGIN { $ENV{PGAPPNAME} = "async-dbd-pg-test-$$" }
 
-**How to measure anything against this suite:** confirm no stray processes
-(`pgrep -f 'prove|scratchpad.*\.pl'`) and no other backends
-(`pg_stat_activity`) first, then run the full suite 8+ times and report the
-count rather than one result. One green run is not evidence.
+libpq reads it at connect time, so it covers the pool's connections, anything
+an `on_connect` hook opens, reconnects, and the helpers' own `DBI->connect` —
+verified for each. Each helper then adds `AND application_name = ?`. Covered by
+`t/integration/pubsub.t`'s `'kill_backends leaves connections it does not own
+alone'`, which stands a bystander connection on the database under a different
+application name and asserts it survives. Confirmed red before the fix.
 
-Check *during* the sample as well as before it. A clean pre-flight proves
-nothing about minute six — the contamination that produced the caveat above
-began after sampling had already started, and was found only because the other
-party noticed and said so. Where more than one person or agent can reach the
-database, agree explicitly on who holds it for the duration, rather than each
-checking that it looks free.
-
-**A run can be checked for one specific hazard after the fact — but this does
-not classify a run as clean.** `kill_backends()`'s `pg_terminate_backend`
-always leaves `terminating connection due to administrator command` in the
-run's stderr, so grepping for that string is a reliable test for *this one
-hazard*:
-
-    grep -c 'terminating connection due to administrator command' run.err
-
-**Correct framing: a non-zero count proves contamination by this hazard; a
-zero count proves only that this one hazard was absent, not that the run was
-clean.** Lock contention, connection pressure, and timing effects from a
-database under other load leave no such signature, and this grep cannot see
-them.
-
-Applied to the nine runs above under that narrower reading: the eight clean
-runs contain zero occurrences, and only the single failing run contains any —
-the strongest statement that sample supports is that every failure observed
-in it was accompanied by the collision signature, not that the eight zero-count
-runs were free of every other hazard. It is not proof the suite is otherwise
-deterministic; earlier sessions measured a small solo failure rate. Any future
-claim about flakiness should still run the suite 8+ times and report the
-count, using this grep only to rule `pg_terminate_backend` collisions in or
-out of a given run — not to declare that run clean.
-
-**A second tooling trap, found during the single-reader refactor (item 71),
-that would silently invalidate anyone's mutation testing:** `prove -I
-<scratch> -l` does not prioritise the `-I` scratch path over `-l`'s `lib`,
-regardless of the order the flags are given on the command line — the real
-`lib/` wins. A mutation run invoked that way tests the unmutated code and
-**passes**, which presents as evidence while being its absence: it looks
-exactly like a guard or property that survives mutation, when actually
-nothing was mutated. Use `perl -I <scratch> -Ilib t/path/to/file.t` directly,
-bypassing `prove` entirely, and confirm `$INC{'Async/DBD/Pg/...pm'}` (or
-whichever module was mutated) resolves inside the scratch directory before
-trusting any result from the run.
+**Still open: two concurrent runs of this suite against one database still
+interfere, for an unrelated reason.** `LISTEN`/`NOTIFY` channel names are a
+per-database namespace, and the suite uses 72 distinct literal channel names.
+Two runs both `LISTEN 'cb_error_test'`, both `NOTIFY` it, and each sees the
+other's notifications — measured after this fix: both runs fail, with zero
+collision signatures, on assertions counting received payloads. Connection
+tagging cannot address this; it would need per-process channel names. Until
+then, **one suite run per database at a time**, and see the measurement
+guidance below.

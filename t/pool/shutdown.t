@@ -262,10 +262,17 @@ subtest 'shutdown completes while a listener is trying to reconnect' => sub {
             $parsed->{dbi_dsn}, $parsed->{user}, $parsed->{password},
             { RaiseError => 1, PrintError => 0 },
         );
+        # Scoped to this suite's own connections by application_name, which
+        # Test::Async::DBD::Pg sets via PGAPPNAME. Without it this terminates
+        # every connection to the database, including an unrelated
+        # application's on a shared PostgreSQL -- and a second copy of this
+        # suite's.
         $dbh->do(q{
             SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-             WHERE datname = current_database() AND pid <> pg_backend_pid()
-        });
+             WHERE datname = current_database()
+               AND pid <> pg_backend_pid()
+               AND application_name = ?
+        }, undef, $ENV{PGAPPNAME});
         $dbh->disconnect;
 
         Future::IO->sleep(0.3)->get;    # let it fail and start backing off

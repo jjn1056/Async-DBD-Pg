@@ -43,10 +43,16 @@ sub kill_backends {
         $parsed->{dbi_dsn}, $parsed->{user}, $parsed->{password},
         { RaiseError => 1, PrintError => 0 },
     );
+    # Scoped to this suite's own connections by application_name, which
+    # Test::Async::DBD::Pg sets via PGAPPNAME. Without it this terminates
+    # every connection to the database, including an unrelated application's
+    # on a shared PostgreSQL -- and a second copy of this suite's.
     $dbh->do(q{
         SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-         WHERE datname = current_database() AND pid <> pg_backend_pid()
-    });
+         WHERE datname = current_database()
+           AND pid <> pg_backend_pid()
+           AND application_name = ?
+    }, undef, $ENV{PGAPPNAME});
     $dbh->disconnect;
     return;
 }
@@ -1729,6 +1735,38 @@ subtest 'phase reports the lifecycle, and teardown cannot disagree with itself' 
     $pubsub->disconnect->get;
     is $pubsub->{phase}, 'disconnected', 'disconnected after teardown';
     ok !$pubsub->is_connected, 'and is_connected agrees';
+};
+
+subtest 'kill_backends leaves connections it does not own alone' => sub {
+    my $parsed = Async::DBD::Pg::Util::parse_dsn(test_dsn());
+
+    # Stands in for an unrelated application sharing this database -- a
+    # contributor's own service on the PostgreSQL they pointed TEST_PG_DSN at.
+    # It is not ours, and terminating it is not ours to do.
+    my $bystander = DBI->connect(
+        $parsed->{dbi_dsn}, $parsed->{user}, $parsed->{password},
+        { RaiseError => 1, PrintError => 0 },
+    );
+    $bystander->do(q{SET application_name = 'some-unrelated-application'});
+
+    kill_backends();
+
+    # pg_terminate_backend signals and returns before the backend is gone, so
+    # a single check straight after would pass whether or not it was killed.
+    # Polled instead, and the assertion is on the whole window rather than one
+    # sample.
+    my $survived = 1;
+    for (1 .. 20) {
+        select undef, undef, undef, 0.05;
+        next if eval { $bystander->do('SELECT 1'); 1 };
+        $survived = 0;
+        last;
+    }
+
+    ok $survived,
+        'a connection belonging to someone else is not terminated';
+
+    $bystander->disconnect if $survived;
 };
 
 subtest 'a connect arriving during teardown does not strand a connection' => sub {
