@@ -372,6 +372,16 @@ sub _result_ready {
 async sub _wait_for_result {
     my ($self) = @_;
 
+    # Somebody else owns this socket -- see Async::DBD::Pg::PubSub, which
+    # installs one for the life of its listener loop. Awaiting their future
+    # rather than polling is what keeps exactly one reader on the fd: two
+    # pollers steal each other's readiness, because pg_ready and pg_notifies
+    # both consume the socket into libpq's buffer while poll reports on the
+    # socket itself.
+    if (my $delegate = $self->{_poll_delegate}) {
+        return await $delegate->($self);
+    }
+
     my $sock = $self->_get_socket;
 
     while (!$self->_result_ready) {
@@ -521,6 +531,12 @@ sub release {
     my ($self, %opts) = @_;
     return if $self->{released};
     $self->{released} = 1;
+
+    # Dropped at the one point every checkout passes through. The delegate
+    # closes over whoever installed it; a stale one on a pooled connection
+    # would park the next borrower's query on a future nobody will ever
+    # complete.
+    delete $self->{_poll_delegate};
 
     if (my $pool = $self->{pool}) {
         $pool->_return_connection($self, %opts);

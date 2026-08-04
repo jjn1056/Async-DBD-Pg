@@ -372,4 +372,50 @@ subtest '_result_ready reports readiness without throwing' => sub {
     $pg->shutdown->get;
 };
 
+subtest 'a poll delegate replaces the connection self-polling' => sub {
+    my $pg   = Async::DBD::Pg->new(dsn => test_dsn(), min_connections => 0, max_connections => 2);
+    my $conn = $pg->connection->get;
+
+    # Stands in for the pub/sub listener: something else owns the fd and says
+    # when the result is ready.
+    my ($calls, @timers) = (0);
+    $conn->{_poll_delegate} = sub {
+        my ($c) = @_;
+        $calls++;
+        my $waiter = Async::DBD::Pg::Util::pending_future();
+
+        # Driven from a timer rather than the socket, so the query completing
+        # proves it waited on the delegate rather than polling for itself.
+        # The timer is held in a lexical the subtest owns -- see gaps item 64
+        # for why ->retain is not the way to keep a future alive here.
+        push @timers, Future::IO->sleep(0.05)->on_done(sub {
+            $waiter->done unless $waiter->is_ready;
+        });
+
+        return $waiter;
+    };
+
+    my $result = $conn->query('SELECT 42 AS answer')->get;
+    is $result->first->{answer}, 42, 'the query completed through the delegate';
+    is $calls, 1, 'the delegate was consulted exactly once';
+
+    # A failing delegate fails the query rather than hanging it.
+    $conn->{_poll_delegate} = sub {
+        return Future->fail(Async::DBD::Pg::Error::Connection->new(message => 'reader gone'));
+    };
+    my $failed = eval { $conn->query('SELECT 1')->get; 1 };
+    ok !$failed, 'a failing delegate fails the query';
+    like "$@", qr/reader gone/, 'and the delegate error reaches the caller';
+
+    # The delegate must never reach the next borrower.
+    $conn->release;
+    my $reused = $pg->connection->get;
+    ok !$reused->{_poll_delegate}, 'release clears the delegate';
+    is $reused->query('SELECT 7 AS n')->get->first->{n}, 7,
+        'and the reused connection polls for itself again';
+
+    $reused->release;
+    $pg->shutdown->get;
+};
+
 done_testing;
