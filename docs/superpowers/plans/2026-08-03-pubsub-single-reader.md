@@ -49,25 +49,49 @@ Pure refactor, no behaviour change. Extracts the readiness check so that the lis
 
 Add to `t/integration/connection.t`:
 
+Requires `PG_ASYNC` in the test file — `Connection.pm` gets it via `use DBD::Pg qw(:async);`, use the same. `use Async::DBD::Pg;` is also needed; that file does not already import it.
+
 ```perl
 subtest '_result_ready reports readiness without throwing' => sub {
     my $pg   = Async::DBD::Pg->new(dsn => test_dsn(), min_connections => 0, max_connections => 2);
     my $conn = $pg->connection->get;
+    my $dbh  = $conn->dbh;
 
-    ok !$conn->_result_ready, 'not ready when no statement is in flight'
-        or note 'pg_ready on an idle handle should be false';
+    # Dispatched directly rather than through query(), which would wait for the
+    # result and leave nothing to observe. This is the only state
+    # _wait_for_result ever calls _result_ready in: a statement sent, no result
+    # back yet. pg_ready returns false here -- it is the idle handle, which
+    # nothing in production ever asks, that throws instead.
+    my $sth = $dbh->prepare('SELECT pg_sleep(0.4)', { pg_async => PG_ASYNC });
+    $sth->execute;
 
-    # A connection whose handle has gone reports ready rather than spinning:
-    # the caller stops waiting and the collection path surfaces the real error.
-    my $dead = $pg->connection->get;
-    delete $dead->{dbh};
+    ok !$conn->_result_ready, 'not ready while the statement is still running';
+
+    Future::IO->sleep(0.8)->get;
+    ok $conn->_result_ready, 'ready once the result has arrived';
+
+    # Drained before anything else: leaving the handle active makes DBI warn on
+    # disconnect, which would breach the suite's pristine-stderr requirement.
+    $dbh->pg_result;
+    $sth->finish;
+
+    # With the result collected there is no async query left, so pg_ready
+    # throws. _result_ready must absorb that and report ready -- a caller that
+    # kept waiting here would spin forever.
+    ok $conn->_result_ready, 'absorbs pg_ready throwing when no query is running';
+
+    # Same contract when the handle is gone entirely. Built standalone rather
+    # than checked out, so a connection with no dbh is never returned to the
+    # pool.
+    my $dead = Async::DBD::Pg::Connection->new(dbh => undef);
     ok $dead->_result_ready, 'reports ready when the handle is gone';
 
     $conn->release;
-    $dead->release;
     $pg->shutdown->get;
 };
 ```
+
+**Measured, not assumed** (DBD::Pg 3.20.2): `pg_ready` on an idle handle **throws** `"No asynchronous query is running"`; mid-query it returns `0`; once the result has arrived it returns `1`. An earlier draft of this test asserted that an idle handle reports "not ready", which cannot happen — that is why the test primes a real statement first.
 
 - [ ] **Step 2: Run it and confirm it fails**
 
@@ -96,6 +120,10 @@ In `lib/Async/DBD/Pg/Connection.pm`, immediately above `_wait_for_result`:
 # down notification delivery with it. Reporting "ready" on error is
 # deliberate: it stops the caller waiting and lets pg_result surface the real
 # error to the query's owner, which is the party that cares.
+#
+# The common case is not an error at all: pg_ready throws "No asynchronous
+# query is running" when no statement is outstanding, which callers reach
+# after collecting a result rather than before dispatching one.
 sub _result_ready {
     my ($self) = @_;
 
