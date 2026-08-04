@@ -25,8 +25,9 @@
 
 - `lib/Async/DBD/Pg/Error.pm` — accessor rename (Task 1)
 - `lib/Async/DBD/Pg/Cursor.pm` — close on exhaustion (Task 2)
-- `lib/Async/DBD/Pg.pm` — pool-level `query`/`transaction` (Task 3), scoped handle (Task 4)
-- `t/unit/error.t`, `t/integration/cursor.t`, `t/integration/connection.t`, `t/pool/basic.t`
+- `lib/Async/DBD/Pg/Connection.pm` — `transaction` signature (Task 3)
+- `lib/Async/DBD/Pg.pm` — pool-level `query`, `transaction`, `with_connection` (Task 4)
+- `t/unit/error.t`, `t/integration/cursor.t`, `t/integration/transaction.t`, `t/pool/basic.t`
 
 ---
 
@@ -207,39 +208,187 @@ Say that a fully consumed cursor closes itself and that an abandoned one must st
 
 ---
 
-### Task 3: `$pg->query` and `$pg->transaction`
+### Task 3: One callback convention -- options lead, arguments trail
+
+**Files:**
+- Modify: `lib/Async/DBD/Pg/Connection.pm` (`transaction`), `lib/Async/DBD/Pg/Cursor.pm` (`each`)
+- Test: `t/integration/transaction.t`, `t/integration/cursor.t`
+
+**Interfaces:**
+- Produces: `await $conn->transaction($code, @args)` and
+  `await $conn->transaction(\%opts, $code, @args)`. `$code` is called as
+  `$code->($conn, @args)`. `await $cursor->each($code, @args)` calls
+  `$code->($row, @args)`.
+
+**Why before the pool helpers:** Task 4 adds three more callback-taking methods.
+Settling the convention first means they are written once against it, rather
+than written and then changed.
+
+Two problems today. Every callback captures what it needs from the enclosing
+scope, so a loop that spawns work has to be careful about what each closure
+closed over -- passing values as parameters removes the question. And
+`transaction` takes its options *after* the callback:
+
+```perl
+await $conn->transaction($code, isolation => 'serializable');
+```
+
+which both hides the options behind a block a reader has to scroll past, and
+occupies the slot trailing arguments need.
+
+**Ruling:** options move to a leading hashref, so a reader sees them before the
+body, and trailing arguments are forwarded to the callback. This is a breaking
+change to a documented signature. It is used nowhere in the tree except its own
+POD example, and the distribution is at 0.001001, so it is cheaper now than
+after a release.
+
+- [ ] **Step 1: Write the failing tests**
+
+```perl
+subtest 'transaction forwards trailing arguments to its callback' => sub {
+    my $pg   = Async::DBD::Pg->new(dsn => test_dsn(), min_connections => 0, max_connections => 3);
+    my $conn = $pg->connection->get;
+    $conn->query('CREATE TEMP TABLE argtest (n int, tag text)')->get;
+
+    # Passed in rather than closed over, so a caller looping over work does
+    # not have to reason about what each closure captured.
+    $conn->transaction(async sub {
+        my ($tx, $n, $tag) = @_;
+        await $tx->query('INSERT INTO argtest VALUES ($1, $2)', $n, $tag);
+    }, 42, 'from-args')->get;
+
+    my $r = $conn->query('SELECT n, tag FROM argtest')->get->first;
+    is $r->{n}, 42, 'a trailing argument reached the callback';
+    is $r->{tag}, 'from-args', 'and so did the second';
+
+    $conn->release;
+    $pg->shutdown->get;
+};
+
+subtest 'transaction takes its options first, where they are visible' => sub {
+    my $pg   = Async::DBD::Pg->new(dsn => test_dsn(), min_connections => 0, max_connections => 3);
+    my $conn = $pg->connection->get;
+
+    my $level = $conn->transaction({ isolation => 'serializable' }, async sub {
+        my ($tx) = @_;
+        return await $tx->query('SHOW transaction_isolation');
+    })->get;
+    is $level->first->{transaction_isolation}, 'serializable',
+        'a leading options hashref is read as options';
+
+    # And options plus arguments together, which is the shape that has to work
+    # for the convention to be worth having.
+    my $got = $conn->transaction({ isolation => 'serializable' }, async sub {
+        my ($tx, $value) = @_;
+        return $value;
+    }, 'passed-through')->get;
+    is $got, 'passed-through', 'options and arguments coexist';
+
+    $conn->release;
+    $pg->shutdown->get;
+};
+
+subtest 'each forwards trailing arguments to its callback' => sub {
+    my $pg   = Async::DBD::Pg->new(dsn => test_dsn(), min_connections => 0, max_connections => 3);
+    my $conn = $pg->connection->get;
+    $conn->query('CREATE TEMP TABLE eachargs AS SELECT g AS id FROM generate_series(1,5) g')->get;
+
+    my $cursor = $conn->cursor('SELECT id FROM eachargs', { batch_size => 2 })->get;
+    my @seen;
+    $cursor->each(async sub {
+        my ($row, $prefix) = @_;
+        push @seen, "$prefix$row->{id}";
+    }, 'row-')->get;
+
+    is scalar(@seen), 5, 'every row was delivered';
+    is $seen[0], 'row-1', 'and the trailing argument came with it';
+
+    $conn->release;
+    $pg->shutdown->get;
+};
+```
+
+- [ ] **Step 2: Run and watch them fail.** The first two on the arguments not arriving and the leading hashref being taken for a callback; the third on `each` ignoring extra arguments.
+
+- [ ] **Step 3: Implement in `Connection::transaction`**
+
+```perl
+async sub transaction {
+    my ($self, @rest) = @_;
+
+    # Options lead so a reader sees them before the block, and so the trailing
+    # slot is free for arguments the caller wants forwarded rather than closed
+    # over. A code ref is never a hashref, so the two forms cannot be confused.
+    my %opts = ref $rest[0] eq 'HASH' ? %{ shift @rest } : ();
+    my ($code, @args) = @rest;
+    ...
+}
+```
+
+Every `$code->($self)` call site in that sub becomes `$code->($self, @args)`.
+There are several -- the savepoint path and the top-level path both invoke it.
+Change them all; missing one gives a callback that silently receives nothing.
+
+- [ ] **Step 4: Implement in `Cursor::each`** -- `each($code, @args)` calling `$callback->($row, @args)`.
+
+- [ ] **Step 5: Update the POD for both.** Show the options-first form and the trailing-argument form. State plainly that options moved. ASCII only, and run `podchecker`.
+
+- [ ] **Step 6: Full suite, both implementations**
+
+- [ ] **Step 7: Mutation-verify.** Drop `@args` from the `$code->(...)` calls in `transaction`. Expected: the first subtest reds on the values not arriving; the isolation subtest stays green, proving the two are independent.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add lib/Async/DBD/Pg/Connection.pm lib/Async/DBD/Pg/Cursor.pm t/integration/transaction.t t/integration/cursor.t
+git commit -m "Callback convention: options lead, arguments trail
+
+transaction took its options after the callback, which hid them behind a
+block and occupied the slot trailing arguments need. Options now come
+first, where a reader sees them, and trailing arguments are forwarded to
+the callback so a caller can pass values instead of closing over them.
+
+Breaking change to a documented signature, used nowhere in the tree but
+its own POD example, and cheaper at 0.001001 than after a release."
+```
+
+---
+
+### Task 4: The pool runs statements without a manual checkout
 
 **Files:**
 - Modify: `lib/Async/DBD/Pg.pm`
 - Test: `t/pool/basic.t`
 
 **Interfaces:**
-- Consumes: nothing.
-- Produces: `await $pg->query($sql, @bind)` returning `Async::DBD::Pg::Results`. `await $pg->transaction($code)` returning the callback's value. Both check out a connection, run, and release it — including when the work dies or the caller cancels.
+- Consumes: Task 3's callback convention.
+- Produces: `await $pg->query($sql, @bind)`, `await $pg->transaction($code, @args)`,
+  `await $pg->transaction(\%opts, $code, @args)`, and
+  `await $pg->with_connection($code, @args)`. All check out a connection, run,
+  and release it -- including when the work dies or the caller cancels.
 
-The most common operation in any database library is one query. Today:
+The most common operation in any database library is one query. Today it is a
+checkout, a query, and a release you can forget -- measured: forgetting leaves
+`active_count` at 1. Every peer does it in one call: `pool.query`
+(node-postgres), `pool.fetch` (asyncpg), `$pg->db->query` (Mojo::Pg). The pool
+already proxies `listen`, `unlisten`, `notify` and `pubsub`, so the convenience
+layer exists and covers pub/sub but not the thing people do most.
 
-```perl
-my $conn = await $pg->connection;
-my $r    = await $conn->query('SELECT 1');
-$conn->release;                    # forget this and it leaks -- measured
-```
+`with_connection` covers the multi-statement case with a scope a reader can
+see, and forwards arguments so a loop does not have to reason about what each
+closure captured. Verified against a prototype: it releases on success, on a
+dying body, and on cancellation.
 
-Every peer does it in one call: `pool.query` (node-postgres), `pool.fetch` (asyncpg), `$pg->db->query` (Mojo::Pg). The pool already proxies `listen`, `unlisten`, `notify` and `pubsub` to a connection — so the convenience layer exists and covers pub/sub but not the thing people do most.
-
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing tests**
 
 ```perl
 subtest 'the pool runs a single statement without a manual checkout' => sub {
     my $pg = Async::DBD::Pg->new(dsn => test_dsn(), min_connections => 0, max_connections => 3);
 
-    my $r = $pg->query('SELECT 42 AS answer')->get;
-    is $r->first->{answer}, 42, 'the pool ran the statement';
+    is $pg->query('SELECT 42 AS answer')->get->first->{answer}, 42, 'the pool ran it';
     is $pg->active_count, 0, 'and released the connection';
     is $pg->idle_count, 1, 'back to idle, reusable';
-
-    is $pg->query('SELECT $1::int AS n', 7)->get->first->{n}, 7,
-        'bind parameters are passed through';
+    is $pg->query('SELECT $1::int AS n', 7)->get->first->{n}, 7, 'binds pass through';
 
     $pg->shutdown->get;
 };
@@ -247,53 +396,41 @@ subtest 'the pool runs a single statement without a manual checkout' => sub {
 subtest 'the pool releases its connection when the statement fails' => sub {
     my $pg = Async::DBD::Pg->new(dsn => test_dsn(), min_connections => 0, max_connections => 3);
 
-    my $err = dies { $pg->query('SELECT * FROM no_such_table')->get };
-    ok $err, 'the failure reaches the caller';
+    ok dies { $pg->query('SELECT * FROM no_such_table')->get }, 'the failure reaches the caller';
     is $pg->active_count, 0,
-        'and the connection is still returned -- this is the leak the helper exists to prevent';
-
+        'and the connection is returned -- the leak this helper exists to prevent';
     ok $pg->query('SELECT 1')->get, 'the pool still works afterwards';
+
     $pg->shutdown->get;
 };
 
-subtest 'the pool runs a transaction without a manual checkout' => sub {
+subtest 'with_connection scopes a checkout and forwards arguments' => sub {
     my $pg = Async::DBD::Pg->new(dsn => test_dsn(), min_connections => 0, max_connections => 3);
-    $pg->query('CREATE TABLE IF NOT EXISTS pooltx (n int)')->get;
-    $pg->query('DELETE FROM pooltx')->get;
+    $pg->query('CREATE TABLE IF NOT EXISTS wc (id int, tag text)')->get;
+    $pg->query('DELETE FROM wc')->get;
 
-    $pg->transaction(async sub {
-        my ($tx) = @_;
-        await $tx->query('INSERT INTO pooltx VALUES (1)');
-        await $tx->query('INSERT INTO pooltx VALUES (2)');
-    })->get;
-    is $pg->query('SELECT count(*) AS c FROM pooltx')->get->first->{c}, 2,
-        'both statements committed';
+    my $out = $pg->with_connection(async sub {
+        my ($conn, $id, $tag) = @_;
+        await $conn->query('INSERT INTO wc VALUES ($1, $2)', $id, $tag);
+        return await $conn->query('SELECT tag FROM wc WHERE id = $1', $id);
+    }, 5, 'scoped')->get;
+
+    is $out->first->{tag}, 'scoped', 'the callback ran with its arguments';
     is $pg->active_count, 0, 'and the connection came back';
 
-    my $err = dies {
-        $pg->transaction(async sub {
-            my ($tx) = @_;
-            await $tx->query('INSERT INTO pooltx VALUES (3)');
-            die "no\n";
-        })->get
-    };
-    ok $err, 'a dying transaction still fails the caller';
-    is $pg->query('SELECT count(*) AS c FROM pooltx')->get->first->{c}, 2,
-        'and rolled back';
-    is $pg->active_count, 0, 'and released the connection even so';
+    ok dies { $pg->with_connection(async sub { die "boom\n" })->get }, 'a dying body fails the caller';
+    is $pg->active_count, 0, 'and still releases';
 
-    $pg->query('DROP TABLE pooltx')->get;
+    $pg->query('DROP TABLE wc')->get;
     $pg->shutdown->get;
 };
 
-subtest 'a cancelled pool query does not strand its connection' => sub {
+subtest 'a cancelled pool call does not strand its connection' => sub {
     my $pg = Async::DBD::Pg->new(dsn => test_dsn(), min_connections => 0, max_connections => 3);
 
     my $slow = $pg->query('SELECT pg_sleep(5)');
-    ok wait_until(sub { $pg->active_count == 1 }, 'query in flight', 3),
-        'the statement is running';
+    ok wait_until(sub { $pg->active_count == 1 }, 'query in flight', 3), 'the statement is running';
     $slow->cancel;
-
     ok wait_until(sub { $pg->active_count == 0 }, 'released after cancel', 5),
         'cancelling releases the checkout rather than stranding it';
 
@@ -306,10 +443,20 @@ subtest 'a cancelled pool query does not strand its connection' => sub {
 - [ ] **Step 3: Implement**
 
 ```perl
-# Check out, run, release -- including when the statement fails or the caller
+# Check out, run, release -- including when the work fails or the caller
 # cancels mid-flight. A guard rather than a release after the await: a
-# cancelled async sub never resumes, so anything after the await would not
-# run, which is exactly how a checkout gets stranded.
+# cancelled async sub never resumes, so anything written after the await would
+# not run, which is exactly how a checkout gets stranded. See
+# Async::DBD::Pg::PubSub::_CheckoutGuard, which exists for the same reason.
+async sub with_connection {
+    my ($self, $code, @args) = @_;
+
+    my $conn  = await $self->connection;
+    my $guard = Async::DBD::Pg::_ReleaseGuard->new($conn);
+
+    return await $code->($conn, @args);
+}
+
 async sub query {
     my ($self, @args) = @_;
 
@@ -320,58 +467,28 @@ async sub query {
 }
 
 async sub transaction {
-    my ($self, $code) = @_;
+    my ($self, @rest) = @_;
 
     my $conn  = await $self->connection;
     my $guard = Async::DBD::Pg::_ReleaseGuard->new($conn);
 
-    return await $conn->transaction($code);
+    return await $conn->transaction(@rest);
 }
 ```
 
-`_ReleaseGuard` is the same shape as `Async::DBD::Pg::PubSub::_CheckoutGuard`: holds the connection, releases it in `DESTROY`, and is never disarmed because the checkout is never published anywhere else. Read that class before writing this one — it exists because a release placed after an `await` is skipped on cancellation, which is the bug this task is preventing.
+`_ReleaseGuard` holds the connection and releases it in `DESTROY`. It is never
+disarmed, because the checkout is never published anywhere else. Read
+`_CheckoutGuard` in `PubSub.pm` before writing it.
 
-Do **not** add `$pg->cursor` here. A cursor outlives the call that created it, so the connection cannot be released when `cursor()` returns; that needs Task 2's self-closing cursor and is deferred to a follow-up.
+Do **not** add `$pg->cursor`. A cursor outlives the call that created it, so
+the connection cannot be released when `cursor()` returns. Task 2 makes a
+cursor close itself, which is the prerequisite; it is listed as deferred.
 
 - [ ] **Step 4: Full suite, both implementations**
 
-- [ ] **Step 5: Mutation-verify**
+- [ ] **Step 5: Mutation-verify.** Replace the guard with a plain `$conn->release` after the await. Expected: the cancellation subtest reds, and the dying-body assertions red. If neither does, the guard is not what is releasing, and that is the finding.
 
-Replace the guard with a plain `$conn->release` after the await. Expected: `'a cancelled pool query does not strand its connection'` reds, and the failure subtest reds too. If neither does, the guard is not what is releasing and that is the finding.
-
-- [ ] **Step 6: POD and commit**
-
-Document both, and say the connection is returned automatically. Note that `query` is for one statement and a scoped handle (Task 4) is for several. ASCII only.
-
----
-
-### Task 4: A scoped connection handle
-
-**Files:**
-- Modify: `lib/Async/DBD/Pg.pm`
-- Test: `t/pool/basic.t`
-
-**Interfaces:**
-- Consumes: Task 3's `_ReleaseGuard`.
-- Produces: a handle that borrows a connection and returns it when the handle goes out of scope.
-
-`$pg->query` covers one statement. Several statements on one connection still means a manual checkout and a release you can forget. A handle whose lexical scope owns the checkout removes the obligation without a callback.
-
-**This task's shape needs a ruling before it starts.** The obvious model is Mojo::Pg's `$pg->db`, and there is unease about adopting Mojo idioms wholesale. The mechanism is not in question; the naming and the borrow semantics are:
-
-| option | call site | notes |
-|---|---|---|
-| `$pg->db` | `my $db = await $pg->db; await $db->query(...)` | Mojo's name. Familiar to Mojo users, opaque to everyone else -- "db" names the wrong thing, since it is a borrowed connection rather than a database. |
-| `$pg->checkout` | `my $c = await $pg->checkout; await $c->query(...)` | Says exactly what it does. No precedent in other clients. |
-| `$pg->with_connection(async sub {...})` | callback, released at return | No lexical-lifetime subtlety at all, and no chance of holding it past its usefulness. Costs an indentation level. |
-
-The callback form is the safest and the least surprising; the handle form reads better for long procedural code. They are not exclusive.
-
-- [ ] **Step 1: Get the ruling.** Do not implement until the shape is chosen. Record the decision and the reason in this plan before writing any code.
-
-- [ ] **Step 2 onwards:** to be written once the shape is settled. The tests will mirror Task 3's: it releases on success, on failure, and on cancellation; a second borrow works afterwards; and the mutation is removing whatever performs the release.
-
----
+- [ ] **Step 6: POD and commit.** Document all three, and say the connection is returned automatically. Note that `query` is for one statement and `with_connection` for several. ASCII only, `podchecker` clean.
 
 ## Deferred, for discussion after these four
 
