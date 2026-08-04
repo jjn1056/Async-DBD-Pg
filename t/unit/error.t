@@ -27,7 +27,7 @@ subtest 'query error' => sub {
     isa_ok $err, 'Async::DBD::Pg::Error';
     isa_ok $err, 'Async::DBD::Pg::Error::Query';
 
-    is $err->code, '23505', 'SQLSTATE code';
+    is $err->state, '23505', 'SQLSTATE code';
     is $err->constraint, 'users_email_key', 'constraint name';
     is $err->detail, 'Key (email)=(test@example.com) already exists.', 'detail';
     is $err->hint, undef, 'hint can be undef';
@@ -42,10 +42,10 @@ subtest 'state is the SQLSTATE, matching DBI' => sub {
 
     is $err->state, '23505',
         'state is the five-character SQLSTATE, as DBI documents it';
-    is $err->code, '23505',
-        'code remains an alias for the same thing';
     is $err->state_name, 'unique_violation',
         'the readable name moved to state_name';
+    ok !Async::DBD::Pg::Error::Query->can('code'),
+        'code is gone rather than aliased -- one accessor, one meaning';
 
     my $odd = Async::DBD::Pg::Error::Query->new(message => 'x', code => '99999');
     is $odd->state, '99999', 'an unmapped code still reports its SQLSTATE';
@@ -178,7 +178,7 @@ subtest 'errors can be thrown and caught' => sub {
 
     ok $caught, 'error was thrown';
     isa_ok $caught, 'Async::DBD::Pg::Error::Query';
-    is $caught->code, '42601', 'caught error has correct code';
+    is $caught->state, '42601', 'caught error has correct code';
 };
 
 done_testing;

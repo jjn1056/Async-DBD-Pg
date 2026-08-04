@@ -61,13 +61,9 @@ sub table      { shift->{table} }
 sub column     { shift->{column} }
 sub context    { shift->{context} }
 
-# The five-character SQLSTATE, which is what DBI's own state() returns and
-# what callers compare against. Kept as the meaning of state() rather than a
-# readable name: a name is only useful for the handful of codes this module
-# happens to map, while the code is always present and is what PostgreSQL's
-# documentation is indexed by.
+# The five-character SQLSTATE. This is what DBI's own state() returns, what
+# PostgreSQL's documentation is indexed by, and what callers compare against.
 sub state { $_[0]->{code} }
-sub code  { $_[0]->{code} }
 
 # The readable name for the codes worth naming, 'unknown' otherwise.
 sub state_name {
@@ -113,7 +109,7 @@ Async::DBD::Pg::Error - Error classes for Async::DBD::Pg
     if (my $err = $@) {
         if ($err->isa('Async::DBD::Pg::Error::Query')) {
             warn "Query failed: " . $err->message;
-            warn "SQLSTATE: " . $err->code;
+            warn "SQLSTATE: " . $err->state;
         }
     }
 
@@ -144,10 +140,6 @@ The five character SQLSTATE, for example C<23505>, as DBI's own C<state>
 documents it. This changed meaning: it used to return a readable name, which
 made code comparing C<state> against a SQLSTATE such as C<'23505'> never
 match. Readable names are now C<state_name>.
-
-=head3 code
-
-An alias for C<state>.
 
 =head3 state_name
 
