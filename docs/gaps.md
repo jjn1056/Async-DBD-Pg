@@ -301,7 +301,7 @@ current lazy-splice behaviour and documents it; adding a proper
 `on_cancel` will need that comment and its `waiting_count` assertions
 revisited.
 
-### 72. The `closing` phase does double duty — CONFIRMED, and caller-visible
+### 72. The `closing` phase does double duty — FIXED
 
 **File:** `PubSub.pm` (`{phase}`)
 
@@ -468,3 +468,28 @@ an armed `_CheckoutGuard`. Exit status 0 and zero bytes on stderr under both
 nothing observable justifies it, and a guard that silently skips its release is
 its own hazard if the condition is ever wrong. Left as recorded rather than
 fixed.
+
+**Fixed 2026-08-04.** `_pool_shutdown` now ends at a fifth phase, `'shut'`,
+distinct from `disconnect()`'s transient `'closing'`. Both refusal sites report
+`PubSub has been shut down` for it and `PubSub is disconnecting` for the other,
+matching the pool's existing `is shutting down` / `has been shut down` pair. A
+`_tearing_down` predicate keeps the disjunction in one place.
+
+`disconnect()` also returns immediately on a shut object. It previously set
+`'closing'` on entry and `'disconnected'` at its early return, so calling it on
+a terminally shut pub/sub reversed the terminal state — and a first attempt at
+the fix guarded the *later* assignment, which never fired because the earlier
+one had already destroyed the distinction.
+
+One existing expectation changed: `t/pool/shutdown.t` asserted that a refusal
+after a fully settled shutdown says `is disconnecting`. That subtest is named
+`'shutdown refuses pub/sub work permanently'`, so the new message is what its
+own name always meant.
+
+See `docs/superpowers/specs/2026-08-04-pubsub-terminal-phase-design.md`, which
+also records a claim it got wrong: the audit argued that the reconnect
+supervisor's `ne 'closing'` tests would spin once a new phase existed. Mutating
+the predicate reds only the refusal tests — `_pool_shutdown` cancels the
+supervisor outright, so those phase tests sit behind the cancellation as a
+second line of defence. They were still made positive, as defence rather than
+as a proven fix.
