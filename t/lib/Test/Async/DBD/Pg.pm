@@ -8,6 +8,21 @@ use Test2::V0;
 
 our @EXPORT_OK = qw(require_postgres skip_without_postgres test_dsn);
 
+# Tag every connection this suite opens. The kill helpers in the test files
+# terminate backends to simulate a dropped connection, and without a tag the
+# only thing they can filter on is the database -- so they take out every
+# other connection to it as well, including an unrelated application's.
+#
+# libpq reads PGAPPNAME when it connects, which covers the pool's connections,
+# anything an on_connect hook opens, reconnects, and the helpers' own
+# DBI->connect. Set unconditionally rather than with //=: honouring an
+# inherited value would point the kills at whatever that value names, which is
+# the failure this exists to prevent.
+#
+# Per-process, so two concurrent runs of the suite cannot terminate each
+# other's backends either.
+BEGIN { $ENV{PGAPPNAME} = "async-dbd-pg-test-$$" }
+
 sub test_dsn {
     return $ENV{TEST_PG_DSN} // 'postgresql://postgres:test@localhost:5432/test';
 }
