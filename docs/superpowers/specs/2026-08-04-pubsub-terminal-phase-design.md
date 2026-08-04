@@ -79,7 +79,9 @@ sub _tearing_down {
 }
 ```
 
-Every site, and what it becomes:
+Every site, and what it becomes. `grep -n "{phase} eq\|{phase} ne"` reports
+twelve lines against this table's eleven: the twelfth, at `:646`, is prose
+inside a comment, not a test.
 
 | line | current | becomes | why |
 |---|---|---|---|
