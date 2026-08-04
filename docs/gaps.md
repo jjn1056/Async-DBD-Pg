@@ -1367,3 +1367,44 @@ after the notification, so a build that depends on a later socket wake
 fails — and `'a notification queued during a long control query arrives
 promptly after it'`. Mutation-verified: restoring the old ordering reds
 both.
+
+### 76. The test suite fails intermittently because `kill_backends()` is database-wide
+
+**File:** `t/integration/pubsub.t`, `t/pool/basic.t` (the helper is defined per-file)
+
+`kill_backends()` issues `pg_terminate_backend` against **every** backend on
+the test database, not just the connections the calling subtest owns. Tests
+that use it to simulate a dropped connection therefore also kill connections
+belonging to other parts of the same run.
+
+Measured at `c59364c`, nine consecutive full-suite runs under
+`Future::IO::Impl::UV` on an otherwise idle database: **1 failure, 8 clean**.
+The failure took out two files at once with the same cause:
+
+    t/integration/pubsub.t  'a reconnect supervisor backing off is not fooled
+                             by an ordinary listen() pausing the listener'
+    t/pool/basic.t          'a healed connection does not busy-wait on its
+                             old socket'
+    FATAL: terminating connection due to administrator command
+
+Both are tests that deliberately kill backends and then assert on recovery,
+and both leaked the FATAL to stderr — so the run breaches the pristine-output
+rule as well as failing.
+
+This matters for release, not just for us. A CPAN tester running the suite
+against a shared PostgreSQL instance would see intermittent red through no
+fault of their own, and anyone running two copies of the suite concurrently
+sabotages both.
+
+Not fixed here — it is a test-infrastructure problem, not a library defect,
+and fixing it properly means scoping termination to the connections a subtest
+actually owns (by pid, captured at checkout) rather than issuing a
+database-wide sweep. Recorded because the flakiness has already cost real time
+this session: four separate conclusions were drawn from samples too thin or
+too contaminated to support them, two of them reported as fact and later
+retracted.
+
+**How to measure anything against this suite:** confirm no stray processes
+(`pgrep -f 'prove|scratchpad.*\.pl'`) and no other backends
+(`pg_stat_activity`) first, then run the full suite 8+ times and report the
+count rather than one result. One green run is not evidence.
