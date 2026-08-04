@@ -31,7 +31,7 @@ which is what any client does without a timeout. Two opt-in bounds already exist
 `timeout` option on a query, and `statement_timeout` on the pool. Imposing a default would
 mean guessing a number that suits every workload, so nothing changed here.
 
-### 19. No waiter queue bound
+### 19. Waiter queue is bounded only by `queue_timeout` — MEASURED, no change
 
 Under spike load, the waiting queue is unbounded (limited only by memory). Thousands of
 waiters can queue up, each with a timer future.
@@ -280,7 +280,7 @@ Also unmerged upstream and worth watching, though speculative: the `pipeline-mod
 
 ## Section 11: Pool Shutdown
 
-### 69. The pool's queue branch registers no `on_cancel`
+### 69. `waiting_count` counted callers that had already gone — FIXED
 
 **File:** `Async/DBD/Pg.pm:411-417` (the "3. Queue and wait" branch of
 `connection()`)
@@ -405,7 +405,7 @@ Fixed by using `pending_future()`. Covered by `t/pool/shutdown.t`'s
 connection, releases it from a timer, and calls `->get` at the top level.
 Confirmed red first, with the exact croak.
 
-### 19. No waiter queue bound — MEASURED, real but bounded
+### 19. Waiter queue is bounded only by `queue_timeout` — MEASURED, no change — MEASURED, real but bounded
 
 Stressed at 20,000 queued waiters against a pool of 2, on an otherwise idle
 database:
@@ -424,7 +424,7 @@ cap would turn a slow degradation into a fast failure, which is a product
 decision rather than a defect: what should a pool do when 20,000 callers are
 waiting? Left open deliberately, now with numbers attached.
 
-### 69. The pool's queue branch registers no `on_cancel` — CONFIRMED
+### 69. `waiting_count` counted callers that had already gone — FIXED — CONFIRMED
 
 Reproduced exactly as described: five queued callers, all cancelled, and
 
@@ -493,3 +493,60 @@ the predicate reds only the refusal tests — `_pool_shutdown` cancels the
 supervisor outright, so those phase tests sit behind the cancellation as a
 second line of defence. They were still made positive, as defence rather than
 as a proven fix.
+
+## Corrections from measuring items 19 and 69, 2026-08-04
+
+Both entries overstated their problem, and the first attempt at fixing 69 was
+worse than the defect. Recorded because the wrong versions were believed for a
+while and acted on.
+
+### 19 — the queue is not unbounded
+
+The entry said "limited only by memory". `queue_timeout` defaults to **30
+seconds** and its timer splices the waiter out on expiry, without needing a
+connection to be released. So the steady-state ceiling is
+
+    arrival_rate x queue_timeout x ~8.7 KB per waiter
+
+— about 260 MB for a service where 1,000 acquisitions per second all queue,
+and it stays there rather than growing. Genuinely unbounded only if
+`queue_timeout => 0` is set explicitly, which is an opt-out.
+
+Measured: 20,000 waiters queue in 0.79s at 174 MB, hand-off after a release is
+prompt, and the process stays responsive and shuts down cleanly. No change
+made. A hard cap is a product decision — fail fast, or keep queueing — and
+nothing indicates anyone needs one.
+
+### 69 — the entry was wrong about how long it lasted, and the obvious fix was worse
+
+The entry said a cancelled waiter "sits in `{waiting}` indefinitely" if no
+connection is ever released. It does not: the `queue_timeout` timer sweeps it,
+same as for a timed-out waiter. Verified against the pre-fix code with a 0.4s
+timeout — `waiting_count` went to 0 at expiry with no release performed. The
+real exposure was a `waiting_count` that over-reported for up to
+`queue_timeout` seconds.
+
+**The first fix was a regression.** Splicing the entry out in an `on_cancel`
+handler is O(n) per cancellation, so cancelling a full queue is O(n²).
+Measured: 1,000 waiters 0.07s, 5,000 waiters 1.43s, **20,000 waiters 22.03s of
+blocked event loop**. That is a worse failure than the wrong number it fixed,
+and it only came to light because the fix was measured rather than assumed
+correct.
+
+Fixed instead by counting what the name promises — callers still genuinely
+waiting, skipping entries whose future has settled:
+
+    sub waiting_count { scalar grep { !$_->{future}->is_ready } @{shift->{waiting}} }
+
+O(1) per cancellation, O(n) only when the gauge is read, which is rare. Same
+20,000-waiter cancellation now takes **0.47s**, and `waiting_count` reports 0
+immediately rather than after the timeout sweep. Memory is still reclaimed by
+the timer or the next release, which is where it always was.
+
+Covered by `t/pool/basic.t`'s `'a cancelled queued caller is removed from the
+queue immediately'` and `'cancelling one queued caller leaves the others
+queued'`, both mutation-verified against reverting `waiting_count` to the raw
+array length. The safety property — a released connection is never handed to a
+caller that has gone — is asserted in the first of those and was already
+pinned by `t/integration/pubsub.t`'s `'abandoning a queued connect does not
+leave a waiter behind'`, whose comment has been corrected.

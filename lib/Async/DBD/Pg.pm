@@ -116,7 +116,17 @@ sub min_connections { shift->{min_connections} }
 sub max_connections { shift->{max_connections} }
 sub idle_count      { scalar @{shift->{idle}} }
 sub active_count    { scalar @{shift->{active}} }
-sub waiting_count   { scalar @{shift->{waiting}} }
+# Counts callers still genuinely waiting, not entries still in the array. A
+# caller that cancelled -- its own deadline, an enclosing wait_any, a request
+# handler going away -- leaves a settled future behind until the queue_timeout
+# timer or the next release sweeps it, and reporting those as waiting inflated
+# the gauge exactly when the pool was saturated and someone was reading it.
+#
+# Filtered here rather than spliced on cancellation: splicing is O(n) per
+# cancel, so cancelling a large queue became O(n^2) -- measured at 22 seconds
+# of blocked event loop for 20,000 waiters, which is a worse failure than the
+# wrong number it corrected.
+sub waiting_count   { scalar grep { !$_->{future}->is_ready } @{shift->{waiting}} }
 sub total_count     { my $s = shift; scalar(@{$s->{idle}}) + scalar(@{$s->{active}}) }
 sub stats           { shift->{stats} }
 sub safe_dsn        { Async::DBD::Pg::Util::safe_dsn(shift->{dsn}) }
