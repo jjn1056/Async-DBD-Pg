@@ -61,6 +61,12 @@ Adopting it rather than inventing a shape means anyone arriving from Mojo::Pg
 already knows it, and it generalises to every `pg_type` constant without
 further API.
 
+This reserves no syntax that currently works. A hashref bind value is refused
+today by DBD::Pg's own XS with `Cannot bind a reference` — verified — so
+giving it a meaning is purely additive. JSON is passed as a *string* today, so
+a document like `{"type":"click","value":42}` never reaches the sentinel check,
+which only inspects `ref $value eq 'HASH'`.
+
 ## Verified before designing around it
 
 Each of these was run against DBD::Pg 3.20.2 rather than assumed, because the
@@ -78,44 +84,79 @@ whole design rests on them:
 $params->{$name}`), so a sentinel survives named-placeholder conversion with no
 change to that function.
 
-## The ambiguity, and why the fix is documentation rather than code
+## Disambiguating a lone hashref
 
-`_parse_query_args` already gives a lone hashref a meaning:
-
-```perl
-if (@args == 1 && ref $args[0] eq 'HASH') {
-    $bind = $args[0];          # named placeholders
-}
-```
-
-So a single positional typed parameter collides:
+`_parse_query_args` already gives a lone hashref a meaning — named binds — so a
+single positional typed parameter has the same shape as a named-bind map:
 
 ```perl
-# read as named binds with keys 'type' and 'value', NOT as one typed value
-await $conn->query('INSERT INTO blobs (data) VALUES ($1)',
-    { type => PG_BYTEA, value => $bytes });
+{ type => PG_BYTEA, value => $bytes }   # one typed value?
+{ type => 'click',  value => 42     }   # binds for :type and :value?
 ```
 
-Mojo::Pg does not have this problem because it has no named placeholders.
+Identical input, two intentions. The keys cannot settle it: a query with
+`:type` and `:value` placeholders against a table with `type` and `value`
+columns is entirely ordinary.
 
-**Resolution: use the named form for that case.** It is unambiguous, needs no
-new syntax, and is arguably better style anyway:
+**The SQL settles it.** If the statement contains no `:name` placeholders, the
+hashref cannot be a named-bind map, so it is a single positional value:
 
 ```perl
-await $conn->query('INSERT INTO blobs (data) VALUES (:data)',
-    { data => { type => PG_BYTEA, value => $bytes } });
+my ($converted, $named) = convert_placeholders($sql, $bind);
+if (@$named || $converted ne $sql) { ($sql, $bind) = ($converted, $named) }
+else                               { $bind = [$bind] }
 ```
 
-Two alternatives were rejected. Sniffing the top-level hashref for `type` and
-`value` keys would misread a genuine named-bind hash for a query with `:type`
-and `:value` placeholders — and a table with `type` and `value` columns is
-entirely ordinary. Accepting `query($sql, \@binds)` as an explicit positional
-list would change the meaning of an existing call: today a lone arrayref is one
-parameter holding a PostgreSQL array, and it would become a list of parameters.
+This is the principle psycopg uses: its `%s` versus `%(name)s` declares the
+style in the statement itself, and the parameter container must match.
 
-The colliding call fails loudly rather than silently: with `$1` in the SQL and
-no `:name`, `convert_placeholders` returns an empty bind list and PostgreSQL
-rejects the statement for supplying no parameters. Wrong, but not quiet.
+Verified against the prototype — all four cases behave:
+
+| call | result |
+|---|---|
+| two positional, one typed | ok |
+| single positional typed | 256/256 bytes |
+| named placeholders with a sentinel | 256/256 bytes |
+| genuine `:type`/`:value` named binds | `type=click value=42` |
+
+Nothing valid changes meaning. A lone hashref against a statement with no
+`:name` placeholders is a hard error today — DBD::Pg reports `execute called
+with an unbound placeholder` — so giving it a meaning only turns a failure into
+a success.
+
+**One consequence to accept.** A mistyped named-bind call (`:naem` in the SQL,
+`naem` absent from the hash) now reports `Cannot bind a reference` from DBD::Pg
+rather than a missing-placeholder error. Both are loud; the attribution is
+worse. That is the price of the single-parameter form working, and the
+single-parameter binary insert is common enough to be worth it.
+
+## How other clients solve this
+
+Checked against source, because the answer determines whether annotation is a
+wart or a necessity.
+
+| client | binary parameter | mechanism |
+|---|---|---|
+| node-postgres | `Buffer` | dispatch on JS type; `toPostgres()` escape hatch |
+| psycopg | `bytes` | dispatch on Python type; `%b`/`%t` forces wire format |
+| asyncpg | `bytes` | dispatch on Python type, plus server type OIDs |
+| Mojo::Pg | `{type => PG_BYTEA, value => $x}` | caller annotates |
+| DBI / DBD::Pg | `bind_param($i, $v, {pg_type => ...})` | caller annotates |
+
+node-postgres is explicit — `if (val instanceof Buffer) { return val }`, then
+dates, arrays and objects each dispatched on type. Psycopg the same.
+
+**The divide is the language, not the library.** Python, JavaScript and Go each
+have a distinct binary type, so their clients can look at a value and know.
+Perl has none: a scalar holding an image and a scalar holding a sentence are
+the same thing. Annotation is the only mechanism available, which is why both
+Perl clients use it, and why the "infer from the value" option was unavailable
+rather than merely unattractive — the only signals are "contains a NUL" or
+"fails a UTF-8 check", and both misfire on legitimate text.
+
+DBI never meets this ambiguity because it has no bulk-bind API: every parameter
+is an explicit `bind_param` call. The ambiguity is a cost of our convenience
+layer, and worth naming as ours.
 
 ## Implementation
 
