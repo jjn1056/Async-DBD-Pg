@@ -303,4 +303,29 @@ subtest 'shutdown completes while a listener is trying to reconnect' => sub {
     is $pg->total_count, 0, 'still empty once the backoff would have elapsed';
 };
 
+
+subtest 'shutdown->get waits at the top level rather than croaking' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn => test_dsn(), min_connections => 0, max_connections => 2,
+    );
+    my $held = $pg->connection->get;
+    is $pg->active_count, 1, 'a connection is checked out';
+
+    # Released from a timer, so shutdown genuinely has to wait rather than
+    # finding the pool already drained. Held in a lexical rather than ->retain
+    # -- see gaps item 64 for why.
+    my $releaser = Future::IO->sleep(0.2)->on_done(sub { $held->release });
+
+    # The idiom a caller outside an async sub writes. The drain future was a
+    # bare Future->new, whose top-level ->get croaks the moment it is not
+    # already ready instead of pumping the reactor -- so this worked only when
+    # the pool had nothing to wait for, which is when it is not needed.
+    my $ok  = eval { $pg->shutdown->get; 1 };
+    my $err = $@;
+
+    ok $ok, 'shutdown->get waited for the checkout to come back'
+        or diag "shutdown->get died: $err";
+    is $pg->active_count, 0, 'and the pool drained';
+};
+
 done_testing;
