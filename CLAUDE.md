@@ -37,6 +37,11 @@ docker compose up -d
 ```
 Default: `postgresql://postgres:test@localhost:5432/test` (PostgreSQL 16-Alpine).
 
+`TEST_PG_DSN` is required — there is no default. Without it the integration
+and pool tests skip; only the unit tests run. This is deliberate: the suite
+creates and drops data and terminates backends, so it runs only against a
+database named explicitly.
+
 `PG_PORT` overrides the published host port when 5432 is already in use
 (`PG_PORT=5433 docker compose up -d`); `TEST_PG_DSN` must then name the same
 port. Check which port the container actually published before running the
