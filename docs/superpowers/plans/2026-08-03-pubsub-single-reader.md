@@ -500,6 +500,16 @@ async sub _listener_loop {
         if ($waiter && $conn->_result_ready) {
             delete $self->{_query_waiter};
             $waiter->done unless $waiter->is_ready;
+
+            # Start the iteration over rather than parking. ->done above
+            # resumes the waiting query synchronously, all the way through its
+            # own pg_result, which consumes whatever is on the socket --
+            # trailing notifications included -- into libpq's buffer without
+            # draining them. Parking here would wait on an OS readability
+            # event that has already happened. Going back to the top drains
+            # that buffer first, and re-tests the loop condition, which the
+            # resumed query may have invalidated by tearing the listener down.
+            next;
         }
 
         await Future::IO->poll($sock, POLLIN);
@@ -548,7 +558,11 @@ Expected: `160/160 received, 160 distinct, 0 duplicated`, `VERDICT: clean`, both
 
 - [ ] **Step 9: Mutation-verify**
 
-In a scratch copy with `$INC` confirmed, remove the waiter-completion block from the loop (the `if ($waiter && $conn->_result_ready)` stanza). Expected: control queries hang, and `'a control query completes while the listener keeps running'` reds on its bound rather than on setup.
+Two mutations, each in a scratch copy with `$INC` confirmed.
+
+1. Remove the waiter-completion block from the loop (the whole `if ($waiter && $conn->_result_ready)` stanza). Expected: control queries hang, and `'a control query completes while the listener keeps running'` reds on its bound rather than on setup.
+
+2. Remove only the `next`, letting control fall through to the poll. Expected: the fragmentation experiment stalls — a growing backlog that never drains without unrelated traffic. **The suite will not catch this one**; it was found by the experiment in Step 8 while the full suite passed 189/189 clean on both implementations. That asymmetry is the point of the mutation: it records that this line is load-bearing for a property no test asserts directly.
 
 - [ ] **Step 10: Commit**
 
