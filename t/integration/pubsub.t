@@ -2152,4 +2152,128 @@ subtest 'a query parked on the listener is failed when the loop itself dies' => 
     $pg->shutdown->get;
 };
 
+
+subtest 'teardown in progress and terminally shut are distinguishable' => sub {
+    # The defect: both states refused with the identical message, so a caller
+    # could not tell "retry shortly" from "stop asking". The two errors must
+    # differ, and -- more importantly -- must predict behaviour: the transient
+    # one is followed by a working retry, the terminal one is not.
+    my $transient;
+    {
+        my $pg = Async::DBD::Pg->new(
+            dsn => test_dsn(), min_connections => 0, max_connections => 4,
+        );
+        my $pubsub = $pg->pubsub;
+        $pubsub->listen('t72_transient', sub { })->get;
+
+        my $disconnecting = $pubsub->disconnect;
+        $transient = dies { $pubsub->listen('t72_mid', sub { })->get };
+        $disconnecting->get;
+
+        ok $transient, 'a listen during disconnect is refused';
+        like $transient, qr/disconnecting/,
+            'and says teardown is in progress';
+
+        ok lives { $pubsub->listen('t72_after', sub { })->get },
+            'retrying once teardown settles works -- the refusal was transient';
+
+        $pubsub->disconnect->get;
+        $pg->shutdown->get;
+    }
+
+    my $terminal;
+    {
+        my $pg = Async::DBD::Pg->new(
+            dsn => test_dsn(), min_connections => 0, max_connections => 4,
+        );
+        my $pubsub = $pg->pubsub;
+        $pubsub->listen('t72_terminal', sub { })->get;
+        $pg->shutdown->get;
+
+        $terminal = dies { $pubsub->listen('t72_never', sub { })->get };
+        ok $terminal, 'a listen after pool shutdown is refused';
+        like $terminal, qr/has been shut down/,
+            'and says so, rather than claiming teardown is in progress';
+        unlike $terminal, qr/is disconnecting/,
+            'it does not report itself as merely mid-teardown';
+
+        ok dies { $pubsub->listen('t72_still_never', sub { })->get },
+            'and stays refused -- the refusal was terminal';
+    }
+
+    isnt "$transient", "$terminal",
+        'the two states do not report the same thing';
+};
+
+subtest 'a terminally shut pub/sub refuses through both refusal sites' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn => test_dsn(), min_connections => 0, max_connections => 4,
+    );
+    my $pubsub = $pg->pubsub;
+    $pubsub->listen('t72_sites', sub { })->get;
+    $pg->shutdown->get;
+
+    # connect() and _run_control_query() refuse independently. A convenience
+    # method reaches only one of them, so both are exercised directly.
+    like dies { $pubsub->connect->get }, qr/has been shut down/,
+        'connect reports the terminal state';
+    like dies { $pubsub->_run_control_query('LISTEN whatever')->get },
+        qr/has been shut down/,
+        'and so does a control query';
+};
+
+subtest 'disconnect does not resurrect a terminally shut pub/sub' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn => test_dsn(), min_connections => 0, max_connections => 4,
+    );
+    my $pubsub = $pg->pubsub;
+    $pubsub->listen('t72_resurrect', sub { })->get;
+    $pg->shutdown->get;
+
+    # disconnect() on an already-shut object takes an early return that used
+    # to set the phase to 'disconnected' unconditionally -- reversing a
+    # terminal state and claiming the object was connectable again.
+    $pubsub->disconnect->get;
+
+    # Asserted on the phase itself, not on the error a later listen() happens
+    # to produce: with the phase reset, listen() still fails -- but at the
+    # pool, whose message is 'Connection pool has been shut down'. Matching on
+    # the text alone would pass while the terminal state was being reversed.
+    is $pubsub->{phase}, 'shut',
+        'the terminal phase survives a redundant disconnect';
+
+    my $err = dies { $pubsub->listen('t72_after_resurrect', sub { })->get };
+    like $err, qr/PubSub has been shut down/,
+        'and the refusal still comes from the pub/sub, not from the pool';
+    ok !$pubsub->is_connected, 'and it still reports itself not connected';
+};
+
+subtest 'the reconnect supervisor stops when the pool shuts down' => sub {
+    my @logged;
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 4,
+        on_log          => sub { push @logged, $_[1] },
+    );
+    my $pubsub = $pg->pubsub;
+    $pubsub->listen('t72_supervisor', sub { })->get;
+
+    my $captured = capture_stderr(sub {
+        kill_backends();
+        wait_until(sub { !$pubsub->is_connected }, 'listener noticed', 5);
+    });
+    is $captured, '', 'the termination notice does not reach fd 2';
+
+    # A supervisor that tests "phase ne 'closing'" keeps looping once the
+    # phase is terminal instead. Bounded on purpose: a spin is the failure
+    # mode here, so an unbounded wait would hang the suite rather than fail.
+    $pg->shutdown(timeout => 2)->get;
+
+    my $before = scalar @logged;
+    Future::IO->sleep(1)->get;
+    is scalar(@logged), $before,
+        'the supervisor is not still retrying after the pool shut down';
+};
+
 done_testing;

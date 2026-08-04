@@ -233,8 +233,12 @@ subtest 'shutdown refuses pub/sub work permanently, not just until reconnect' =>
     # internal mechanisms -- it's the only way to exercise the check itself
     # rather than something further downstream.
     my $err = dies { $pubsub->_run_control_query('LISTEN shutdown_direct_probe')->get };
-    like $err, qr/PubSub is disconnecting/,
-        'refused with the teardown error even once shutdown has fully settled';
+    # 'has been shut down', not 'is disconnecting'. This subtest's own name is
+    # the reason: the refusal here is permanent, and reporting it with the
+    # message disconnect() uses told a caller to retry something that will
+    # never succeed. See the terminal-phase design spec.
+    like $err, qr/PubSub has been shut down/,
+        'refused as permanently shut, not as merely mid-teardown';
 };
 
 subtest 'shutdown completes while a listener is trying to reconnect' => sub {

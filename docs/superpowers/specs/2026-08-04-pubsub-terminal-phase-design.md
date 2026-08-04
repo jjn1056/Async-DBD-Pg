@@ -64,8 +64,24 @@ both in `_reconnect_loop`, and both would misbehave rather than fail loudly:
     while ($self->{phase} ne 'closing') {   # :415 -- spins forever once 'shut'
     last if $self->{phase} eq 'closing';    # :426 -- never stops on 'shut'
 
-So the supervisor would keep running against a pub/sub whose pool is gone. Both
-must become a positive test. Introduce one predicate rather than repeating the
+The concern was that the supervisor would keep running against a pub/sub whose
+pool is gone.
+
+**Corrected after implementing: that spin is not reachable, and no test proves
+it.** Mutating `_tearing_down` back to `'closing'` only reds the two *refusal*
+tests and leaves the supervisor test green — because `_pool_shutdown` cancels
+`{_reconnect_future}` outright, so the loop is torn down by cancellation
+whatever its phase test says. The phase test is a second line of defence behind
+that cancellation, exactly as `_listener_loop`'s slot checks sat behind
+`_stop_listener` in gaps item 71.
+
+Both sites still become positive tests: a phase value added later is then
+refused by default rather than falling through silently, which costs nothing
+and is the more robust shape. But that is a defensive change, not a fix for a
+demonstrated defect, and this spec claimed otherwise before it was measured.
+
+The audit itself remains the point — the refusal sites genuinely do need
+updating, and the mutation proves it. Introduce one predicate rather than repeating the
 disjunction:
 
 ```perl
