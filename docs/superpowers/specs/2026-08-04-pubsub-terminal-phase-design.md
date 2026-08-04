@@ -64,9 +64,26 @@ both in `_reconnect_loop`, and both would misbehave rather than fail loudly:
     while ($self->{phase} ne 'closing') {   # :415 -- spins forever once 'shut'
     last if $self->{phase} eq 'closing';    # :426 -- never stops on 'shut'
 
-So the supervisor would keep running against a pub/sub whose pool is gone. Both
-must become a positive test. Introduce one predicate rather than repeating the
-disjunction:
+The concern was that the supervisor would keep running against a pub/sub whose
+pool is gone.
+
+**Corrected after implementing: that spin is not reachable, and no test proves
+it.** Mutating `_tearing_down` back to `'closing'` only reds the two *refusal*
+tests and leaves the supervisor test green — because `_pool_shutdown` cancels
+`{_reconnect_future}` outright, so the loop is torn down by cancellation
+whatever its phase test says. The phase test is a second line of defence behind
+that cancellation, exactly as `_listener_loop`'s slot checks sat behind
+`_stop_listener` in gaps item 71.
+
+Both sites still become positive tests: a phase value added later is then
+refused by default rather than falling through silently, which costs nothing
+and is the more robust shape. But that is a defensive change, not a fix for a
+demonstrated defect, and this spec claimed otherwise before it was measured.
+
+The audit itself remains the point — the refusal sites genuinely do need
+updating, and the mutation proves it.
+
+Introduce one predicate rather than repeating the disjunction:
 
 ```perl
 # True once teardown has begun, whether it will finish in a reconnectable
@@ -92,8 +109,8 @@ inside a comment, not a test.
 | `:319` | `_listener_loop`: `while eq 'live'` | unchanged | already positive |
 | `:356` | `_start_listener`: `eq 'live'` | unchanged | already positive |
 | `:366` | on_fail: `ne 'live'` | unchanged | positive in effect |
-| `:415` | `_reconnect_loop`: `while ne 'closing'` | `while !_tearing_down` | **would spin** |
-| `:426` | `_reconnect_loop`: `last if eq 'closing'` | `last if _tearing_down` | **would not stop** |
+| `:415` | `_reconnect_loop`: `while ne 'closing'` | `while !_tearing_down` | defensive; cancellation already stops it |
+| `:426` | `_reconnect_loop`: `last if eq 'closing'` | `last if _tearing_down` | defensive; see above |
 | `:520` | `_run_control_query` refuses | `_tearing_down`, message by phase | must refuse in both |
 | `:621` | `disconnect` early return | see below | **would resurrect** |
 

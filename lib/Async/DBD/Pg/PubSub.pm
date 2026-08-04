@@ -39,6 +39,19 @@ sub new {
 sub pool                { shift->{pool} }
 sub conn                { shift->{conn} }
 sub is_connected        { shift->{phase} eq 'live' }
+
+# True once teardown has begun, whether it will end somewhere reconnectable
+# ('disconnected', after disconnect) or terminal ('shut', after the pool goes).
+# Anything that must simply stop working asks this; anything that must tell a
+# caller which of the two it is reads {phase} directly.
+#
+# Written as a positive test rather than `ne 'closing'` on purpose: a phase
+# value added later is then refused by default instead of silently falling
+# through, which is how a loop guarded on "not closing" would spin.
+sub _tearing_down {
+    my $phase = shift->{phase};
+    return $phase eq 'closing' || $phase eq 'shut';
+}
 sub subscribed_channels { scalar keys %{shift->{channels}} }
 
 sub _validate_channel {
@@ -101,8 +114,10 @@ async sub connect {
     # once {phase} is 'closing'. 'closing' is not terminal: once teardown
     # settles, {phase} is 'disconnected' and a fresh connect is allowed again.
     die Async::DBD::Pg::Error::Connection->new(
-        message => 'PubSub is disconnecting',
-    ) if $self->{phase} eq 'closing';
+        message => $self->{phase} eq 'shut'
+            ? 'PubSub has been shut down'
+            : 'PubSub is disconnecting',
+    ) if $self->_tearing_down;
 
     # One attempt, shared by everyone who needs a connection -- explicit
     # callers and the reconnect supervisor alike. Callers arriving together
@@ -412,7 +427,7 @@ async sub _reconnect_loop {
 
     my $attempt = 0;
 
-    while ($self->{phase} ne 'closing') {
+    while (!$self->_tearing_down) {
         $attempt++;
 
         my $delay = _backoff_delay(
@@ -423,7 +438,7 @@ async sub _reconnect_loop {
 
         await Future::IO->sleep($delay);
 
-        last if $self->{phase} eq 'closing';
+        last if $self->_tearing_down;
 
         my $ok = eval {
             # Through connect(), not a checkout of our own. An ordinary
@@ -516,8 +531,10 @@ async sub _run_control_query {
     # then have teardown release that same connection out from under it a
     # moment later -- corrupting it for whoever the pool hands it to next.
     die Async::DBD::Pg::Error::Connection->new(
-        message => 'PubSub is disconnecting',
-    ) if $self->{phase} eq 'closing';
+        message => $self->{phase} eq 'shut'
+            ? 'PubSub has been shut down'
+            : 'PubSub is disconnecting',
+    ) if $self->_tearing_down;
 
     # Claimed with a fresh future rather than the query's own future: the
     # query does not exist yet, since the connection is checked and the
@@ -580,6 +597,13 @@ async sub _run_control_query {
 
 async sub disconnect {
     my ($self) = @_;
+
+    # A terminally shut pub/sub has already been torn down and is not coming
+    # back, so there is nothing here to do. Returned before the assignment
+    # below rather than guarded further down: that assignment would overwrite
+    # 'shut' with 'closing' and lose the distinction before anything could
+    # act on it.
+    return $self if $self->{phase} eq 'shut';
 
     # Stop trying to come back before tearing down; otherwise a reconnect in
     # flight would re-establish the listener behind us. Set before the
@@ -650,7 +674,7 @@ sub _pool_shutdown {
     # chosen because it is the honest answer -- unlike disconnect(), a
     # pool-shut-down pubsub is not going to reconnect, and 'disconnected'
     # would claim otherwise.
-    $self->{phase} = 'closing';
+    $self->{phase} = 'shut';
 
     if (my $reconnecting = delete $self->{_reconnect_future}) {
         $reconnecting->cancel unless $reconnecting->is_ready;
