@@ -778,6 +778,8 @@ Comments describing a stop/restart that no longer happens, and gaps items
 ## Done when
 
 - The suite passes under `PERL_FUTURE_IO_IMPL=UV` and `=IOAsync` with zero bytes on stderr, and `pg_stat_activity` shows no leaked backends before or after.
-- `grep -n '_stop_listener' lib/Async/DBD/Pg/PubSub.pm` shows callers only in teardown and reconnect — none in `_run_control_query` or `_ControlQueryGuard`.
+- `grep -n '_stop_listener' lib/Async/DBD/Pg/PubSub.pm` shows **exactly one** call site, in `disconnect()` — and none in `_run_control_query` or `_ControlQueryGuard`.
+
+  Earlier drafts of this plan said "teardown and reconnect", which is wrong and was restated several times before anyone checked. `_pool_shutdown` cancels `{_listener_future}` directly because it is synchronous and cannot await `_stop_listener`; `_reconnect_loop` never calls it, because by the time a reconnect starts the old listener has already died. The requirement is unaffected either way, but the claim was inaccurate.
 - The fragmentation experiment reports `160/160` and `VERDICT: clean` on both implementations.
 - Every task's mutation check reded on the property it targets, not on something incidental.
