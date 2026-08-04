@@ -33,8 +33,33 @@ mean guessing a number that suits every workload, so nothing changed here.
 
 ### 19. Waiter queue is bounded only by `queue_timeout` — MEASURED, no change
 
-Under spike load, the waiting queue is unbounded (limited only by memory). Thousands of
-waiters can queue up, each with a timer future.
+Under spike load the waiting queue grows: every caller that cannot be served
+immediately is queued with a timer future, at roughly **8.7 KB each**.
+
+It is not unbounded, which earlier versions of this entry claimed twice.
+`queue_timeout` defaults to **30 seconds**, and its timer splices the waiter
+out on expiry without needing a connection to be released. The steady-state
+ceiling is therefore
+
+    arrival_rate x queue_timeout x ~8.7 KB per waiter
+
+— around 260 MB for a service where 1,000 acquisitions per second all queue,
+and it stays there rather than growing. It is genuinely unbounded only if
+`queue_timeout => 0` is set, which is an explicit opt-out.
+
+Measured on an otherwise idle database:
+
+    queued 20000 waiters in 0.79s, waiting_count=20000
+    process RSS: 174 MB
+    releasing one connection hands off to exactly one waiter, in 0.39s
+
+It degrades linearly rather than falling over: queueing is fast, hand-off is
+prompt, and the process stayed responsive and shut down cleanly.
+
+**No change made, deliberately.** A hard cap is a product decision — what
+should a pool do when 20,000 callers are waiting, fail fast or keep queueing?
+— and nothing indicates anyone needs one. Someone sizing a service can compute
+the ceiling from the formula above.
 
 ### 20. `parse_dsn` doesn't support Unix sockets
 
@@ -91,8 +116,6 @@ worth taking without the module.
 
 ---
 
-## Section 4: CPAN Packaging (release blockers)
-
 ### 46. COPY protocol support — DEFERRED to 0.002
 
 Every mature async PG library has COPY support built-in or via companion package. It's the
@@ -148,10 +171,6 @@ after an absolute age, regardless of activity. Include configurable jitter (like
 prevent thundering herd when many connections reach max lifetime simultaneously.
 
 ---
-
-## Section 8: Convenience Gaps vs. Plain DBD::Pg
-
-Features that users of DBD::Pg will expect and find missing.
 
 ### 51. No type binding control
 
@@ -218,8 +237,6 @@ a common misconfiguration.
 
 ---
 
-## Section 9: Nice to Have (future consideration)
-
 ### 59. JSON/JSONB column auto-expansion
 
 Mojo::Pg's `expand()` auto-decodes JSON/JSONB columns to Perl hashrefs/arrayrefs on read,
@@ -233,85 +250,6 @@ which is genuinely convenient. Questions to resolve before implementing:
 Low priority for initial release but high user-experience value.
 
 ---
-
-## Section 10: DBD::Pg Upstream Spike (COPY FROM async support) — RESOLVED UPSTREAM
-
-This spike identified four changes DBD::Pg needed for true non-blocking COPY FROM STDIN.
-All four have been implemented and merged into `bucardo/dbdpg` master as commit `8d729c0`
-("Add non-blocking async COPY FROM support", pull request #176, Github issue #177), by John
-Napiorkowski and Ed Sabol. The spike's premise no longer holds: DBD::Pg does now call
-`PQsetnonblocking()`, and the write-side primitives are surfaced to Perl.
-
-The original findings, for the record:
-
-1. **Expose `PQsetnonblocking()`** — or call it internally when entering COPY mode. DBD::Pg
-   never called this; the connection was always in blocking mode.
-
-2. **Expose `PQflush()`** — needed for the non-blocking write loop. When `PQputCopyData`
-   returns 0 (buffer full), the caller must: call `PQflush()`, if it returns 1 wait for
-   socket write-ready or read-ready, if read-ready call `PQconsumeInput()` (to avoid
-   deadlock from server NOTICEs), then retry.
-
-3. **Add `pg_putcopydata_async`** — or modify `pg_putcopydata` to honor non-blocking mode
-   and return 0 on buffer-full instead of blocking. `dbdimp.c:4537` had a `copystatus == 0`
-   branch that was dead code with a comment `/* non-blocking mode only */`.
-
-4. **Possibly expose `PQconsumeInput()`** — for the write-side flush loop. Already used
-   internally for `pg_getcopydata_async`.
-
-The assessment that the C changes were contained proved correct: the dead non-blocking
-branches needed `PQsetnonblocking()` to be called and their return values surfaced.
-
-**What this means for us.** The delivered API is `pg_putcopydata_async`,
-`pg_putcopyend_async` and `pg_flush` (see item 46 for the call contract). It is slated for
-DBD::Pg **3.21.0, which is not yet on CPAN** — the current release is 3.20.2 (May 1, 2026).
-So COPY FROM is gated on someone else's release schedule, which is why item 46 defers COPY
-rather than blocking our own release on it. When 3.21.0 ships, gate COPY behind a runtime
-version check, the same way async connect is already gated on DBD::Pg 3.19.0.
-
-Nothing else we want is gated: `pg_error_field` (47), `pg_placeholder_dollaronly` (52),
-`pg_skip_deallocate` (55) and `pg_getcopydata_async` are all in 3.20.2 today.
-
-Also unmerged upstream and worth watching, though speculative: the `pipeline-mode`,
-`single-row-mode` and `native-bools` branches on `bucardo/dbdpg`.
-
-
----
-
-## Section 11: Pool Shutdown
-
-### 69. `waiting_count` counted callers that had already gone — FIXED
-
-**File:** `Async/DBD/Pg.pm:411-417` (the "3. Queue and wait" branch of
-`connection()`)
-
-A cancelled queued caller is spliced out of `{waiting}` only lazily, by
-`_release_to_idle_or_waiting` the next time a connection is actually
-released (`next if $waiting->{future}->is_ready` skips settled entries).
-If no connection is ever released afterward, the stale entry sits in
-`{waiting}` indefinitely and `waiting_count` reports a wrong number. It
-never hands a connection to a caller that is no longer waiting for one —
-the `is_ready` check already handles that — so the damage is a wrong
-statistic and a small, bounded leak of a hash entry, not a correctness
-bug.
-
-Not fixed here. `t/integration/pubsub.t`'s `'abandoning a queued connect
-does not leave a waiter behind'` (the comment at `:401`) depends on the
-current lazy-splice behaviour and documents it; adding a proper
-`on_cancel` will need that comment and its `waiting_count` assertions
-revisited.
-
-### 72. The `closing` phase does double duty — FIXED
-
-**File:** `PubSub.pm` (`{phase}`)
-
-`closing` means both "teardown is in progress" and "terminally shut". The
-phase model replaced booleans whose overloading caused item 67, and this
-is the one place where the same ambiguity survives in the new field.
-Nothing depends on distinguishing the two today, which is why it was left
-alone. It matters if a caller ever needs to tell "wait for teardown, then
-retry" from "this object is finished" — a `shut` phase would separate
-them.
 
 ### 73. Teardown cancels in-flight work by name, not from a registry — DECIDED, not a defect
 
@@ -342,6 +280,7 @@ Two related debts it would not have fixed either way:
   wrong; it is three mechanisms, and any future consolidation has to
   start from that.
 
+
 ### 74. `_CheckoutGuard::DESTROY` has no `${^GLOBAL_PHASE}` check — TESTED, no observable effect
 
 **File:** `PubSub.pm` (`_CheckoutGuard::DESTROY`)
@@ -367,98 +306,6 @@ that silently skips its release is its own hazard if the condition is
 ever wrong.
 
 ---
-
-## Verified by stress test, 2026-08-04
-
-Items 19, 69 and the shutdown defect below were exercised deliberately rather
-than reasoned about. What follows is what was observed.
-
-### 77. `$pg->shutdown->get` croaked whenever a connection was still checked out — FIXED
-
-**File:** `Async/DBD/Pg.pm` (`shutdown`)
-
-Found by stress-testing item 19, not by any test in the suite.
-
-`shutdown`'s drain future was a bare `Future->new`. A bare `Future` has no
-reactor behind it, so its `->get` cannot block — it croaks with
-`Future=HASH(0x...) is not yet complete and does not provide ->await` the
-moment it is not already ready. `shutdown` awaits that future, so the future
-`shutdown` itself returns inherits the problem.
-
-The effect: `$pg->shutdown->get` worked only when the pool had nothing to wait
-for, and croaked whenever it actually had to drain a checkout — which is the
-only time the call matters. Reproduced on both `Future::IO::Impl::UV` and
-`::IOAsync` with a single held connection and no waiters at all.
-
-This is item 66's defect in a second place. That item fixed the queue branch of
-`connection()` and introduced `pending_future()` for exactly this reason;
-`shutdown` was missed.
-
-**Why the suite did not catch it.** `t/pool/shutdown.t` drives shutdown through
-a local `settle()` helper that polls `is_ready` in a loop, and the POD and
-examples all show `await $pg->shutdown` from inside an async sub. Both work.
-Neither is the idiom a caller outside an async sub writes, which is `->get` —
-and that was the only broken path.
-
-Fixed by using `pending_future()`. Covered by `t/pool/shutdown.t`'s
-`'shutdown->get waits at the top level rather than croaking'`, which holds a
-connection, releases it from a timer, and calls `->get` at the top level.
-Confirmed red first, with the exact croak.
-
-### 19. Waiter queue is bounded only by `queue_timeout` — MEASURED, no change — MEASURED, real but bounded
-
-Stressed at 20,000 queued waiters against a pool of 2, on an otherwise idle
-database:
-
-    queued 20000 waiters in 0.79s, waiting_count=20000
-    process RSS: 174 MB
-    releasing one connection hands off to exactly one waiter, in 0.39s
-
-So the queue is genuinely unbounded and costs roughly 8.7 KB per waiter, but it
-degrades linearly rather than falling over: queueing is fast, hand-off is
-O(1)-ish, and the process stayed responsive and shut down cleanly afterwards.
-
-The exposure is memory growth under sustained overload with callers that never
-time out — `queue_timeout` already bounds it for callers that set one. A hard
-cap would turn a slow degradation into a fast failure, which is a product
-decision rather than a defect: what should a pool do when 20,000 callers are
-waiting? Left open deliberately, now with numbers attached.
-
-### 69. `waiting_count` counted callers that had already gone — FIXED — CONFIRMED
-
-Reproduced exactly as described: five queued callers, all cancelled, and
-
-    after cancelling all: waiting_count=5
-    after 0.3s idle:      waiting_count=5
-    after a release:      waiting_count=0
-
-So the stale entries are real, they never clear on their own, and only a
-connection release sweeps them. The consequence is the one already recorded — a
-wrong `waiting_count` and a bounded hash-entry leak, not a connection handed to
-a caller that has gone. Still open, still not urgent, but no longer theoretical.
-
-### 72, 73, 74 — stress-test verdicts
-
-**72 is confirmed and is worse than this register said.** It was recorded as
-"nothing depends on distinguishing the two today". Something does: the caller.
-Measured —
-
-    during disconnect:   PubSub is disconnecting   -> retrying works
-    after pool shutdown: PubSub is disconnecting   -> terminal
-
-Identical error, opposite correct responses. A caller writing retry logic
-cannot tell "wait and try again" from "give up", so either it retries a dead
-object forever or it abandons a pub/sub that was about to become usable. That
-makes this an API defect rather than an internal tidiness point, and a separate
-terminal phase (or a distinct error) is the fix.
-
-**73 is a design observation, not a defect, and the decision has been made
-twice.** Teardown cancels four futures by name rather than from a registry. A
-registry makes forgetting a mechanism *benign* rather than impossible — a
-future nobody registers is exactly as orphaned as one nobody names — so it
-softens the failure mode without preventing it, at the cost of indirection over
-four call sites that are currently explicit. Recorded so the option is not
-re-derived; not something to build.
 
 **74 does not manifest.** Exercised deliberately: a process exiting with five
 connections checked out, a pub/sub listening, and a `notify` in flight holding
@@ -493,60 +340,3 @@ the predicate reds only the refusal tests — `_pool_shutdown` cancels the
 supervisor outright, so those phase tests sit behind the cancellation as a
 second line of defence. They were still made positive, as defence rather than
 as a proven fix.
-
-## Corrections from measuring items 19 and 69, 2026-08-04
-
-Both entries overstated their problem, and the first attempt at fixing 69 was
-worse than the defect. Recorded because the wrong versions were believed for a
-while and acted on.
-
-### 19 — the queue is not unbounded
-
-The entry said "limited only by memory". `queue_timeout` defaults to **30
-seconds** and its timer splices the waiter out on expiry, without needing a
-connection to be released. So the steady-state ceiling is
-
-    arrival_rate x queue_timeout x ~8.7 KB per waiter
-
-— about 260 MB for a service where 1,000 acquisitions per second all queue,
-and it stays there rather than growing. Genuinely unbounded only if
-`queue_timeout => 0` is set explicitly, which is an opt-out.
-
-Measured: 20,000 waiters queue in 0.79s at 174 MB, hand-off after a release is
-prompt, and the process stays responsive and shuts down cleanly. No change
-made. A hard cap is a product decision — fail fast, or keep queueing — and
-nothing indicates anyone needs one.
-
-### 69 — the entry was wrong about how long it lasted, and the obvious fix was worse
-
-The entry said a cancelled waiter "sits in `{waiting}` indefinitely" if no
-connection is ever released. It does not: the `queue_timeout` timer sweeps it,
-same as for a timed-out waiter. Verified against the pre-fix code with a 0.4s
-timeout — `waiting_count` went to 0 at expiry with no release performed. The
-real exposure was a `waiting_count` that over-reported for up to
-`queue_timeout` seconds.
-
-**The first fix was a regression.** Splicing the entry out in an `on_cancel`
-handler is O(n) per cancellation, so cancelling a full queue is O(n²).
-Measured: 1,000 waiters 0.07s, 5,000 waiters 1.43s, **20,000 waiters 22.03s of
-blocked event loop**. That is a worse failure than the wrong number it fixed,
-and it only came to light because the fix was measured rather than assumed
-correct.
-
-Fixed instead by counting what the name promises — callers still genuinely
-waiting, skipping entries whose future has settled:
-
-    sub waiting_count { scalar grep { !$_->{future}->is_ready } @{shift->{waiting}} }
-
-O(1) per cancellation, O(n) only when the gauge is read, which is rare. Same
-20,000-waiter cancellation now takes **0.47s**, and `waiting_count` reports 0
-immediately rather than after the timeout sweep. Memory is still reclaimed by
-the timer or the next release, which is where it always was.
-
-Covered by `t/pool/basic.t`'s `'a cancelled queued caller is removed from the
-queue immediately'` and `'cancelling one queued caller leaves the others
-queued'`, both mutation-verified against reverting `waiting_count` to the raw
-array length. The safety property — a released connection is never handed to a
-caller that has gone — is asserted in the first of those and was already
-pinned by `t/integration/pubsub.t`'s `'abandoning a queued connect does not
-leave a waiter behind'`, whose comment has been corrected.

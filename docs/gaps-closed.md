@@ -1138,3 +1138,126 @@ collision signatures, on assertions counting received payloads. Connection
 tagging cannot address this; it would need per-process channel names. Until
 then, **one suite run per database at a time**, and see the measurement
 guidance below.
+
+## Closed 2026-08-04
+
+### 69. `waiting_count` counted callers that had already gone — FIXED
+
+**File:** `Async/DBD/Pg.pm:411-417` (the "3. Queue and wait" branch of
+`connection()`)
+
+A cancelled queued caller is spliced out of `{waiting}` only lazily, by
+`_release_to_idle_or_waiting` the next time a connection is actually
+released (`next if $waiting->{future}->is_ready` skips settled entries).
+If no connection is ever released afterward, the stale entry sits in
+`{waiting}` indefinitely and `waiting_count` reports a wrong number. It
+never hands a connection to a caller that is no longer waiting for one —
+the `is_ready` check already handles that — so the damage is a wrong
+statistic and a small, bounded leak of a hash entry, not a correctness
+bug.
+
+Not fixed here. `t/integration/pubsub.t`'s `'abandoning a queued connect
+does not leave a waiter behind'` (the comment at `:401`) depends on the
+current lazy-splice behaviour and documents it; adding a proper
+`on_cancel` will need that comment and its `waiting_count` assertions
+revisited.
+
+Reproduced exactly as described: five queued callers, all cancelled, and
+
+    after cancelling all: waiting_count=5
+    after 0.3s idle:      waiting_count=5
+    after a release:      waiting_count=0
+
+So the stale entries are real, they never clear on their own, and only a
+connection release sweeps them. The consequence is the one already recorded — a
+wrong `waiting_count` and a bounded hash-entry leak, not a connection handed to
+a caller that has gone. Still open, still not urgent, but no longer theoretical.
+
+The entry said a cancelled waiter "sits in `{waiting}` indefinitely" if no
+connection is ever released. It does not: the `queue_timeout` timer sweeps it,
+same as for a timed-out waiter. Verified against the pre-fix code with a 0.4s
+timeout — `waiting_count` went to 0 at expiry with no release performed. The
+real exposure was a `waiting_count` that over-reported for up to
+`queue_timeout` seconds.
+
+**The first fix was a regression.** Splicing the entry out in an `on_cancel`
+handler is O(n) per cancellation, so cancelling a full queue is O(n²).
+Measured: 1,000 waiters 0.07s, 5,000 waiters 1.43s, **20,000 waiters 22.03s of
+blocked event loop**. That is a worse failure than the wrong number it fixed,
+and it only came to light because the fix was measured rather than assumed
+correct.
+
+Fixed instead by counting what the name promises — callers still genuinely
+waiting, skipping entries whose future has settled:
+
+    sub waiting_count { scalar grep { !$_->{future}->is_ready } @{shift->{waiting}} }
+
+O(1) per cancellation, O(n) only when the gauge is read, which is rare. Same
+20,000-waiter cancellation now takes **0.47s**, and `waiting_count` reports 0
+immediately rather than after the timeout sweep. Memory is still reclaimed by
+the timer or the next release, which is where it always was.
+
+Covered by `t/pool/basic.t`'s `'a cancelled queued caller is removed from the
+queue immediately'` and `'cancelling one queued caller leaves the others
+queued'`, both mutation-verified against reverting `waiting_count` to the raw
+array length. The safety property — a released connection is never handed to a
+caller that has gone — is asserted in the first of those and was already
+pinned by `t/integration/pubsub.t`'s `'abandoning a queued connect does not
+leave a waiter behind'`, whose comment has been corrected.
+
+### 72. The `closing` phase does double duty — FIXED
+
+**File:** `PubSub.pm` (`{phase}`)
+
+`closing` means both "teardown is in progress" and "terminally shut". The
+phase model replaced booleans whose overloading caused item 67, and this
+is the one place where the same ambiguity survives in the new field.
+Nothing depends on distinguishing the two today, which is why it was left
+alone. It matters if a caller ever needs to tell "wait for teardown, then
+retry" from "this object is finished" — a `shut` phase would separate
+them.
+
+**72 is confirmed and is worse than this register said.** It was recorded as
+"nothing depends on distinguishing the two today". Something does: the caller.
+Measured —
+
+    during disconnect:   PubSub is disconnecting   -> retrying works
+    after pool shutdown: PubSub is disconnecting   -> terminal
+
+Identical error, opposite correct responses. A caller writing retry logic
+cannot tell "wait and try again" from "give up", so either it retries a dead
+object forever or it abandons a pub/sub that was about to become usable. That
+makes this an API defect rather than an internal tidiness point, and a separate
+terminal phase (or a distinct error) is the fix.
+
+### 77. `$pg->shutdown->get` croaked whenever a connection was still checked out — FIXED
+
+**File:** `Async/DBD/Pg.pm` (`shutdown`)
+
+Found by stress-testing item 19, not by any test in the suite.
+
+`shutdown`'s drain future was a bare `Future->new`. A bare `Future` has no
+reactor behind it, so its `->get` cannot block — it croaks with
+`Future=HASH(0x...) is not yet complete and does not provide ->await` the
+moment it is not already ready. `shutdown` awaits that future, so the future
+`shutdown` itself returns inherits the problem.
+
+The effect: `$pg->shutdown->get` worked only when the pool had nothing to wait
+for, and croaked whenever it actually had to drain a checkout — which is the
+only time the call matters. Reproduced on both `Future::IO::Impl::UV` and
+`::IOAsync` with a single held connection and no waiters at all.
+
+This is item 66's defect in a second place. That item fixed the queue branch of
+`connection()` and introduced `pending_future()` for exactly this reason;
+`shutdown` was missed.
+
+**Why the suite did not catch it.** `t/pool/shutdown.t` drives shutdown through
+a local `settle()` helper that polls `is_ready` in a loop, and the POD and
+examples all show `await $pg->shutdown` from inside an async sub. Both work.
+Neither is the idiom a caller outside an async sub writes, which is `->get` —
+and that was the only broken path.
+
+Fixed by using `pending_future()`. Covered by `t/pool/shutdown.t`'s
+`'shutdown->get waits at the top level rather than croaking'`, which holds a
+connection, releases it from a timer, and calls `->get` at the top level.
+Confirmed red first, with the exact croak.
