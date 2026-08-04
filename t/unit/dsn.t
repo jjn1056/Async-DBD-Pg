@@ -55,4 +55,29 @@ subtest 'invalid DSN throws' => sub {
     like $died, qr/Cannot parse DSN/, 'invalid DSN throws';
 };
 
+
+subtest 'the test helper requires TEST_PG_DSN to be set explicitly' => sub {
+    # No fallback on purpose. Defaulting to localhost:5432 meant that on any
+    # machine with a PostgreSQL answering there -- a CPAN smoker's, a
+    # contributor's own -- the integration suite would connect and run against
+    # it uninvited, mutating data and terminating backends. Skipping is the
+    # right answer when nobody has said which database to use.
+    require Test::Async::DBD::Pg;
+
+    my $set = do {
+        local $ENV{TEST_PG_DSN} = 'postgresql://someone@example/db';
+        Test::Async::DBD::Pg::test_dsn();
+    };
+    is $set, 'postgresql://someone@example/db',
+        'test_dsn returns TEST_PG_DSN when it is set';
+
+    my $unset = do {
+        local %ENV = %ENV;
+        delete $ENV{TEST_PG_DSN};
+        Test::Async::DBD::Pg::test_dsn();
+    };
+    is $unset, undef,
+        'and undef when it is not, rather than a localhost default';
+};
+
 done_testing;

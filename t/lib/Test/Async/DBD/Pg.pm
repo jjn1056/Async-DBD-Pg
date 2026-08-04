@@ -23,12 +23,25 @@ our @EXPORT_OK = qw(require_postgres skip_without_postgres test_dsn);
 # other's backends either.
 BEGIN { $ENV{PGAPPNAME} = "async-dbd-pg-test-$$" }
 
+# Deliberately without a fallback. These tests create and drop data, and
+# terminate backends to simulate connection loss; running them against a
+# database nobody nominated is not something to do by default. A localhost
+# default meant that any machine with PostgreSQL answering on 5432 -- a CPAN
+# smoker's, a contributor's own -- would be used uninvited, because connecting
+# successfully was the only condition checked.
+#
+# Callers use it through require_postgres/skip_without_postgres, which skip
+# when this is undef, so an unset variable produces a clean skip rather than a
+# failure.
 sub test_dsn {
-    return $ENV{TEST_PG_DSN} // 'postgresql://postgres:test@localhost:5432/test';
+    return $ENV{TEST_PG_DSN};
 }
 
 sub require_postgres {
-    my $dsn = test_dsn();
+    my $dsn = test_dsn()
+        or skip_all('TEST_PG_DSN is not set; see CONTRIBUTORS.md for how to '
+                  . 'start a test database');
+
     my $parsed = _dsn_to_dbi($dsn);
 
     my $dbh = eval {
@@ -49,7 +62,9 @@ sub require_postgres {
 }
 
 sub skip_without_postgres {
-    my $dsn = test_dsn();
+    my $dsn = test_dsn()
+        or skip_all('TEST_PG_DSN is not set; see CONTRIBUTORS.md for how to '
+                  . 'start a test database');
 
     my $parsed = eval { _dsn_to_dbi($dsn) };
     skip_all("Cannot parse PostgreSQL DSN: $dsn") unless $parsed;

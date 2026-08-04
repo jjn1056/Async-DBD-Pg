@@ -41,6 +41,12 @@ TEST_PG_DSN="postgresql://postgres:test@localhost:5433/test" prove -r -l t/
 
 ### Run the Tests
 
+`TEST_PG_DSN` is required for anything that touches a database — there is no
+default. Without it, the integration and pool tests skip and say so. That is
+deliberate: these tests create and drop data and terminate backends to
+simulate connection loss, so they only ever run against a database somebody
+named explicitly. The unit tests need no database and run either way.
+
 ```bash
 TEST_PG_DSN="postgresql://postgres:test@localhost:5432/test" prove -r -l t/
 TEST_PG_DSN="postgresql://postgres:test@localhost:5432/test" prove -r -l -v t/
