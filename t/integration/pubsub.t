@@ -4,6 +4,7 @@ use Test2::V0;
 use Time::HiRes qw(time);
 use DBI;
 use File::Temp qw(tempfile);
+use Scalar::Util qw(refaddr);
 
 use lib 't/lib';
 use Test::Async::DBD::Pg qw(skip_without_postgres test_dsn);
@@ -1390,33 +1391,28 @@ subtest 'the listener keeps reading the connection it is polling' => sub {
     $pubsub->disconnect->get;
 };
 
-subtest 'the slot is free before the listener is restarted' => sub {
+subtest 'the control-query slot is released when a query completes' => sub {
     my $pg = Async::DBD::Pg->new(
         dsn => test_dsn(), min_connections => 0, max_connections => 3,
     );
     my $pubsub = $pg->pubsub;
 
-    $pubsub->listen('order_seed', sub { })->get;
+    # Replaces a subtest that pinned the ordering between freeing this slot and
+    # restarting the listener. Nothing restarts the listener now -- it never
+    # stops -- so that ordering has no referent, but the slot itself still
+    # matters: it is the mutex that keeps two async operations off one handle.
+    $pubsub->listen('slot_first', sub { })->get;
+    ok !$pubsub->{_control_query},
+        'the slot is free once the control query has settled';
 
-    # Whatever restarts the listener must see a free slot. Two guards
-    # destroyed in reverse declaration order restart it while the slot is
-    # still claimed, which Task 3's derived pause turns into a listener that
-    # exits immediately and is never started again.
-    my $slot_at_restart = 'unset';
-    no warnings 'redefine';
-    my $orig = Async::DBD::Pg::PubSub->can('_start_listener');
-    local *Async::DBD::Pg::PubSub::_start_listener = sub {
-        my ($ps) = @_;
-        $slot_at_restart = $ps->{_control_query} ? 'HELD' : 'free';
-        return $ps->$orig;
-    };
-
-    $pubsub->listen('order_probe', sub { })->get;
-
-    is $slot_at_restart, 'free',
-        'the control-query slot was released before the listener restarted';
+    # Would park in _run_control_query's mutex loop forever if the slot were
+    # not released, so this is the assertion with teeth rather than the one
+    # above.
+    $pubsub->listen('slot_second', sub { })->get;
+    ok $pubsub->is_connected, 'a second control query proceeds afterwards';
 
     $pubsub->disconnect->get;
+    $pg->shutdown->get;
 };
 
 subtest 'the listener is not restarted while a queued control query is in flight' => sub {
@@ -1880,6 +1876,65 @@ subtest 'a notification queued during a long control query arrives promptly afte
 
     $pubsub->disconnect->get;
     $notifier->release;
+    $pg->shutdown->get;
+};
+
+subtest 'a control query completes while the listener keeps running' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn => test_dsn(), min_connections => 0, max_connections => 4,
+    );
+    my $pubsub = $pg->pubsub;
+
+    my @got;
+    $pubsub->listen('sole_reader', sub { push @got, $_[1] })->get;
+
+    # The listener is running now. With the pause gone it stays running, and
+    # this query's result must be delivered by the listener rather than by the
+    # query polling for itself -- which is what the delegate arranges.
+    my $before = $pubsub->{_listener_future};
+    ok $before && !$before->is_ready, 'the listener is running before the query';
+
+    $pubsub->listen('sole_reader_two', sub { })->get;
+
+    my $after = $pubsub->{_listener_future};
+    ok $after && !$after->is_ready, 'the listener is still running after it';
+    ok refaddr($before) == refaddr($after),
+        'and it is the same listener -- never stopped and restarted';
+
+    # Still functional on both channels.
+    my $notifier = $pg->connection->get;
+    $notifier->query("SELECT pg_notify('sole_reader', 'a')")->get;
+    ok wait_until(sub { @got }, 'notification delivered', 5),
+        'notifications still flow after a control query';
+
+    $notifier->release;
+    $pubsub->disconnect->get;
+    $pg->shutdown->get;
+};
+
+subtest 'a control query issued from a notification callback completes' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn => test_dsn(), min_connections => 0, max_connections => 4,
+    );
+    my $pubsub = $pg->pubsub;
+
+    # The callback runs inside _process_notifications, which is inside the
+    # listener loop. Its listen() claims the control-query slot synchronously
+    # and then waits on the very loop that is running it.
+    my $inner;
+    $pubsub->listen('cb_origin', sub {
+        $inner //= $pubsub->listen('cb_target', sub { });
+    })->get;
+
+    my $notifier = $pg->connection->get;
+    $notifier->query("SELECT pg_notify('cb_origin', 'go')")->get;
+
+    ok wait_until(sub { $inner && $inner->is_ready }, 'inner listen settled', 8),
+        'a control query issued from a callback completes';
+    ok $inner->is_done, 'and it succeeded';
+
+    $notifier->release;
+    $pubsub->disconnect->get;
     $pg->shutdown->get;
 };
 

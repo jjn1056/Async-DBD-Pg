@@ -312,27 +312,37 @@ async sub _listener_loop {
     my $conn = $self->{conn} or return;
     my $sock = $conn->_get_socket;
 
-    # Pause exactly while something holds this connection. Reading the slot
-    # rather than a flag someone sets means there is nothing to leave behind:
-    # a paused listener resumes because the holder released, not because a
-    # second code path remembered to clear a boolean.
-    while ($self->{phase} eq 'live' && !$self->{_control_query}) {
-        # Drained before parking, not after waking. A control query that ran
-        # while this loop was paused consumed whatever arrived into libpq's
-        # buffer to get its own result, so by the time the pause lifts the
-        # socket can be empty while notifications are already in hand.
-        # Waiting on the socket first would strand them until unrelated
-        # traffic made it readable again.
+    # From here until this loop ends, this is the only thing polling this
+    # socket: a query on this connection waits on us instead. See _ReaderGuard.
+    my $reader = Async::DBD::Pg::PubSub::_ReaderGuard->new($self, $conn);
+
+    while ($self->{phase} eq 'live') {
+        # Drained before anything else, and before parking below. A control
+        # query's own result and a notification arrive in the same read, and
+        # whichever call consumes the socket buffers both -- so waiting on the
+        # socket first would strand notifications until unrelated traffic made
+        # it readable again.
         $self->_process_notifications($conn);
 
-        # Re-checked here rather than after the poll below. The call above runs
-        # user callbacks, and one that calls listen()/unlisten() claims the
-        # control-query slot synchronously before returning to us -- so by this
-        # line the pause may already be owed to somebody. Leaving cleanly is
-        # better than parking on the socket and being cancelled out of it.
-        # After the poll the same test would be redundant: the while condition
-        # re-tests it with nothing in between.
-        last unless $self->{phase} eq 'live' && !$self->{_control_query};
+        # Checked after those callbacks and before parking: a callback can
+        # issue a control query synchronously, and its result may be ready
+        # already. Deleted before completing, so a query issued by the resumed
+        # caller does not see a stale waiter.
+        my $waiter = $self->{_query_waiter};
+        if ($waiter && $conn->_result_ready) {
+            delete $self->{_query_waiter};
+            $waiter->done unless $waiter->is_ready;
+
+            # Start the iteration over rather than parking. ->done above
+            # resumes the waiting query synchronously, all the way through its
+            # own pg_result, which consumes whatever is on the socket --
+            # trailing notifications included -- into libpq's buffer without
+            # draining them. Parking here would wait on an OS readability
+            # event that has already happened. Going back to the top drains
+            # that buffer first, and re-tests the loop condition, which the
+            # resumed query may have invalidated by tearing the listener down.
+            next;
+        }
 
         await Future::IO->poll($sock, POLLIN);
     }
@@ -510,9 +520,10 @@ async sub _run_control_query {
     ) if $self->{phase} eq 'closing';
 
     # Claimed with a fresh future rather than the query's own future: the
-    # query does not exist yet, since _stop_listener below awaits before one
-    # is issued. Reading the loop's exit and claiming this are not separated
-    # by an await, so no second caller can slip in between.
+    # query does not exist yet, since the connection is checked and the
+    # statement dispatched only inside the eval below. Reading the loop's
+    # exit and claiming this are not separated by an await, so no second
+    # caller can slip in between.
     #
     # pending_future rather than a bare Future->new: a second caller waiting
     # on the loop above is otherwise handed back a listen()/unlisten() future
@@ -521,8 +532,6 @@ async sub _run_control_query {
     my $done = pending_future();
     $self->{_control_query} = $done;
     my $query_guard = Async::DBD::Pg::PubSub::_ControlQueryGuard->new($self, $done);
-
-    await $self->_stop_listener if $self->{_listener_future};
 
     # Held outside the eval so it can be asked about after: a cancelled
     # future reaches its awaiter as "Future=HASH(0x...) was cancelled" -- an
@@ -739,12 +748,10 @@ sub DESTROY {
     $conn->release;
 }
 
-# Releases the one-at-a-time slot _run_control_query claims on {_control_query}
-# and restarts the listener, in that order: the listener's own run condition
-# reads that slot, so restarting it first would start a loop that exits on
-# its first check with nothing left to restart it. Released from a destructor
-# as well as explicitly, so a caller cancelling mid-query still frees the slot
-# and restarts the listener instead of leaving both stuck.
+# Releases the one-at-a-time slot _run_control_query claims on
+# {_control_query}. Released from a destructor as well as explicitly, so a
+# caller cancelling mid-query still frees the slot instead of leaving it
+# stuck for whoever is queued behind it.
 package Async::DBD::Pg::PubSub::_ControlQueryGuard;
 
 use strict;
@@ -766,9 +773,6 @@ sub release {
     my $done   = delete $self->{done} or return;
     my $pubsub = delete $self->{pubsub};
 
-    # Slot first, listener second. The listener's own run condition reads
-    # this slot, so restarting it while the slot is still claimed would start
-    # a loop that exits on its first check with nothing left to restart it.
     if ($pubsub && $pubsub->{_control_query}
         && refaddr($pubsub->{_control_query}) == refaddr($done)) {
         delete $pubsub->{_control_query};
@@ -776,30 +780,7 @@ sub release {
     delete $pubsub->{_control_query_inflight} if $pubsub;
     $done->done unless $done->is_ready;
 
-    # $done->done above can, in the same call, run a second control query
-    # queued behind this one all the way through reclaiming {_control_query}
-    # and sending its own statement on this connection -- a waiter parked in
-    # _run_control_query's mutex loop resumes synchronously once the future
-    # it is awaiting completes. A non-empty slot here means somebody else is
-    # mid-query, so restarting the listener now would poll the same socket
-    # that query is still awaiting a result on. Deferred instead: that
-    # query's own release() re-checks the same way, and restarts it once it
-    # is genuinely the last one out.
-    #
-    # {phase} eq 'live' also gates a teardown in progress: disconnect() and
-    # _pool_shutdown() set {phase} to 'closing' before cancelling an
-    # in-flight control query, and that cancellation is what runs this
-    # release() -- so a query cancelled by teardown reaches this line with
-    # {phase} already 'closing', and this guard will not restart the
-    # listener for it. See disconnect()'s second _stop_listener call for the
-    # older, coarser safeguard that used to be needed here.
-    return unless $pubsub && $pubsub->{phase} eq 'live' && !$pubsub->{_control_query};
-
-    my $started = $pubsub->_start_listener;
-    $started->on_fail(sub {
-        my ($err) = @_;
-        $pubsub->_log(warn => "Could not restart listener: $err");
-    });
+    return;
 }
 
 sub DESTROY { shift->release }
@@ -850,6 +831,72 @@ sub DESTROY {
     my $attempt = delete $pubsub->{_connecting};
     delete $pubsub->{_connecting_waiters};
     $attempt->cancel unless $attempt->is_ready;
+}
+
+# Installs the connection's poll delegate for exactly as long as the listener
+# loop runs, and takes it away however that loop ends -- return, exception or
+# cancellation. That equivalence is the whole design: while the delegate is
+# present the listener owns the fd and a query waits on it; while it is absent
+# the query polls for itself. There is never a moment with two readers, and
+# never one with none.
+package Async::DBD::Pg::PubSub::_ReaderGuard;
+
+use strict;
+use warnings;
+
+use Scalar::Util qw(refaddr weaken);
+use Async::DBD::Pg::Util qw(pending_future);
+
+sub new {
+    my ($class, $pubsub, $conn) = @_;
+
+    my $self = bless { conn => $conn, pubsub => $pubsub }, $class;
+    weaken($self->{pubsub});
+
+    my $weak_pubsub = $pubsub;
+    weaken($weak_pubsub);
+
+    $conn->{_poll_delegate} = sub {
+        my $live = $weak_pubsub
+            or return Future->fail(Async::DBD::Pg::Error::Connection->new(
+                message => 'PubSub is gone',
+            ));
+
+        my $waiter = pending_future();
+        $live->{_query_waiter} = $waiter;
+
+        # Cleared however this settles -- done, failed, or the caller
+        # cancelling -- so the loop never holds a future nobody is waiting on
+        # and never completes a query that has already given up.
+        $waiter->on_ready(sub {
+            my $p = $weak_pubsub                  or return;
+            my $held = $p->{_query_waiter}        or return;
+            delete $p->{_query_waiter}
+                if refaddr($held) == refaddr($waiter);
+        });
+
+        return $waiter;
+    };
+
+    return $self;
+}
+
+sub DESTROY {
+    my ($self) = @_;
+
+    my $conn = delete $self->{conn} or return;
+    delete $conn->{_poll_delegate};
+
+    my $pubsub = $self->{pubsub} or return;
+    my $waiter = delete $pubsub->{_query_waiter} or return;
+    return if $waiter->is_ready;
+
+    # The listener is what would have completed this. Failing it is the only
+    # alternative to leaving the query parked forever on a future with nobody
+    # left to finish it.
+    $waiter->fail(Async::DBD::Pg::Error::Connection->new(
+        message => 'PubSub listener stopped while a query was waiting',
+    ));
 }
 
 package Async::DBD::Pg::PubSub;
