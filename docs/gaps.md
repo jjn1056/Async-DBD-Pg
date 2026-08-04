@@ -1421,3 +1421,19 @@ began after sampling had already started, and was found only because the other
 party noticed and said so. Where more than one person or agent can reach the
 database, agree explicitly on who holds it for the duration, rather than each
 checking that it looks free.
+
+**A run can be checked for contamination after the fact.** A collision always
+leaves `terminating connection due to administrator command` in the run's
+stderr, so grepping for that string classifies a run without needing to know
+what else was on the machine at the time:
+
+    grep -c 'terminating connection due to administrator command' run.err
+
+Applied to the nine runs above: the eight clean runs contain zero occurrences,
+and only the single failing run contains any. That is the strongest statement
+today's evidence supports — **every failure observed was accompanied by the
+collision signature, and no uncontaminated run failed.** It is not proof the
+suite is otherwise deterministic; earlier sessions measured a small solo
+failure rate. But it does mean a sample can be validated rather than trusted,
+and any future claim about flakiness should classify its runs this way before
+quoting a number.
