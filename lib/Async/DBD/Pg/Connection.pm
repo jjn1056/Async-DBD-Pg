@@ -756,8 +756,8 @@ C<type> and C<value>:
 This is required for C<bytea>, and is not optional in the way it may appear.
 Without it the value is sent as text, and PostgreSQL's text form for C<bytea>
 is not a Perl string: a value containing a NUL byte is B<truncated at that
-byte, and the statement reports success>. Anything with a zero in it — an
-image, a compressed or encrypted payload, a serialized structure — is lost on
+byte, and the statement reports success>. Anything with a zero in it -- an
+image, a compressed or encrypted payload, a serialized structure -- is lost on
 the way in. The same applies to any type whose wire form differs from the
 scalar you hold; C<bytea> is simply the case where the loss is silent.
 

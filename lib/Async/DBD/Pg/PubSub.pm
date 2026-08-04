@@ -1019,7 +1019,7 @@ broadcast: B<every> client listening on that channel receives every
 notification, including other applications and other instances of your own.
 This is PostgreSQL's behaviour rather than anything imposed here, and it is
 worth stating because it makes C<NOTIFY> unsuitable on its own as a work
-queue — two workers listening on C<jobs> both wake for the same job. Use it to
+queue -- two workers listening on C<jobs> both wake for the same job. Use it to
 wake workers and let the database decide who gets the work, typically with
 C<SELECT ... FOR UPDATE SKIP LOCKED>; F<examples/07-job-queue> does exactly
 that.
