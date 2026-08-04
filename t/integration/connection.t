@@ -13,10 +13,11 @@ use Future::IO;
 
 BEGIN { Future::IO->load_best_impl; }
 
+use Async::DBD::Pg;
 use Async::DBD::Pg::Connection;
 use Async::DBD::Pg::Util qw(parse_dsn);
 use DBI;
-use DBD::Pg;
+use DBD::Pg qw(:async);
 
 # Helper to create a connection
 sub make_connection {
@@ -331,6 +332,44 @@ subtest 'a notice on a connection with no pool is not swallowed' => sub {
         'the notice still reaches a warning rather than being silently dropped';
 
     $conn->_close_dbh;
+};
+
+subtest '_result_ready reports readiness without throwing' => sub {
+    my $pg   = Async::DBD::Pg->new(dsn => test_dsn(), min_connections => 0, max_connections => 2);
+    my $conn = $pg->connection->get;
+    my $dbh  = $conn->dbh;
+
+    # Dispatched directly rather than through query(), which would wait for the
+    # result and leave nothing to observe. This is the only state
+    # _wait_for_result ever calls _result_ready in: a statement sent, no result
+    # back yet. pg_ready returns false here -- it is the idle handle, which
+    # nothing in production ever asks, that throws instead.
+    my $sth = $dbh->prepare('SELECT pg_sleep(0.4)', { pg_async => PG_ASYNC });
+    $sth->execute;
+
+    ok !$conn->_result_ready, 'not ready while the statement is still running';
+
+    Future::IO->sleep(0.8)->get;
+    ok $conn->_result_ready, 'ready once the result has arrived';
+
+    # Drained before anything else: leaving the handle active makes DBI warn on
+    # disconnect, which would breach the suite's pristine-stderr requirement.
+    $dbh->pg_result;
+    $sth->finish;
+
+    # With the result collected there is no async query left, so pg_ready
+    # throws. _result_ready must absorb that and report ready -- a caller that
+    # kept waiting here would spin forever.
+    ok $conn->_result_ready, 'absorbs pg_ready throwing when no query is running';
+
+    # Same contract when the handle is gone entirely. Built standalone rather
+    # than checked out, so a connection with no dbh is never returned to the
+    # pool.
+    my $dead = Async::DBD::Pg::Connection->new(dbh => undef);
+    ok $dead->_result_ready, 'reports ready when the handle is gone';
+
+    $conn->release;
+    $pg->shutdown->get;
 };
 
 done_testing;
