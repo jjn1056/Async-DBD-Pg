@@ -177,8 +177,12 @@ for my $i (0 .. $#$bind) {
 $sth->execute;
 ```
 
-Everything else is unchanged: the same statement handle, the same guard, the
-same `pg_async` dispatch, the same result collection.
+And in `query`, the disambiguation shown above, so a lone hashref against a
+statement with no `:name` placeholders is treated as one positional value
+rather than an empty named-bind map.
+
+Those are the only two changes. The statement handle, the guard, the
+`pg_async` dispatch and the result collection are all untouched.
 
 ## Scope
 
