@@ -296,7 +296,7 @@ async sub _execute_async {
     }
 
     # Wait for async result using Future::IO
-    await $self->_wait_for_result($dbh);
+    await $self->_wait_for_result;
 
     my $result = eval { $self->_capture_pg_notices(sub { $dbh->pg_result }) };
     if ($@ || !$result) {
@@ -341,16 +341,50 @@ sub _get_socket {
     return $sock;
 }
 
+# True once the in-flight async statement's result is ready to collect.
+#
+# Wrapped in _capture_pg_notices because a NOTICE emitted by the running
+# statement is delivered while pg_ready reads the socket; unwrapped it would
+# reach stderr instead of the connection's notice handling.
+#
+# Never throws. This is called from the pub/sub listener loop as well as from
+# a query's own frame, and a DBI exception escaping there would kill the
+# listener -- reporting a query's error as a connection failure and taking
+# down notification delivery with it. Reporting "ready" on error is
+# deliberate: it stops the caller waiting and lets pg_result surface the real
+# error to the query's owner, which is the party that cares.
+#
+# The common case is not an error at all: pg_ready throws "No asynchronous
+# query is running" when no statement is outstanding, which callers reach
+# after collecting a result rather than before dispatching one.
+sub _result_ready {
+    my ($self) = @_;
+
+    my $dbh = $self->{dbh} or return 1;
+
+    my $ready = eval { $self->_capture_pg_notices(sub { $dbh->pg_ready }) };
+    return 1 if $@;
+
+    return $ready ? 1 : 0;
+}
+
 # Wait for PostgreSQL socket to be readable using Future::IO's official poll API
 async sub _wait_for_result {
-    my ($self, $dbh) = @_;
+    my ($self) = @_;
+
+    # Somebody else owns this socket -- see Async::DBD::Pg::PubSub, which
+    # installs one for the life of its listener loop. Awaiting their future
+    # rather than polling is what keeps exactly one reader on the fd: two
+    # pollers steal each other's readiness, because pg_ready and pg_notifies
+    # both consume the socket into libpq's buffer while poll reports on the
+    # socket itself.
+    if (my $delegate = $self->{_poll_delegate}) {
+        return await $delegate->($self);
+    }
 
     my $sock = $self->_get_socket;
 
-    # A statement's own NOTICE is delivered here, while pg_ready reads the
-    # socket -- see _capture_pg_notices. The wrap is per iteration, around
-    # only the synchronous pg_ready call, never across the await below.
-    while (!$self->_capture_pg_notices(sub { $dbh->pg_ready })) {
+    while (!$self->_result_ready) {
         await Future::IO->poll($sock, POLLIN);
     }
 }
@@ -497,6 +531,12 @@ sub release {
     my ($self, %opts) = @_;
     return if $self->{released};
     $self->{released} = 1;
+
+    # Dropped at the one point every checkout passes through. The delegate
+    # closes over whoever installed it; a stale one on a pooled connection
+    # would park the next borrower's query on a future nobody will ever
+    # complete.
+    delete $self->{_poll_delegate};
 
     if (my $pool = $self->{pool}) {
         $pool->_return_connection($self, %opts);
