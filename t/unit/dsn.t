@@ -2,6 +2,11 @@ use strict;
 use warnings;
 use Test2::V0;
 
+# t/lib is not on @INC under the documented `prove -r -l t/`, which adds only
+# lib. The integration tests add it themselves; this file needs it too, for
+# the helper the last subtest loads.
+use lib 't/lib';
+
 use Async::DBD::Pg::Util qw(parse_dsn safe_dsn);
 
 subtest 'parse basic DSN' => sub {
