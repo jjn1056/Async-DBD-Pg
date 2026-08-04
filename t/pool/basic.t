@@ -1046,4 +1046,56 @@ subtest 'concurrent notices on different connections all reach on_log' => sub {
     $conn_b->release;
 };
 
+
+subtest 'a cancelled queued caller is removed from the queue immediately' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn => test_dsn(), min_connections => 0, max_connections => 1,
+    );
+    my $held = $pg->connection->get;
+
+    my @queued = map { $pg->connection } 1 .. 5;
+    is $pg->waiting_count, 5, 'five callers queued behind the held connection';
+
+    $_->cancel for @queued;
+
+    # The pool sweeps its own queue_timeout expiries eagerly. A caller that
+    # cancels -- its own deadline, an enclosing wait_any, a request handler
+    # going away -- used to be left in place until the next release swept it
+    # lazily. That inflated waiting_count exactly when the pool was saturated
+    # and releases were rarest, which is when someone is reading the gauge.
+    is $pg->waiting_count, 0,
+        'cancelling clears them without waiting for a release';
+
+    # The safety property the lazy sweep provided must survive: a connection
+    # handed back must not go to a caller that has gone.
+    $held->release;
+    ok wait_until(sub { $pg->active_count == 0 }, 'not handed to a ghost', 3),
+        'the released connection was not checked out to a cancelled caller';
+
+    $pg->shutdown->get;
+};
+
+subtest 'cancelling one queued caller leaves the others queued' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn => test_dsn(), min_connections => 0, max_connections => 1,
+    );
+    my $held = $pg->connection->get;
+
+    my @queued = map { $pg->connection } 1 .. 3;
+    $queued[1]->cancel;
+
+    is $pg->waiting_count, 2, 'only the cancelled one was removed';
+
+    # And the survivors still work: the next release goes to one of them.
+    $held->release;
+    ok wait_until(sub { $queued[0]->is_ready || $queued[2]->is_ready },
+                  'a survivor was served', 3),
+        'a still-waiting caller received the released connection';
+
+    $_->cancel for grep { !$_->is_ready } @queued;
+    my $winner = (grep { $_->is_done } @queued)[0];
+    $winner->get->release if $winner;
+    $pg->shutdown->get;
+};
+
 done_testing;

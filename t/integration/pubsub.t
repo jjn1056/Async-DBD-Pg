@@ -407,11 +407,12 @@ subtest 'abandoning a queued connect does not leave a waiter behind' => sub {
     $queued->cancel;
     ok !$pubsub->is_connected, 'not left connected';
 
-    # A cancelled waiter is only spliced out of {waiting} the next time the
-    # pool has a connection to hand out -- _return_connection skips settled
-    # entries lazily rather than the cancellation itself editing the array.
-    # Releasing the held connection is what proves the guard's cancellation
-    # actually reached the queued future, not just this object's own state.
+    # The cancellation itself now splices the entry out of {waiting}, so
+    # waiting_count is already 0 by this point. The release is still what
+    # proves the guard's cancellation actually reached the queued future
+    # rather than only changing this object's own state, and the assertion
+    # below it -- that the connection was not handed to the caller that has
+    # gone -- is the property that has to survive either way.
     $held->release;
 
     ok wait_until(sub { $pg->waiting_count == 0 }, 'stale waiter cleared', 3),
