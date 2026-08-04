@@ -1197,7 +1197,7 @@ resolution (the refusal), and pins that a connect after teardown settles
 still works. Mutation-verified: removing the refusal reds the
 stranded-checkout assertions, not merely the refusal ones.
 
-### 71. The listener's pause around control queries is load-bearing — RESOLVED, and it exposed item 75
+### 71. The listener's pause around control queries is load-bearing — FIXED, and it exposed item 75
 
 **File:** `PubSub.pm` (`_listener_loop`, `_stop_listener`, `_ControlQueryGuard::release`)
 
@@ -1232,18 +1232,53 @@ of every control query and the collision was never reachable. It was testing
 the second line of defence while the first still held — an equivalent mutant,
 for a reason that could not be seen without removing both.
 
-**The pause stays. Do not delete the stop/restart dance.** Its cost was
-measured and is not the problem: during a real `LISTEN`, delivery latency is
-1.7 ms against a 1.2 ms idle baseline. It is not a sleep — `_stop_listener`
-cancels the poll and awaits the teardown, and the event loop is never blocked.
+**At the time this was written, the pause stayed and the stop/restart dance
+was not deleted.** Its cost was measured and was not the problem: during a
+real `LISTEN`, delivery latency was 1.7 ms against a 1.2 ms idle baseline. It
+was not a sleep — `_stop_listener` cancelled the poll and awaited the
+teardown, and the event loop was never blocked. That verdict was correct for
+a *naive* deletion, one that left nothing in the collision's place. It does
+not describe what shipped below, which removes the second reader instead of
+deleting one side of the collision between two.
 
-The comparison that settled the design is Mojo::Pg, which has no pause because
-it has no second reader: one `io` watcher on the socket drains notifications
-first and then checks whether the in-flight query's result is ready. Collapsing
-to a single reader remains the only way to remove the pause, and it is a real
-refactor of `_run_control_query` and the listener rather than a deletion —
-`Connection` is shared with ordinary pooled queries, so it would either
-special-case the pub/sub connection or change the generic query path.
+The comparison that settled the design was Mojo::Pg, which has no pause
+because it has no second reader: one `io` watcher on the socket drains
+notifications first and then checks whether the in-flight query's result is
+ready. Collapsing to a single reader was identified here as the only way to
+remove the pause, and it has now shipped, across five commits:
+
+- `207bed1` extracted the async result-readiness check into
+  `Connection::_result_ready` — wrapped once, unable to throw — so the
+  listener can call it on a query's behalf without a DBI exception killing
+  the listener.
+- `c59364c` let a `Connection` nominate a poll delegate: when one is
+  installed, a query awaits it instead of polling the socket itself, making a
+  second reader on the fd impossible rather than merely avoided.
+- `f42517f` made the pub/sub listener install that delegate for exactly its
+  own lifetime (`_ReaderGuard`), and complete a waiting control query itself
+  once it sees the result is ready. `_run_control_query` no longer calls
+  `_stop_listener`, and `_ControlQueryGuard::release` no longer restarts it.
+  The `{_control_query}` mutex stays — DBD::Pg still cannot run two async
+  operations on one handle, and serializing control queries is a different
+  job from pausing the listener, which happened to share the same field.
+  This commit also caught and fixed the stall recorded in item 75's update
+  below.
+- `b7d6281` and `9cc3936` covered the new failure paths: a query error
+  reaches its caller with the listener intact, a cancelled query leaves no
+  stale waiter, and a listener that stops fails whoever was still waiting on
+  it — the last of these reached only by deliberately killing the loop
+  mid-iteration, since the more obvious route (killing the backend) resolves
+  the query through its own ordinary completion path first and never reaches
+  the guard.
+
+The pause is gone. `_stop_listener` still exists — its only remaining caller
+is `disconnect()`, which still needs to stop a running listener before
+releasing the connection — not `_run_control_query` and not
+`_ControlQueryGuard`; that is a different job from pausing the listener for
+every control query. Measured after the refactor: a real `LISTEN` now costs 1.3 ms
+against a 1.4 ms idle baseline under `Future::IO::Impl::UV`, and 1.2 ms
+against 1.2 ms under `::IOAsync` — the penalty recorded above is gone
+entirely, not merely reduced.
 
 ### 72. The `closing` phase does double duty
 
@@ -1368,6 +1403,52 @@ fails — and `'a notification queued during a long control query arrives
 promptly after it'`. Mutation-verified: restoring the old ordering reds
 both.
 
+**Update, single-reader refactor (item 71):** the same bug class recurred at
+a second point once the pause was removed. `_listener_loop` now completes a
+waiting control query itself with `$waiter->done` when it sees the result is
+ready. That resumes the waiting query's frame synchronously, all the way
+through its own `pg_result`, which can consume everything currently on the
+socket — trailing notification bytes included — into libpq's buffer without
+draining them as notifications, the identical mechanism as above, at a
+different call site. Going straight to `await Future::IO->poll($sock,
+POLLIN)` after completing the waiter would then park on a readability event
+that had already happened, stranding whatever had arrived. The drain-before-
+poll ordering above used to live in a separate inner loop — the pause's own
+loop, shown in the code sample above, that ran only between control queries.
+That inner loop is gone along with the pause; the ordering now lives directly
+in `_listener_loop`'s single unified loop (`f42517f`), unconditionally on
+every iteration, since there is no longer a window where the listener stands
+down for the ordering to be scoped to. It survived that restructuring because
+it is not this codebase's own invention — Mojo::Pg's single `io` watcher has
+the identical invariant, drain before checking readiness, for the identical
+reason: it is what a single reader must always do, not an artifact of the
+pause. Fixed by `next` after completing the waiter rather than falling
+through to the poll: it re-enters the loop at the top, which drains first and
+re-tests the `while` condition — needed because the resumed query's own code
+(error handling, a user callback, even a `disconnect` call) can invalidate
+that condition before the loop would otherwise reach it.
+
+**The asymmetry this exposed, the single most useful fact from that branch:**
+the two ways of breaking this ordering are not equally visible.
+
+- Removing the whole waiter-completion stanza (`if ($waiter &&
+  $conn->_result_ready) { ... }` in its entirety) is caught by the ordinary
+  suite, immediately, as a hang — the first `listen()` anywhere in the file
+  never completes, because nothing ever resolves `{_query_waiter}`.
+- Removing *only* the `next` — falling through to the poll instead of
+  restarting the iteration — is caught by **nothing** in the ordinary suite.
+  The full suite passed `189/189`, zero bytes of stderr, both `Future::IO`
+  implementations, with the bug present. Only the fragmentation experiment
+  (`scratchpad/frag-experiment.pl`, described above) caught it, as a backlog
+  that stalled at 122–123/160 until an unrelated later `NOTIFY` flushed it —
+  because the failure mode is silent stranding, not a hang or a thrown
+  error, and no assertion in the suite observes "did every already-arrived
+  notification get delivered without needing later traffic."
+
+A green suite is not evidence the notification path is correct. Run the
+fragmentation experiment — not just the ordinary suite — against any future
+change to `_listener_loop`.
+
 ### 76. The test suite fails intermittently because `kill_backends()` is database-wide
 
 **File:** `t/integration/pubsub.t`, `t/pool/basic.t` (the helper is defined per-file)
@@ -1422,18 +1503,38 @@ party noticed and said so. Where more than one person or agent can reach the
 database, agree explicitly on who holds it for the duration, rather than each
 checking that it looks free.
 
-**A run can be checked for contamination after the fact.** A collision always
-leaves `terminating connection due to administrator command` in the run's
-stderr, so grepping for that string classifies a run without needing to know
-what else was on the machine at the time:
+**A run can be checked for one specific hazard after the fact — but this does
+not classify a run as clean.** `kill_backends()`'s `pg_terminate_backend`
+always leaves `terminating connection due to administrator command` in the
+run's stderr, so grepping for that string is a reliable test for *this one
+hazard*:
 
     grep -c 'terminating connection due to administrator command' run.err
 
-Applied to the nine runs above: the eight clean runs contain zero occurrences,
-and only the single failing run contains any. That is the strongest statement
-today's evidence supports — **every failure observed was accompanied by the
-collision signature, and no uncontaminated run failed.** It is not proof the
-suite is otherwise deterministic; earlier sessions measured a small solo
-failure rate. But it does mean a sample can be validated rather than trusted,
-and any future claim about flakiness should classify its runs this way before
-quoting a number.
+**Correct framing: a non-zero count proves contamination by this hazard; a
+zero count proves only that this one hazard was absent, not that the run was
+clean.** Lock contention, connection pressure, and timing effects from a
+database under other load leave no such signature, and this grep cannot see
+them.
+
+Applied to the nine runs above under that narrower reading: the eight clean
+runs contain zero occurrences, and only the single failing run contains any —
+the strongest statement that sample supports is that every failure observed
+in it was accompanied by the collision signature, not that the eight zero-count
+runs were free of every other hazard. It is not proof the suite is otherwise
+deterministic; earlier sessions measured a small solo failure rate. Any future
+claim about flakiness should still run the suite 8+ times and report the
+count, using this grep only to rule `pg_terminate_backend` collisions in or
+out of a given run — not to declare that run clean.
+
+**A second tooling trap, found during the single-reader refactor (item 71),
+that would silently invalidate anyone's mutation testing:** `prove -I
+<scratch> -l` does not prioritise the `-I` scratch path over `-l`'s `lib`,
+regardless of the order the flags are given on the command line — the real
+`lib/` wins. A mutation run invoked that way tests the unmutated code and
+**passes**, which presents as evidence while being its absence: it looks
+exactly like a guard or property that survives mutation, when actually
+nothing was mutated. Use `perl -I <scratch> -Ilib t/path/to/file.t` directly,
+bypassing `prove` entirely, and confirm `$INC{'Async/DBD/Pg/...pm'}` (or
+whichever module was mutated) resolves inside the scratch directory before
+trusting any result from the run.

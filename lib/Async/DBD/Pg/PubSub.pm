@@ -607,8 +607,13 @@ async sub disconnect {
     # nothing left to wake it. Cancelling here runs _StatementGuard::DESTROY
     # (Connection.pm), which cancels server-side and finishes the handle
     # before {conn} is touched. Done before the _stop_listener call below
-    # rather than after, so that call catches and re-stops a listener the
-    # cancelled query's own guard may have just restarted.
+    # rather than after: cancelling here propagates into the query's own
+    # {_query_waiter}, clearing it before _stop_listener tears the listener
+    # down. Reversed, _ReaderGuard::DESTROY would find that waiter still live
+    # and fail it with "listener stopped" instead of a cancellation --
+    # missing the is_cancelled check a few lines below in
+    # _run_control_query, and surfacing that raw error to the caller instead
+    # of "PubSub is disconnecting".
     if (my $query = delete $self->{_control_query_inflight}) {
         $query->cancel unless $query->is_ready;
     }
@@ -657,9 +662,10 @@ sub _pool_shutdown {
 
     # See the matching block in disconnect() for why this exists and why it
     # runs before the {_listener_future} cancellation below rather than
-    # after: cancelling an in-flight control query can synchronously restart
-    # the listener through its own guard, and the block below is what
-    # catches and cancels that.
+    # after: cancelling an in-flight control query here clears its
+    # {_query_waiter} before the listener is torn down, so the query settles
+    # by cancellation rather than by _ReaderGuard::DESTROY failing a waiter
+    # it finds still live.
     if (my $query = delete $self->{_control_query_inflight}) {
         $query->cancel unless $query->is_ready;
     }
