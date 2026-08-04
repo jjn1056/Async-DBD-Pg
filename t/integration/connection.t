@@ -17,7 +17,7 @@ use Async::DBD::Pg;
 use Async::DBD::Pg::Connection;
 use Async::DBD::Pg::Util qw(parse_dsn);
 use DBI;
-use DBD::Pg qw(:async);
+use DBD::Pg qw(:async :pg_types);
 
 # Helper to create a connection
 sub make_connection {
@@ -415,6 +415,145 @@ subtest 'a poll delegate replaces the connection self-polling' => sub {
         'and the reused connection polls for itself again';
 
     $reused->release;
+    $pg->shutdown->get;
+};
+
+
+subtest 'typed bind parameters carry binary data intact' => sub {
+    my $pg = Async::DBD::Pg->new(dsn => test_dsn(), min_connections => 0, max_connections => 3);
+    my $conn = $pg->connection->get;
+    $conn->query('CREATE TEMP TABLE bindtest (tag text primary key, b bytea, t text)')->get;
+
+    my $all_bytes = join '', map { chr } 0 .. 255;
+
+    # Untyped, this is stored as text and truncated at the first NUL -- the
+    # write succeeds and the data is gone. That silence is the defect.
+    $conn->query('INSERT INTO bindtest (tag, b) VALUES ($1, $2)',
+                 'untyped', $all_bytes)->get;
+    is $conn->query('SELECT length(b) AS n FROM bindtest WHERE tag=$1', 'untyped')
+            ->get->first->{n},
+        0, 'an untyped bytea bind still loses the data -- typing is opt-in';
+
+    $conn->query('INSERT INTO bindtest (tag, b) VALUES ($1, $2)',
+                 'typed', { type => PG_BYTEA, value => $all_bytes })->get;
+    my $back = $conn->query('SELECT b FROM bindtest WHERE tag=$1', 'typed')->get->first->{b};
+    is length($back), 256, 'a typed bytea bind stores every byte';
+    ok $back eq $all_bytes, 'and the round trip is byte-exact';
+
+    # The silent case specifically: a NUL in the middle rather than at the front.
+    $conn->query('INSERT INTO bindtest (tag, b) VALUES ($1, $2)',
+                 'embedded_nul', { type => PG_BYTEA, value => "abc\0def" })->get;
+    is $conn->query('SELECT length(b) AS n FROM bindtest WHERE tag=$1', 'embedded_nul')
+            ->get->first->{n},
+        7, 'a NUL in the middle no longer truncates';
+
+    $conn->release;
+    $pg->shutdown->get;
+};
+
+subtest 'typed and untyped parameters mix in one statement' => sub {
+    my $pg = Async::DBD::Pg->new(dsn => test_dsn(), min_connections => 0, max_connections => 3);
+    my $conn = $pg->connection->get;
+    $conn->query('CREATE TEMP TABLE mixtest (tag text, b bytea, t text, n int)')->get;
+
+    my $bin = join '', map { chr } 0 .. 255;
+    $conn->query('INSERT INTO mixtest VALUES ($1, $2, $3, $4)',
+                 'mixed', { type => PG_BYTEA, value => $bin }, 'plain text', 42)->get;
+
+    my $r = $conn->query('SELECT length(b) AS n, t, n AS num FROM mixtest')->get->first;
+    is $r->{n}, 256, 'the typed parameter is binary';
+    is $r->{t}, 'plain text', 'an untyped neighbour is untouched';
+    is $r->{num}, 42, 'and so is a numeric one';
+
+    $conn->release;
+    $pg->shutdown->get;
+};
+
+subtest 'typed binds work through named placeholders' => sub {
+    my $pg = Async::DBD::Pg->new(dsn => test_dsn(), min_connections => 0, max_connections => 3);
+    my $conn = $pg->connection->get;
+    $conn->query('CREATE TEMP TABLE namedtest (tag text, b bytea)')->get;
+
+    my $bin = join '', map { chr } 0 .. 255;
+    # Runs through convert_placeholders, which must pass the sentinel along
+    # rather than flattening it.
+    $conn->query('INSERT INTO namedtest VALUES (:tag, :blob)',
+                 { tag => 'named', blob => { type => PG_BYTEA, value => $bin } })->get;
+
+    is $conn->query('SELECT length(b) AS n FROM namedtest')->get->first->{n}, 256,
+        'a sentinel survives named-placeholder conversion';
+
+    $conn->release;
+    $pg->shutdown->get;
+};
+
+subtest 'a single positional typed parameter is not read as a named-bind map' => sub {
+    my $pg = Async::DBD::Pg->new(dsn => test_dsn(), min_connections => 0, max_connections => 3);
+    my $conn = $pg->connection->get;
+    $conn->query('CREATE TEMP TABLE onlytest (b bytea)')->get;
+
+    my $bin = join '', map { chr } 0 .. 255;
+    # A lone hashref already means named binds. The statement has no :name
+    # placeholders, so it cannot be one -- it is a single positional value.
+    $conn->query('INSERT INTO onlytest (b) VALUES ($1)',
+                 { type => PG_BYTEA, value => $bin })->get;
+
+    is $conn->query('SELECT length(b) AS n FROM onlytest')->get->first->{n}, 256,
+        'the lone sentinel is bound as one value';
+
+    $conn->release;
+    $pg->shutdown->get;
+};
+
+subtest 'a genuine named-bind hash with type and value keys still works' => sub {
+    my $pg = Async::DBD::Pg->new(dsn => test_dsn(), min_connections => 0, max_connections => 3);
+    my $conn = $pg->connection->get;
+    $conn->query('CREATE TEMP TABLE eventtest (type text, value int)')->get;
+
+    # The case that rules out deciding by inspecting the hashref's keys: a
+    # table with type and value columns is entirely ordinary, and this hash is
+    # indistinguishable from a sentinel by shape alone. The SQL decides.
+    $conn->query('INSERT INTO eventtest (type, value) VALUES (:type, :value)',
+                 { type => 'click', value => 42 })->get;
+
+    my $r = $conn->query('SELECT type, value FROM eventtest')->get->first;
+    is $r->{type}, 'click', 'the hash was read as named binds, not as a sentinel';
+    is $r->{value}, 42, 'both named values arrived';
+
+    $conn->release;
+    $pg->shutdown->get;
+};
+
+subtest 'undef through a typed bind stores NULL' => sub {
+    my $pg = Async::DBD::Pg->new(dsn => test_dsn(), min_connections => 0, max_connections => 3);
+    my $conn = $pg->connection->get;
+    $conn->query('CREATE TEMP TABLE nulltest (tag text, b bytea)')->get;
+
+    $conn->query('INSERT INTO nulltest VALUES ($1, $2)',
+                 'null', { type => PG_BYTEA, value => undef })->get;
+
+    ok $conn->query('SELECT b IS NULL AS isnull FROM nulltest')->get->first->{isnull},
+        'a typed bind of undef is NULL, not an empty string';
+
+    $conn->release;
+    $pg->shutdown->get;
+};
+
+subtest 'a hashref that is not a sentinel is left alone' => sub {
+    my $pg = Async::DBD::Pg->new(dsn => test_dsn(), min_connections => 0, max_connections => 3);
+    my $conn = $pg->connection->get;
+
+    # Missing 'value', so not a sentinel. It must reach DBD::Pg as a reference
+    # and be refused there, rather than being silently unwrapped into
+    # something that looks like it worked.
+    my $err = dies {
+        $conn->query('SELECT $1::text AS x', { type => PG_BYTEA })->get
+    };
+    ok $err, 'a hashref without both keys is not treated as a typed value';
+    like $err, qr/bind|reference|placeholder/i,
+        'and the failure names the binding, rather than corrupting quietly';
+
+    $conn->release;
     $pg->shutdown->get;
 };
 
