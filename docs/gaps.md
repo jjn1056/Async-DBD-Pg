@@ -301,7 +301,7 @@ current lazy-splice behaviour and documents it; adding a proper
 `on_cancel` will need that comment and its `waiting_count` assertions
 revisited.
 
-### 72. The `closing` phase does double duty
+### 72. The `closing` phase does double duty — CONFIRMED, and caller-visible
 
 **File:** `PubSub.pm` (`{phase}`)
 
@@ -313,7 +313,7 @@ alone. It matters if a caller ever needs to tell "wait for teardown, then
 retry" from "this object is finished" — a `shut` phase would separate
 them.
 
-### 73. Teardown cancels in-flight work by name, not from a registry
+### 73. Teardown cancels in-flight work by name, not from a registry — DECIDED, not a defect
 
 **File:** `PubSub.pm` (`disconnect`, `_pool_shutdown`)
 
@@ -342,7 +342,7 @@ Two related debts it would not have fixed either way:
   wrong; it is three mechanisms, and any future consolidation has to
   start from that.
 
-### 74. `_CheckoutGuard::DESTROY` has no `${^GLOBAL_PHASE}` check
+### 74. `_CheckoutGuard::DESTROY` has no `${^GLOBAL_PHASE}` check — TESTED, no observable effect
 
 **File:** `PubSub.pm` (`_CheckoutGuard::DESTROY`)
 
@@ -436,3 +436,35 @@ So the stale entries are real, they never clear on their own, and only a
 connection release sweeps them. The consequence is the one already recorded — a
 wrong `waiting_count` and a bounded hash-entry leak, not a connection handed to
 a caller that has gone. Still open, still not urgent, but no longer theoretical.
+
+### 72, 73, 74 — stress-test verdicts
+
+**72 is confirmed and is worse than this register said.** It was recorded as
+"nothing depends on distinguishing the two today". Something does: the caller.
+Measured —
+
+    during disconnect:   PubSub is disconnecting   -> retrying works
+    after pool shutdown: PubSub is disconnecting   -> terminal
+
+Identical error, opposite correct responses. A caller writing retry logic
+cannot tell "wait and try again" from "give up", so either it retries a dead
+object forever or it abandons a pub/sub that was about to become usable. That
+makes this an API defect rather than an internal tidiness point, and a separate
+terminal phase (or a distinct error) is the fix.
+
+**73 is a design observation, not a defect, and the decision has been made
+twice.** Teardown cancels four futures by name rather than from a registry. A
+registry makes forgetting a mechanism *benign* rather than impossible — a
+future nobody registers is exactly as orphaned as one nobody names — so it
+softens the failure mode without preventing it, at the cost of indirection over
+four call sites that are currently explicit. Recorded so the option is not
+re-derived; not something to build.
+
+**74 does not manifest.** Exercised deliberately: a process exiting with five
+connections checked out, a pub/sub listening, and a `notify` in flight holding
+an armed `_CheckoutGuard`. Exit status 0 and zero bytes on stderr under both
+`Future::IO::Impl::UV` and `::IOAsync`. Adding
+`return if ${^GLOBAL_PHASE} eq 'DESTRUCT'` remains a one-line change, but
+nothing observable justifies it, and a guard that silently skips its release is
+its own hazard if the condition is ever wrong. Left as recorded rather than
+fixed.
