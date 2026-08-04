@@ -1938,4 +1938,102 @@ subtest 'a control query issued from a notification callback completes' => sub {
     $pg->shutdown->get;
 };
 
+subtest 'a control query that fails reaches its caller, and the listener lives' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn => test_dsn(), min_connections => 0, max_connections => 4,
+    );
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('err_probe', sub { })->get;
+
+    my $listener = $pubsub->{_listener_future};
+
+    # Fails on its own merits, not because the connection is broken. The error
+    # belongs to this caller; the listener must not be collateral damage.
+    my ($ok, $err);
+    my $captured = capture_stderr(sub {
+        $ok  = eval { $pubsub->_run_control_query('SELECT 1/0')->get; 1 };
+        $err = $@;
+    });
+    ok !$ok, 'the failing control query fails';
+    like "$err", qr/division by zero/i, 'the caller gets the real error';
+    is $captured, '', 'and nothing leaked to stderr on the way';
+
+    ok !$listener->is_ready, 'the listener survived the query error';
+    ok refaddr($pubsub->{_listener_future}) == refaddr($listener),
+        'and was not restarted behind our back';
+
+    # Still working afterwards.
+    $pubsub->listen('err_probe_two', sub { })->get;
+    ok $pubsub->is_connected, 'further control queries still work';
+
+    $pubsub->disconnect->get;
+    $pg->shutdown->get;
+};
+
+subtest 'cancelling a control query leaves no stale waiter' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn => test_dsn(), min_connections => 0, max_connections => 4,
+    );
+    my $pubsub = $pg->pubsub;
+    $pubsub->listen('cancel_probe', sub { })->get;
+
+    my $slow = $pubsub->_run_control_query('SELECT pg_sleep(2)');
+    ok wait_until(sub { $pubsub->{_query_waiter} }, 'query parked on the delegate', 3),
+        'the query is waiting on the listener';
+
+    $slow->cancel;
+
+    ok wait_until(sub { !$pubsub->{_query_waiter} }, 'waiter cleared', 3),
+        'cancelling clears the waiter rather than leaving it for the loop';
+
+    # The connection is still usable: the next control query completes.
+    $pubsub->listen('cancel_probe_two', sub { })->get;
+    ok $pubsub->is_connected, 'the next control query completes';
+
+    $pubsub->disconnect->get;
+    $pg->shutdown->get;
+};
+
+subtest 'a listener that stops fails a query still waiting on it' => sub {
+    my @logged;
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 4,
+        on_log          => sub { push @logged, $_[1] },
+    );
+    my $pubsub = $pg->pubsub;
+
+    $pubsub->listen('orphan_probe', sub { })->get;
+
+    my $slow = $pubsub->_run_control_query('SELECT pg_sleep(5)');
+    ok wait_until(sub { $pubsub->{_query_waiter} }, 'query parked', 3),
+        'the query is waiting on the listener';
+
+    # NOT disconnect(): teardown cancels an in-flight control query itself, so
+    # the query would settle by cancellation and the guard would never be the
+    # thing that finished it -- a test that passes without exercising what it
+    # names. Killing the backend takes the listener down underneath a query
+    # that is parked on the delegate, which is the only path by which the
+    # guard is what settles it, and is also the realistic case: a dropped
+    # connection.
+    my $captured = capture_stderr(sub {
+        kill_backends();
+
+        ok wait_until(sub { $slow->is_ready }, 'orphaned query settled', 8),
+            'the waiting query is failed rather than left parked forever';
+    });
+    is $captured, '', 'the termination notice does not reach fd 2';
+    ok scalar(grep { /terminating connection due to administrator command/ } @logged),
+        'the termination notice reaches on_log instead';
+
+    ok !$slow->is_done, 'and it did not falsely report success';
+    ok !$slow->is_cancelled,
+        'it was failed by the listener stopping, not cancelled by teardown';
+
+    $pubsub->disconnect->get;
+    $pg->shutdown->get;
+};
+
 done_testing;
