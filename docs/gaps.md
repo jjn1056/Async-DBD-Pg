@@ -1377,8 +1377,14 @@ the test database, not just the connections the calling subtest owns. Tests
 that use it to simulate a dropped connection therefore also kill connections
 belonging to other parts of the same run.
 
-Measured at `c59364c`, nine consecutive full-suite runs under
-`Future::IO::Impl::UV` on an otherwise idle database: **1 failure, 8 clean**.
+Observed at `c59364c` under `Future::IO::Impl::UV`: across nine consecutive
+full-suite runs, one failed and eight were clean. **That is not a measured
+failure rate and must not be quoted as one** — a second agent was running the
+same suite against the same database during part of that window, which is
+itself the hazard this item describes. The honest reading is narrower: the
+suite passes repeatedly at this commit, and it can fail this way. The rate is
+unknown.
+
 The failure took out two files at once with the same cause:
 
     t/integration/pubsub.t  'a reconnect supervisor backing off is not fooled
@@ -1408,3 +1414,10 @@ retracted.
 (`pgrep -f 'prove|scratchpad.*\.pl'`) and no other backends
 (`pg_stat_activity`) first, then run the full suite 8+ times and report the
 count rather than one result. One green run is not evidence.
+
+Check *during* the sample as well as before it. A clean pre-flight proves
+nothing about minute six — the contamination that produced the caveat above
+began after sampling had already started, and was found only because the other
+party noticed and said so. Where more than one person or agent can reach the
+database, agree explicitly on who holds it for the duration, rather than each
+checking that it looks free.
