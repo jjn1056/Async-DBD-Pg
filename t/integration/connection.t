@@ -155,7 +155,7 @@ subtest 'query errors carry PostgreSQL diagnostics' => sub {
 
     isa_ok $err, 'Async::DBD::Pg::Error::Query';
     is $err->code, '23505', 'SQLSTATE recorded';
-    is $err->state, 'unique_violation', 'SQLSTATE mapped to a state name';
+    is $err->state_name, 'unique_violation', 'SQLSTATE mapped to a state name';
     is $err->constraint, 'diag_email_unique', 'violated constraint named';
     like $err->detail, qr/already exists/i, 'detail carries the server explanation';
     is $err->table, 'diag', 'offending table named';
