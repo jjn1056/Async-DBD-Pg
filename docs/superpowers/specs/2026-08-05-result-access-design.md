@@ -32,6 +32,18 @@ obtain them at any price.
 
 Both are fixed by fetching positionally and keeping the metadata.
 
+## The principle
+
+**Positional storage is the truth. Every derived view either represents that
+truth losslessly or refuses loudly.** No view may silently drop, collapse, or
+invent data.
+
+Refusals are `croak`, never `warn`. A warning scrolls past in production and
+the caller proceeds with half their data, which is the failure this design
+exists to remove. The one deliberate exception is the `single` / `single_value`
+pair, which warn: those report an expectation mismatch about row *count*, not
+data loss, and the value returned is complete and correct.
+
 ## Storage
 
     my $names = $sth->{NAME} ? [ @{ $sth->{NAME} } ] : [];
@@ -48,6 +60,12 @@ fails. The current code has this order already; it is not incidental.
 for an `INSERT` or `CREATE`; the positional form *dies* with `no statement
 executing`. An empty `NAME` is what distinguishes them.
 
+Duplicate names are detected once, at construction, by a single pass over
+`NAME` -- a flag plus the positions of each repeated name. Nothing croaks at
+construction: `arrays` consumers must neither pay for the check twice nor trip
+over a problem they do not have. The croak fires lazily, when a hash is about
+to be built.
+
 Measured, 20,000 rows x 4 columns:
 
     fetchall_arrayref({})  -- current      0.050s
@@ -59,13 +77,13 @@ hashes that `rows` returns. The fix costs nothing.
 
 ## API
 
-### Results
+### Results: the core
 
     $r->rows            Collection of hashrefs, derived on demand
     $r->arrays          Collection of arrayrefs, positional
     $r->columns         column names, in order, duplicates intact
     $r->types           PostgreSQL type names: int4, text, numeric
-    $r->count  $r->rows_affected  $r->is_empty
+    $r->count  $r->rows_affected  $r->is_empty  $r->elapsed
 
     $r->first           first row, or undef -- takes what is there
     $r->single          first row, warns if more than one matched
@@ -80,16 +98,102 @@ one, tell me if I was wrong*. It applies to rows and to values alike, which is
 why the value getter is `single_value` and not `scalar`. `scalar` named a Perl
 context rather than the thing being returned.
 
+**Every hash-producing path croaks on duplicate column names** -- `rows`,
+`first`, `single`, `next`, `each`, `all`, and the lookups below:
+
+    Column 'id' appears 2 times at positions 0, 1;
+    alias the columns in your SQL, or use ->arrays or ->as
+
+The positional and metadata views keep working on that same result:
+`arrays`, `columns`, `types`, `count`, `rows_affected`, `is_empty`,
+`row_array`, `elapsed`.
+
+### Views
+
+A view is a new Results-like object sharing the original's row arrayref -- no
+copy of row data -- with something swapped. Three exist. Each carries **its own
+iterator position, starting at 0**, so iterating a view never moves the
+original's `next` cursor and vice versa. That is what makes `as` on a
+half-iterated result well-defined rather than a mutation.
+
+**`$r->as(...)` -- rename columns.**
+
+    my $v = $r->as(['seller_id', 'buyer_id', 'name']);     # full positional
+    my $v = $r->as({ 0 => 'seller_id', 1 => 'buyer_id' }); # sparse, by index
+
+The names array is swapped; `types` stay aligned by position. `$v->columns`
+returns the renamed names in order, because introspection on a view must
+describe what that view's accessors return. `$r->columns` on the original still
+returns the raw names, duplicates intact. `$v->rows`, `$v->first`,
+`$v->single`, `$v->get_column('seller_id')`, `$v->multi`, `$v->by` all operate
+under the new names.
+
+Renaming is by index, never by current name: the case that needs renaming is
+exactly the case where names do not identify a column. Three croaks --
+list length not equal to the column count, an index out of range, and a rename
+whose result still contains duplicates.
+
+**`$r->multi` -- name-addressable and lossless.** A Collection of
+`Hash::MultiValue` objects, one per row, built from the view's names. This is
+what a generic consumer uses when it must address by name and cannot alias.
+
+`require`d at call time; missing, it dies with an install hint. Optional
+dependency, not a prereq. Derived on every call, never cached, and the POD says
+so plainly: N objects per call, measured at 2.8x the plain fetch when this was
+tried as default storage. Hold the result if you loop; not a good choice for
+large result sets.
+
+**`$r->expand` -- decode json and jsonb columns.**
+
+    $r->expand->rows->[0]{payload}{user}{name};
+
+Which columns to decode comes from the stored `pg_type`, never from sniffing
+values -- the direct payoff of keeping types. Non-JSON columns pass through
+untouched, and the original's rows are never mutated. Decoding is eager, at
+view construction, so the cost is paid once and is visible at the call site
+rather than scattered through a loop. A decode failure dies naming the column
+and the row index: malformed JSON arriving from PostgreSQL should be
+impossible, so it is treated as the serious error it is.
+
+`JSON::MaybeXS` is `require`d at call time -- it selects the fastest installed
+backend and falls back to core `JSON::PP` -- and dies with an install hint if
+absent. Optional dependency, same pattern as `Hash::MultiValue`.
+
+Views compose: `$r->as({ 1 => 'body' })->expand->by('id')`.
+
+### Lookups
+
+The commonest post-fetch transform is a lookup keyed by a column, and the
+hand-rolled `map` version silently keeps the last row when key values repeat --
+the same bug class as duplicate columns. So the pair splits along the same
+line, lossy-but-checked against lossless:
+
+    my $users = $r->by('id');        # { 42 => $row_hashref, ... }
+    my $teams = $r->groups('dept');  # { eng => Collection, ... }
+
+`by` croaks if a key value repeats:
+
+    Value '42' in column 'id' appears 3 times; use ->groups
+
+`groups` never loses a row; its values are Collections, consistent with `rows`.
+Both croak on a column name that is not present, listing the available ones,
+and both build hashrefs, so the duplicate-column croak fires first. On a
+renamed view, the lookup is by renamed column and the rows carry renamed keys.
+
 ### Column
 
     $c->name  $c->index
     $c->all             Collection of values
     $c->first  $c->next  $c->reset
 
-`get_column` takes a name or an index. A name that appears more than once is an
-error naming the positions, not a silent choice between them:
+`get_column` takes a name or an index and never guesses. Three croaks:
 
+    No column 'idd'; columns are: id, name, price
     Column 'id' appears 2 times at positions 0, 1; ask for one by index
+    Column index 7 out of range; result has 4 columns
+
+Returning `undef` for a typo'd name is the silent-failure class this design
+removes. On a renamed view, name lookup is against the renamed set.
 
 ### Collection
 
@@ -107,6 +211,23 @@ convention matching neither Mojo's `$_` nor Perl's own.
 
 Since it is a blessed arrayref, the second already works.
 
+### Rendering
+
+    $r->preview        # default 5 rows
+    $r->preview(20)
+
+A compact string: column names with their PostgreSQL types, the total row
+count, and the first N rows as an aligned text table. Bounded by design -- N
+rows maximum, cell width capped with an ellipsis. This is the view for
+debugging, logging and the REPL, and it is what an agent inspecting a result
+needs: shape and a sample, never a flood.
+
+It is positional, so it works on duplicate-column results, on views, and on
+results with no rows to show:
+
+    0 rows; 3 columns: id int4, name text, made date
+    no columns; rows_affected: 7
+
 ### Pool and Connection
 
     await $pg->query_row($sql, @bind)      one row, or undef; warns if several matched
@@ -115,6 +236,17 @@ Since it is a blessed arrayref, the second already works.
 `undef` for no match, because that is an ordinary outcome to branch on rather
 than an exception to trap. A warning for several, because asking for one and
 getting many usually means the query is wrong.
+
+`query_row` returns a hashref, so the duplicate croak applies. Its signature
+takes a bind list and must not grow an options convention, so the message
+points one tier down instead:
+
+    Column 'id' appears 2 times at positions 0, 1 in query_row;
+    alias the columns, or use query(...)->single (optionally with ->as)
+
+`query_value` is positional -- first column of the first row -- and never
+builds a hash, so it succeeds on a duplicate-column query. That is a feature
+and the POD says so.
 
 This gives `query` / `query_row` / `query_value` -- asyncpg's
 `fetch` / `fetchrow` / `fetchval`, arrived at independently.
@@ -129,27 +261,101 @@ the caller sees. That makes the lazy and eager sides read alike:
     while (my $row = $rs->next)        { ... }
     while (my $row = await $cur->next) { ... }
 
+Cursor batches are `Results` objects already, so a cursor over a
+duplicate-column query croaks the same way, on the first `next` that builds a
+hash rather than at open time.
+
 **No `reset` on Cursor.** A server-side cursor is consumed; re-running the
 query is a different guarantee, not a rewind. This is the one place the two
 protocols legitimately diverge, and the POD says so rather than leaving it to
 be discovered.
 
+### RETURNING
+
+`INSERT`/`UPDATE`/`DELETE ... RETURNING` populates `NAME` and yields rows
+through the same handle machinery as `SELECT`, so the empty-`NAME` guard
+already routes it correctly. Required behaviour, established by test rather
+than trusted:
+
+- `RETURNING *` and `RETURNING a, b` produce a full `Results` -- `rows`,
+  `arrays`, `columns`, `types`, `as`, `multi`, `expand`, the duplicate croak,
+  all identical to `SELECT`.
+- `RETURNING id, id` is legal SQL and hits the same croak path as a self-join.
+- Statements without `RETURNING` keep today's behaviour: empty `columns`,
+  `rows_affected` as the payload, `rows` returning an empty Collection. No
+  croak -- an empty name list holds no duplicates.
+- The fetch-before-metadata ordering constraint is verified to hold for
+  `RETURNING` statements. Expected, since it is the same handle machinery, but
+  pinned down rather than assumed.
+
+### Observability
+
+`$r->elapsed` is the wall-clock duration of the query in fractional seconds,
+captured at execute time from `Time::HiRes::clock_gettime(CLOCK_MONOTONIC)`
+(verified present on this platform; `Time::HiRes::time` where the constant is
+not exported). Nearly free to capture and impossible to reconstruct afterwards
+-- the same argument that keeps `pg_type`.
+
+One callback on the pool:
+
+    $pg->on_query(sub {
+        my ($event) = @_;
+        warn "slow: $event->{sql}" if $event->{elapsed} > 1;
+    });
+
+The event is a hashref: `sql`, `binds`, `elapsed`, `rows`, `error`. It fires on
+success and on failure alike; on failure `error` is set and `rows` is `undef`.
+
+This single hook is slow-query logging, tracing, metrics, and the test
+assertion "this code path ran two queries" -- without building any of those
+four. It stays one hook. It does not grow into an event system.
+
+`binds` carries the values as passed, so a `bytea` insert puts its payload in
+the event. The POD warns that a handler which logs `binds` unfiltered will log
+whatever was bound.
+
+## Transactions
+
+The distribution already has this, at `Async::DBD::Pg::transaction` and
+`Async::DBD::Pg::Connection::transaction`, with `with_connection` for the
+non-transactional case:
+
+    my $result = await $pg->transaction(async sub ($conn) { ... });
+
+Commit on success, rollback on exception, exception propagates. The critical
+async property is that the connection stays checked out for the whole sub,
+across every `await` inside it -- interleaving another query onto a connection
+between `BEGIN` and `COMMIT` is the bug hand-rolled versions have. That
+property is asserted by test here rather than assumed. No second spelling is
+added.
+
+## Documentation as an interface
+
+This library appears in no model's training data, so code generated against it
+will reach for Mojo::Pg and DBIC idioms unless the documentation is compact,
+canonical and correct. Two deliverables follow from that:
+
+**Verified POD examples.** Every SYNOPSIS and method example is extracted and
+run as a test. Documentation that is mechanically guaranteed to run means code
+generated from it works.
+
+**A machine-oriented reference.** One `llms.txt`-style file in the dist root:
+the whole public API surface with a one-line example each, under roughly 1,500
+tokens, so a human or an agent reads it in a single pass. Checked against the
+real API by test so it cannot drift.
+
 ## When to use which
 
-**`rows` unless you have a reason.** Three reasons exist:
-
-- the query repeats a column name, and a hash cannot hold both
-- the code does not know the columns ahead of time
-- one column is wanted and its name is ambiguous
-
-That rule is the test of whether two views are one concept too many. It fits in
-a sentence, so they are not.
+**`rows` unless the names repeat; alias in SQL if you can, `->as` if you can't,
+`arrays` if you don't know the columns, `multi` if you're generic and willing
+to pay.**
 
 ## Rejected, with the reason
 
-**Hash::MultiValue per row.** Measured 0.140s against 0.050s -- **2.8x** on
-every result set, to solve a problem that arises on some. It also does nothing
-for the metadata gap.
+**Hash::MultiValue as default per-row storage.** Measured 0.140s against
+0.050s -- **2.8x** on every result set, to solve a problem that arises on some.
+It also does nothing for the metadata gap. As the opt-in `->multi` view it
+contradicts none of this: the cost falls on the caller who asked for it.
 
 **A `Record`-style hybrid** (asyncpg's tuple/dict row, `$row->[0]` and
 `$row->{name}` on one object, via `@{}` and `%{}` overload). Two attempts:
@@ -171,9 +377,23 @@ with a failure mode that looks like success.
 the hot path; and does not fix duplicates, since accessors over a hash have the
 same collapse. Possible later precisely because rows are positional underneath.
 
+**Auto-disambiguating duplicate names** (`id`, `id_2`). Invents data the query
+did not contain, and the invented name depends on column order, so it changes
+under a `SELECT *` when the table changes. Renaming stays explicit, by the
+caller, through `as` or through SQL.
+
 **In-memory `min`/`max`/`sum` on a column.** They would look like DBIC's SQL
 aggregates and be imposters: `->max` over rows already fetched is not the
 maximum of the table.
+
+**`map`/`grep`/`sort`/`reduce` on Collection**, as above. `by` and `groups` do
+not reopen this: they are lookup views with croak semantics, not general list
+utilities.
+
+**`->to_csv` and `->to_json` on Results.** `arrays` plus `columns` plus `types`
+is exactly the interface a serialiser needs. A serialiser that lives outside
+the library and requires nothing private from it is the proof that interface is
+right.
 
 **Query building, relationships, `update`/`delete`, schema classes.** ORM
 territory. DBIC should sit on top of this, not be replaced by it.
@@ -186,12 +406,20 @@ Never released publicly, so breaking changes are free and the better shape wins.
 - `rows` returns a blessed arrayref -- `@{ }` and `->[0]` unaffected, but
   `ref($r->rows) eq 'ARRAY'` becomes false. Nothing in-tree does that.
 - `Cursor::next` returns a row rather than a batch. `each` and `all` unchanged.
+- `rows` on a duplicate-column result croaks where it previously returned
+  collapsed data. That is the point of the change, not a side effect of it.
 
 ## Known consequences
 
 **`next`/`reset` make `Results` stateful.** Two consumers sharing a result will
-interfere. DBIC has the same property; it belongs in the POD rather than being
-discovered.
+interfere. Views do not have this problem with each other, since each carries
+its own position. DBIC has the same property; it belongs in the POD rather than
+being discovered.
+
+**A duplicate-column result has no usable `first`.** `$r->first` croaks even
+when the caller only wants a column whose name is unique. `row_array(0)` and
+`get_column` by index are the positional escapes, and `as` is the fix. This is
+the deliberate cost of refusing loudly.
 
 **Strictness differs between `$pg->query(...)->first` and `$pg->query_row(...)`**
 for the same SQL -- the first is lax by design, the second warns. One sentence
@@ -203,27 +431,71 @@ otherwise consistent scheme, recorded deliberately.
 
 ## Testing
 
-Each shown failing first:
+Each shown failing first.
 
 1. A self-join's repeated columns are all reachable through `arrays`, and
    `columns` reports every one. Fails today at two keys.
 2. `types` reports PostgreSQL type names. Fails today: unobtainable.
 3. `rows` is still usable as an arrayref -- `@{ }`, `->[0]{name}`, `scalar @{ }`.
-4. `get_column` by name, by index, and the ambiguity error naming positions.
-5. `first` silent, `single` and `single_value` warning on multiple rows.
-6. `query_row` and `query_value`: match, no match returning undef, several
-   warning.
-7. `Cursor::next` yields rows, and `batch_size` changes round trips, not
-   results.
-8. Non-row statements -- `INSERT`, `CREATE` -- still work, which is the trap
-   the positional fetch introduces.
+4. `rows`, `first`, `single`, `next`, `each` and `all` croak on a self-join's
+   duplicate columns, the message naming the column, the count and the
+   positions.
+5. `arrays`, `columns`, `types`, `count`, `rows_affected`, `is_empty` and
+   `row_array` all work on that same result.
+6. `as` full-list form: rename, then `rows`, `single`, `get_column` and
+   `columns` all reflect the new names.
+7. `as` sparse form: only the named indexes change; the rest keep raw names.
+8. `as` validation croaks: wrong list length, out-of-range index, and a rename
+   that still leaves duplicates.
+9. View independence: iterate a view with `next`, the original's cursor has not
+   moved; and the reverse.
+10. `get_column` by name, by index, the ambiguity croak naming positions, the
+    missing-name croak listing available columns, and the out-of-range croak.
+11. `first` silent, `single` and `single_value` warning on multiple rows.
+12. `multi` returns Hash::MultiValue rows holding *all* values of a repeated
+    name, and works on a renamed view with renamed keys.
+13. `query_row` and `query_value`: match, no match returning `undef`, several
+    warning. `query_row`'s duplicate croak names the `query(...)->single`
+    escape hatch; `query_value` succeeds on the same SQL.
+14. `Cursor::next` yields rows, and `batch_size` changes round trips, not
+    results.
+15. Non-row statements -- `INSERT`, `CREATE` -- still work, which is the trap
+    the positional fetch introduces.
+16. RETURNING parity in full: `RETURNING *` and `RETURNING a, b` behave as
+    `SELECT`; `RETURNING id, id` croaks; a statement without `RETURNING` is
+    untouched; the fetch-before-metadata order holds.
+17. `by` builds the lookup, croaks on a repeated key value naming the value,
+    column and count and suggesting `groups`, and croaks on a missing column
+    listing the available ones.
+18. `groups` is lossless, one Collection per key value; missing-column croak.
+19. `expand` decodes json and jsonb to structures with other columns
+    byte-identical; composes with `as`; works on a RETURNING result; dies with
+    an install hint when the JSON module is absent; leaves the original's rows
+    unmutated.
+20. `preview` output contains column names, types and row count; row output
+    capped at N; wide values truncated; sensible output for empty and non-row
+    results; works on a duplicate-column result.
+21. `elapsed` present and greater than zero on every Results including
+    RETURNING. `on_query` receives `sql`, `binds`, `elapsed` and `rows` on
+    success, and fires with `error` set on a failing query.
+22. `transaction` commits on success, rolls back and rethrows on exception, and
+    the connection is not shared with another query between `BEGIN` and
+    `COMMIT`/`ROLLBACK` even when the sub awaits. Asserted through `on_query`
+    or connection identity.
+23. POD examples extract and run green, and every method listed in the machine
+    reference exists -- a `can` sweep is enough to stop drift.
 
-Mutation: revert the constructor to `fetchall_arrayref({})`. Tests 1 and 2 must
-red on missing data rather than on setup.
+Mutation: revert the constructor to `fetchall_arrayref({})`. Tests 1, 2 and 4
+must red on missing data rather than on setup.
 
 ## Risk
 
-`Results` is constructed by every query in the distribution. The change is one
-constructor and a set of accessors over the same data, and the existing suite
-exercises that path continuously -- but a mistake here affects every result,
-not an edge case.
+`Results` is constructed by every query in the distribution. The core change is
+one constructor and a set of accessors over the same data, and the existing
+suite exercises that path continuously -- but a mistake there affects every
+result, not an edge case.
+
+The views, lookups, rendering and observability are additive: they cannot
+change what an existing result returns. That difference is the natural seam for
+sequencing the work -- storage and croaks first, verified against the whole
+suite, then everything built on top of them.
