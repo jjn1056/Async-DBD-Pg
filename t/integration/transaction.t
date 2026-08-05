@@ -55,7 +55,7 @@ subtest 'basic transaction commit' => sub {
     is $result, 'done', 'transaction returned value';
 
     my $count = $conn->query('SELECT COUNT(*) FROM test_tx')->get;
-    is $count->scalar, 2, 'both inserts committed';
+    is $count->single_value, 2, 'both inserts committed';
 
     $conn->_close_dbh;
 };
@@ -81,7 +81,7 @@ subtest 'transaction rollback on error' => sub {
     ok $err, 'transaction failed';
 
     my $count = $conn->query('SELECT COUNT(*) FROM test_tx2')->get;
-    is $count->scalar, 1, 'only original row exists (transaction rolled back)';
+    is $count->single_value, 1, 'only original row exists (transaction rolled back)';
 
     $conn->_close_dbh;
 };
@@ -108,7 +108,7 @@ subtest 'nested transaction with savepoints' => sub {
     is $result, 'outer done', 'outer transaction returned';
 
     my $count = $conn->query('SELECT COUNT(*) FROM test_tx3')->get;
-    is $count->scalar, 2, 'both inserts committed';
+    is $count->single_value, 2, 'both inserts committed';
 
     $conn->_close_dbh;
 };
