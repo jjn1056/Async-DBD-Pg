@@ -178,15 +178,21 @@ sub single {
     return $self->first;
 }
 
+# Positional, so a duplicate column name cannot stop either of these.
+sub first_value {
+    my ($self) = @_;
+
+    my $row = $self->{_rows}[0] or return undef;
+
+    return $row->[0];
+}
+
 sub single_value {
     my ($self) = @_;
 
     $self->_warn_if_several('single_value');
 
-    # Positional, so a duplicate column name cannot stop it.
-    my $row = $self->{_rows}[0] or return undef;
-
-    return $row->[0];
+    return $self->first_value;
 }
 
 sub _warn_if_several {
@@ -657,6 +663,16 @@ No match is C<undef> and is not warned about: that is an ordinary outcome to
 branch on.
 
 Croaks if the column names repeat.
+
+=head2 first_value
+
+    my $value = $result->first_value;
+
+First column of the first row, or C<undef> when there are none. Takes what
+is there without complaint, exactly as L</first> does for rows.
+
+Positional, so it never builds a hash and works whatever the column names
+are.
 
 =head2 single_value
 

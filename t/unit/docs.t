@@ -153,7 +153,7 @@ subtest 'the public API is covered by the machine reference' => sub {
     # to everyone reading the reference, which is the drift this catches.
     my @results_api = qw(
         rows arrays columns types count rows_affected is_empty elapsed
-        first single single_value row_array next reset all get_column
+        first single first_value single_value row_array next reset all get_column
         preview as multi expand by groups
     );
 

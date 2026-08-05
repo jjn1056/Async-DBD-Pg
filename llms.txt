@@ -83,7 +83,8 @@ Rows are stored positionally; hashes are derived on demand.
 
     $r->first         # first row, or undef  (croaks if names repeat)
     $r->single        # first row, warns if more than one matched
-    $r->single_value  # first column of first row, warns if several
+    $r->first_value   # first column of first row, no complaint
+    $r->single_value  # same, but warns if more than one row matched
     $r->row_array($i) # one row, positional
     $r->next  $r->reset  $r->all
     $r->get_column($name_or_index)   # a Column

@@ -162,6 +162,27 @@ subtest 'single_value takes the first column of the first row' => sub {
     is duplicated()->single_value, 1, 'works on a duplicate-column result';
 };
 
+subtest 'first_value is the lax counterpart to single_value' => sub {
+    my $several = results(
+        columns => ['id'], types => ['int4'], rows => [[1], [2], [3]],
+    );
+
+    # The pair matches first/single for rows: take what is there, against
+    # I expected one and want telling if I was wrong.
+    my $warning;
+    {
+        local $SIG{__WARN__} = sub { $warning = shift };
+        is $several->first_value, 1, 'the first value';
+    }
+    is $warning, undef, 'and no complaint about the other two';
+
+    my $none = results(columns => ['id'], types => ['int4']);
+    is $none->first_value, undef, 'undef when there are no rows';
+
+    # Positional, like single_value, so duplicates cannot stop it.
+    is duplicated()->first_value, 1, 'works on a duplicate-column result';
+};
+
 subtest 'next and reset walk the rows' => sub {
     my $r = people();
 
