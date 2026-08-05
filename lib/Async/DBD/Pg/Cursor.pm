@@ -86,6 +86,7 @@ async sub next {
 
     if (@$rows < $batch_size) {
         $self->{exhausted} = 1;
+        await $self->close;
     }
 
     return @$rows ? $rows : undef;
@@ -183,7 +184,8 @@ Async::DBD::Pg::Cursor - Streaming cursor for large result sets
         process($row);
     });
 
-    # Clean up
+    # Draining a cursor closes it automatically; close it yourself only if
+    # you stop before reaching the end.
     await $cursor->close;
 
 =head1 METHODS
@@ -196,7 +198,8 @@ Async::DBD::Pg::Cursor - Streaming cursor for large result sets
 
 Fetches the next batch, returning an arrayref of rows or C<undef> once the
 cursor is exhausted. Each call is one round trip returning up to
-C<batch_size> rows.
+C<batch_size> rows. The batch that empties the cursor closes it, the same as
+calling L</close> explicitly.
 
 =head2 each
 
@@ -207,7 +210,8 @@ C<batch_size> rows.
 
 Walks every remaining row, calling the callback once per row, fetching a batch
 at a time. This keeps only one batch in memory however large the result is.
-Returns the number of rows visited.
+Returns the number of rows visited. A callback that runs to completion drains
+the cursor and, by way of L</next>, closes it.
 
 =head2 all
 
@@ -215,18 +219,22 @@ Returns the number of rows visited.
 
 Collects every remaining row into a single arrayref. This defeats the point of
 a cursor on a large result, since the whole set ends up in memory; prefer
-L</each> or L</next> unless the result is known to be small.
+L</each> or L</next> unless the result is known to be small. Draining the
+cursor this way closes it too.
 
 =head2 close
 
     await $cursor->close;
 
 Closes the cursor on the server and commits the transaction if the cursor
-started one.
+started one. Calling it again is harmless.
 
-Always close a cursor you are finished with. One left to be garbage collected
-cannot close itself, because closing has to await and destruction cannot; it
-warns instead, and the cursor stays open until its connection is released.
+A cursor that is read to exhaustion through L</next> or L</each> closes
+itself; there is nothing to do after that. A cursor abandoned before then
+still needs an explicit close: one left to be garbage collected cannot close
+itself, because closing has to await and destruction cannot. It warns
+instead, and stays open, holding its transaction, until its connection is
+released.
 
 =head1 ACCESSORS
 
