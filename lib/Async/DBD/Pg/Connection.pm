@@ -3,6 +3,7 @@ package Async::DBD::Pg::Connection;
 use strict;
 use warnings;
 
+use Carp qw(carp croak);
 use Future;
 use Future::AsyncAwait;
 use Future::IO qw(POLLIN);
@@ -10,6 +11,7 @@ use IO::Socket;
 use DBD::Pg qw(:async);
 use POSIX qw(dup);
 use Scalar::Util qw(weaken);
+use Time::HiRes ();
 
 use Async::DBD::Pg::Cursor;
 use Async::DBD::Pg::Error;
@@ -73,15 +75,131 @@ async sub query {
     $self->{query_count}++;
     $self->{last_used} = time();
 
-    my $result;
-    if (my $timeout = $opts->{timeout}) {
-        $result = await $self->_query_with_timeout($sql, $bind, $timeout);
-    }
-    else {
-        $result = await $self->_execute_async($sql, $bind);
+    # Monotonic, so a clock adjustment mid-query cannot produce a negative or
+    # wildly wrong duration. Captured here rather than reconstructed later,
+    # for the same reason the column types are: afterwards it is gone.
+    my $started = _now();
+
+    my $result = eval {
+        $opts->{timeout}
+            ? await $self->_query_with_timeout($sql, $bind, $opts->{timeout})
+            : await $self->_execute_async($sql, $bind);
+    };
+    my $error = $@;
+
+    my $elapsed = _now() - $started;
+
+    if ($error) {
+        $self->_report_query($sql, $bind, $elapsed, undef, $error);
+        die $error;
     }
 
+    $result->_record_elapsed($elapsed);
+    $self->_report_query($sql, $bind, $elapsed, $result->count, undef);
+
     return $result;
+}
+
+# One hook, deliberately: slow-query logging, tracing, metrics and the test
+# assertion "this path ran two queries" are all this shape, and none of them
+# needs an event system to sit on.
+sub _report_query {
+    my ($self, $sql, $bind, $elapsed, $rows, $error) = @_;
+
+    my $pool = $self->{pool} or return;
+    my $hook = $pool->{on_query} or return;
+
+    # A handler that dies must not turn a working query into a failed one,
+    # nor mask the error a failing one is already carrying.
+    eval {
+        $hook->({
+            sql     => $sql,
+            binds   => $bind,
+            elapsed => $elapsed,
+            rows    => $rows,
+            error   => $error,
+        });
+        1;
+    } or $pool->_log(warn => "on_query handler failed: $@");
+
+    return;
+}
+
+sub _now {
+    return Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC())
+        if defined &Time::HiRes::CLOCK_MONOTONIC;
+
+    return Time::HiRes::time();
+}
+
+# One row, or undef. The pair with query_value below covers the two shapes
+# almost every query has: give me the row I identified, give me the value I
+# counted. asyncpg spells them fetchrow and fetchval.
+async sub query_row {
+    my ($self, @args) = @_;
+
+    my $result = await $self->query(@args);
+
+    if (my ($name, $at) = $result->_repeated_column) {
+        # query_row takes a bind list and has nowhere to put an option, so
+        # the way out is one tier down rather than an argument here.
+        croak sprintf(
+            "Column '%s' appears %d times at positions %s in query_row; "
+          . 'alias the columns, or use query(...)->single (optionally with ->as)',
+            $name, scalar @$at, join(', ', @$at),
+        );
+    }
+
+    _warn_if_several($result, 'query_row');
+
+    return $result->first;
+}
+
+# The first column of the first row, or undef. Positional throughout, so a
+# repeated column name cannot stop it -- which is what makes it the answer
+# query_row's croak sends people to.
+async sub query_value {
+    my ($self, @args) = @_;
+
+    my $result = await $self->query(@args);
+
+    _warn_if_several($result, 'query_value');
+
+    my $row = $result->row_array(0) or return undef;
+
+    return $row->[0];
+}
+
+# One row as a list of values, for the idiom this is named after:
+#
+#     my ($id, $name) = await $conn->query_list($sql, @bind);
+#
+# The future completes with the list, so awaiting it in list context yields
+# every column. An async sub cannot see its caller's context -- wantarray in
+# the body reports whatever the machinery set, not what the call site wants
+# -- so unlike Results::first_list this cannot hand back an arrayref instead.
+# Awaited in scalar context it yields the first value, the same as
+# query_value would.
+async sub query_list {
+    my ($self, @args) = @_;
+
+    my $result = await $self->query(@args);
+
+    _warn_if_several($result, 'query_list');
+
+    # return evaluates its expression in list context inside an async sub,
+    # which is what puts every column into the future rather than just one.
+    return $result->first_list;
+}
+
+sub _warn_if_several {
+    my ($result, $method) = @_;
+
+    my $n = $result->count;
+
+    carp "$method expected one row but $n rows matched" if $n > 1;
+
+    return;
 }
 
 sub _parse_query_args {
@@ -276,7 +394,18 @@ async sub _execute_async {
 
     my $dbh = $self->{dbh};
 
-    my $sth = eval { $dbh->prepare($sql, { pg_async => PG_ASYNC }) };
+    # dollaronly confines DBD::Pg's own placeholder scan to $1, which is the
+    # only form reaching it: positional binds arrive as $1 already, and
+    # convert_placeholders has rewritten :name into $1 by now. Left off, that
+    # scan reads PostgreSQL's own syntax as placeholders -- jsonb's ?, ?| and
+    # ?& operators, and the open array slice arr[:2] -- and the statement dies
+    # at execute on a placeholder the caller never wrote.
+    my $sth = eval {
+        $dbh->prepare($sql, {
+            pg_async                  => PG_ASYNC,
+            pg_placeholder_dollaronly => 1,
+        })
+    };
     if ($@ || !$sth) {
         $self->_throw_query_error($@ || $dbh->errstr, $sql);
     }
@@ -746,6 +875,22 @@ statement is sent; naming a placeholder with no matching key is an error
 rather than something passed through to the server. The two forms cannot be
 mixed in one statement.
 
+There is no third form: B<C<?> is never a placeholder here>. That is
+deliberate, and it is what makes PostgreSQL's own syntax usable unescaped:
+
+    # the jsonb existence operators, which need no escaping
+    await $conn->query(q{SELECT data ? 'key' FROM docs WHERE id = $1}, $id);
+    await $conn->query(q{SELECT data ?| array['a','b'] FROM docs});
+
+    # an array slice with an omitted bound
+    await $conn->query('SELECT tags[:2] FROM posts WHERE id = $1', $id);
+
+Coming from DBI, where C<?> is the usual placeholder, a statement written
+with C<?> reaches PostgreSQL with the question marks intact and fails as a
+syntax error naming the C<?>. Use C<$1> instead. For the same reason a
+C<:name> typed by mistake in a statement with no hashref of parameters
+reaches the server literally and is reported as a syntax error at the colon.
+
 =head3 Typed bind parameters
 
 A bind value may state its own PostgreSQL type by being a hashref with
@@ -789,6 +934,67 @@ thrown. Without it a query waits as long as the server takes.
 
 Fails with an L<Async::DBD::Pg::Error/Async::DBD::Pg::Error::Query> carrying
 the SQLSTATE and the diagnostics the server returned.
+
+=head2 query_row
+
+    my $row = await $conn->query_row($sql, @bind);
+
+The first row as a hashref, or C<undef> when nothing matched. Takes the same
+arguments as L</query>.
+
+    my $user = await $conn->query_row('SELECT * FROM users WHERE id = $1', $id)
+        or return;
+
+C<undef> for no match, because that is an ordinary outcome to branch on
+rather than an exception to trap. A warning when more than one row matched,
+because asking for one and getting several usually means the query is wrong;
+the first row is still returned.
+
+Because it builds a hashref, a query whose column names repeat is an error:
+
+    Column 'id' appears 2 times at positions 0, 1 in query_row;
+    alias the columns, or use query(...)->single (optionally with ->as)
+
+C<query_row> takes a bind list and so has nowhere to put an option, which is
+why the way out is one tier down rather than an argument here. See
+L<Async::DBD::Pg::Results/"Repeated column names">.
+
+=head2 query_value
+
+    my $value = await $conn->query_value($sql, @bind);
+
+The first column of the first row, or C<undef> when nothing matched. Takes
+the same arguments as L</query>.
+
+    my $total = await $conn->query_value('SELECT count(*) FROM users');
+
+C<undef> for no match, and a warning for more than one row, matching
+L</query_row>.
+
+Positional throughout: it never builds a hashref, so unlike L</query_row> it
+works on a query whose column names repeat.
+
+=head2 query_list
+
+    my ($id, $name) = await $conn->query_list($sql, @bind);
+
+The first row as a list of values, in column order, for the common case of
+wanting a few fields out of one row without naming them twice:
+
+    my ($id, $name, $email)
+        = await $conn->query_list('SELECT id, name, email FROM users WHERE id = $1', $id);
+
+An empty list when nothing matched, and a warning when more than one row
+matched, matching L</query_row> and L</query_value>.
+
+Positional throughout, so like L</query_value> and unlike L</query_row> it
+works on a query whose column names repeat.
+
+Awaited in scalar context it gives the first value rather than an arrayref,
+because the future carries the values as a list. This is the one place it
+differs from L<Async::DBD::Pg::Results/first_list>, which does return an
+arrayref there: an async sub cannot see the context of the code awaiting it.
+Use C<< (await $conn->query($sql))->first_list >> if you want the arrayref.
 
 =head2 transaction
 

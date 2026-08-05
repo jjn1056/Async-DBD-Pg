@@ -120,7 +120,13 @@ subtest 'results built from a live statement handle' => sub {
         { id => 2, word => 'two' },
     ], 'rows as hashrefs keyed by column';
     is $result->first, { id => 1, word => 'one' }, 'first row';
-    is $result->scalar, 1, 'scalar takes the first column of the first row';
+    is $result->arrays->[0], [1, 'one'], 'the same row positionally';
+    is $result->types, ['int4', 'text'], 'PostgreSQL type names';
+
+    # single_value is the strict getter and would warn about the second row,
+    # so the lax way to the same value is through the column.
+    is $result->get_column(0)->first, 1, 'first column of the first row';
+
     ok !$result->is_empty, 'not empty';
 
     # A statement returning nothing still has columns.
@@ -129,7 +135,7 @@ subtest 'results built from a live statement handle' => sub {
     is $none->columns, ['n'], 'columns still reported';
     ok $none->is_empty, 'reports empty';
     is $none->first, undef, 'first is undef';
-    is $none->scalar, undef, 'scalar is undef';
+    is $none->single_value, undef, 'single_value is undef';
 
     # NULL must survive as undef rather than becoming an empty string.
     my $null = $conn->query('SELECT NULL::text AS nothing')->get;
@@ -196,12 +202,12 @@ subtest 'query count increments' => sub {
     $conn->_close_dbh;
 };
 
-subtest 'scalar method' => sub {
+subtest 'single_value method' => sub {
     my $conn = make_connection();
 
     my $result = $conn->query('SELECT COUNT(*) FROM pg_tables')->get;
 
-    ok $result->scalar > 0, 'scalar returns count value';
+    ok $result->single_value > 0, 'single_value returns the count';
 
     $conn->_close_dbh;
 };

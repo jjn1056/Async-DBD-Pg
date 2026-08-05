@@ -16,6 +16,7 @@ BEGIN { Future::IO->load_best_impl; }
 use Async::DBD::Pg;
 use Async::DBD::Pg::Connection;
 use Async::DBD::Pg::Util qw(parse_dsn);
+use Scalar::Util qw(refaddr);
 use DBI;
 
 # Helper to create a connection
@@ -39,6 +40,67 @@ sub make_connection {
     );
 }
 
+subtest 'a transaction keeps its connection across every await' => sub {
+    # The bug hand-rolled transaction helpers have is interleaving another
+    # query onto the connection between BEGIN and COMMIT. Nothing about that
+    # is visible from the return value, so it is asserted directly: every
+    # statement the pool runs is recorded with the connection that ran it,
+    # and a competing query is deliberately started mid-transaction.
+    my @seen;
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 4,
+        on_query        => sub { push @seen, $_[0]{sql} },
+    );
+
+    $pg->query('CREATE TABLE IF NOT EXISTS tx_iso (id int)')->get;
+    $pg->query('DELETE FROM tx_iso')->get;
+    @seen = ();
+
+    my ($inside, $other);
+
+    $pg->transaction(async sub {
+        my ($conn) = @_;
+        $inside = $conn;
+
+        await $conn->query('INSERT INTO tx_iso VALUES (1)');
+
+        # Run an unrelated query to completion while this transaction is
+        # suspended, and record which connection it got. Interleaving it onto
+        # this one would put a statement inside a transaction it knows
+        # nothing about, and roll it back on failure.
+        await $pg->with_connection(async sub {
+            my ($c) = @_;
+            $other = $c;
+            await $c->query('SELECT pg_sleep(0.05)');
+        });
+
+        await $conn->query('INSERT INTO tx_iso VALUES (3)');
+        return 1;
+    })->get;
+
+    ok defined $other, 'the competing query ran while the transaction was open';
+    isnt refaddr($other), refaddr($inside),
+        'and on a different connection, not this transaction\'s';
+
+    is $pg->query_value('SELECT count(*) FROM tx_iso')->get, 2,
+        'both statements committed together';
+
+    # BEGIN and COMMIT must bracket this transaction's own statements, with
+    # the competing SELECT outside that bracket on the connection level.
+    my ($begin) = grep { $seen[$_] =~ /^BEGIN/ } 0 .. $#seen;
+    my ($commit) = grep { $seen[$_] =~ /^COMMIT/ } 0 .. $#seen;
+    ok defined $begin && defined $commit, 'the transaction bracketed itself';
+    ok $begin < $commit, 'in that order';
+
+    ok $inside->is_released, 'the transaction connection went back afterwards';
+    is $pg->active_count, 0, 'and so did the competing one';
+
+    $pg->query('DROP TABLE tx_iso')->get;
+    $pg->shutdown(timeout => 5)->get;
+};
+
 subtest 'basic transaction commit' => sub {
     my $conn = make_connection();
 
@@ -55,7 +117,7 @@ subtest 'basic transaction commit' => sub {
     is $result, 'done', 'transaction returned value';
 
     my $count = $conn->query('SELECT COUNT(*) FROM test_tx')->get;
-    is $count->scalar, 2, 'both inserts committed';
+    is $count->single_value, 2, 'both inserts committed';
 
     $conn->_close_dbh;
 };
@@ -81,7 +143,7 @@ subtest 'transaction rollback on error' => sub {
     ok $err, 'transaction failed';
 
     my $count = $conn->query('SELECT COUNT(*) FROM test_tx2')->get;
-    is $count->scalar, 1, 'only original row exists (transaction rolled back)';
+    is $count->single_value, 1, 'only original row exists (transaction rolled back)';
 
     $conn->_close_dbh;
 };
@@ -108,7 +170,7 @@ subtest 'nested transaction with savepoints' => sub {
     is $result, 'outer done', 'outer transaction returned';
 
     my $count = $conn->query('SELECT COUNT(*) FROM test_tx3')->get;
-    is $count->scalar, 2, 'both inserts committed';
+    is $count->single_value, 2, 'both inserts committed';
 
     $conn->_close_dbh;
 };

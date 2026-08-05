@@ -1,0 +1,185 @@
+# Async::DBD::Pg
+
+Event-loop agnostic async PostgreSQL client for Perl. Built on DBI/DBD::Pg
+with Future::IO, so it runs under any Future::IO implementation (UV,
+IO::Async, GLib). Every method below that says `await` returns a Future.
+
+Requires Perl 5.24+, DBD::Pg 3.20.0+.
+
+## Getting started
+
+    use Future::AsyncAwait;
+    use Future::IO;
+    use Async::DBD::Pg;
+    BEGIN { Future::IO->load_best_impl }
+
+    my $pg = Async::DBD::Pg->new(dsn => 'postgresql://user:pass@host/db');
+
+    my $row   = await $pg->query_row('SELECT * FROM users WHERE id = $1', 42);
+    my $count = await $pg->query_value('SELECT count(*) FROM users');
+    my $rs    = await $pg->query('SELECT id, name FROM users');
+
+## Placeholders
+
+Two forms, not mixable in one statement:
+
+    await $pg->query('SELECT * FROM t WHERE id = $1 AND x = $2', 1, 'a');
+    await $pg->query('SELECT * FROM t WHERE id = :id', { id => 1 });
+
+`?` is NOT a placeholder here, so PostgreSQL's own operators work unescaped:
+
+    await $pg->query(q{SELECT data ? 'key' FROM docs});      # jsonb exists
+    await $pg->query('SELECT tags[:2] FROM posts');           # array slice
+
+Binary and other typed values must say their type, or a NUL byte silently
+truncates the value:
+
+    use DBD::Pg qw(:pg_types);
+    await $pg->query('INSERT INTO f (body) VALUES ($1)',
+        { type => PG_BYTEA, value => $bytes });
+
+## Pool: Async::DBD::Pg
+
+    Async::DBD::Pg->new(dsn => $dsn, min_connections => 2, max_connections => 10)
+    await $pg->query($sql, @bind)        # Results
+    await $pg->query_row($sql, @bind)    # one hashref, or undef
+    await $pg->query_value($sql, @bind)  # one value, or undef
+    await $pg->query_list($sql, @bind)   # one row as a list: my ($id, $name) = ...
+    await $pg->connection                # check out a Connection yourself
+    await $pg->with_connection($code, @args)  # scoped checkout, always released
+    await $pg->transaction($code, @args)      # commit, or rollback and rethrow
+    await $pg->shutdown(timeout => 5)
+    $pg->on_query(sub { my ($e) = @_ })  # {sql, binds, elapsed, rows, error}
+    $pg->stats  $pg->idle_count  $pg->active_count  $pg->waiting_count
+    $pg->total_count  $pg->is_healthy  $pg->is_shut_down  $pg->safe_dsn
+
+Constructor options: `dsn`, `min_connections`, `max_connections`,
+`connect_timeout`, `statement_timeout`, `max_queries`, `on_connect`,
+`on_release`, `on_log`, `on_query`, `reconnect`.
+
+`with_connection` and `transaction` take `async sub { my ($conn, @args) = @_ }`
+and forward trailing arguments, so values can be passed rather than closed
+over. A transaction holds its connection across every await inside the body.
+
+## Connection: Async::DBD::Pg::Connection
+
+    await $conn->query($sql, @bind)
+    await $conn->query($sql, @bind, { timeout => 5 })
+    await $conn->query_row($sql, @bind)
+    await $conn->query_value($sql, @bind)
+    await $conn->transaction($code, @args)   # nests via savepoints
+    await $conn->cursor($sql, @bind, { batch_size => 100 })
+    $conn->cancel  $conn->release  $conn->dbh
+    $conn->in_transaction  $conn->is_released  $conn->query_count
+
+## Results: Async::DBD::Pg::Results
+
+Rows are stored positionally; hashes are derived on demand.
+
+    $r->rows          # Collection of hashrefs   (croaks if names repeat)
+    $r->arrays        # Collection of arrayrefs  (always works)
+    $r->columns       # ['id', 'name']
+    $r->types         # ['int4', 'text']
+    $r->count  $r->rows_affected  $r->is_empty  $r->elapsed
+
+    $r->first         # first row, or undef  (croaks if names repeat)
+    $r->single        # first row, warns if more than one matched
+    $r->first_value   # first column of first row, no complaint
+    $r->single_value  # same, but warns if more than one row matched
+    $r->first_list    # my ($id, $name) = $r->first_list  (arrayref in scalar ctx)
+    $r->single_list   # same, but warns if more than one row matched
+    $r->row_array($i) # one row, positional
+    $r->next  $r->reset  $r->all
+    $r->get_column($name_or_index)   # a Column
+    $r->preview       # short typed table for logs and debugging
+
+Views (new object, shared rows, own iterator position):
+
+    $r->as(['a_id', 'b_id'])         # rename all, by position
+    $r->as({ 0 => 'a_id' })          # rename some, by index
+    $r->multi                        # Hash::MultiValue rows, lossless
+    $r->expand                       # decode json/jsonb columns
+    $r->by('id')                     # { 42 => $row }, croaks if keys repeat
+    $r->groups('dept')               # { eng => Collection }, lossless
+
+### Repeated column names
+
+`SELECT *` across a join can return two columns named `id`. A hash cannot
+hold both, so every method that builds a hashref croaks rather than silently
+dropping a value:
+
+    Column 'id' appears 2 times at positions 0, 1;
+    alias the columns in your SQL, or use ->arrays or ->as
+
+Positional access still works on that result: `arrays`, `row_array`,
+`columns`, `types`, `single_value`, `preview`, `get_column` by index. So does
+`multi`, which is lossless. The usual fix is to alias in SQL, or `->as`.
+
+## Collection: Async::DBD::Pg::Collection
+
+A blessed arrayref, so `@$collection`, `$collection->[0]`, `map`, `grep`,
+`sort` all work.
+
+    $collection->size  $collection->first  $collection->last
+    $collection->each($cb, @args)
+    $collection->compact    # drops undef only, not '' or 0
+    $collection->join($sep)  $collection->to_array
+
+No `map`/`grep`/`sort`/`reduce` methods: the builtins are shorter and it is
+already an arrayref.
+
+## Column: Async::DBD::Pg::Column
+
+    $col->name  $col->index
+    $col->all         # Collection of values
+    $col->first  $col->next  $col->reset
+
+`next` yields values, so a NULL, `''` or `0` ends a `while (my $v = ...)`
+loop early. Test with `defined`, or use `all`.
+
+## Cursor: Async::DBD::Pg::Cursor
+
+Streams a large result without holding it in memory.
+
+    my $cur = await $conn->cursor('SELECT * FROM big', { batch_size => 500 });
+    while (my $row = await $cur->next) { ... }   # one row at a time
+    await $cur->each(sub { my ($row) = @_ }, @args);
+    await $cur->all;                             # Collection of rows
+    await $cur->close;
+    $cur->name  $cur->batch_size  $cur->is_exhausted  $cur->is_closed
+
+`batch_size` is rows per round trip, not what `next` returns. No `reset`: a
+server-side cursor is consumed, and re-running the query is a different
+guarantee.
+
+## Pub/sub: Async::DBD::Pg::PubSub
+
+LISTEN/NOTIFY on a dedicated connection. Channels are a per-database
+broadcast namespace, not a work queue.
+
+    await $pg->listen('channel', sub { my ($payload, $channel) = @_ });
+    await $pg->notify('channel', $payload);
+    await $pg->unlisten('channel');
+    await $pg->unlisten_all;
+    my $ps = $pg->pubsub;
+    $ps->is_connected  $ps->subscribed_channels
+
+## Errors
+
+Failures are objects that stringify, thrown as exceptions:
+
+    Async::DBD::Pg::Error::Query          # has ->sqlstate, ->sql
+    Async::DBD::Pg::Error::Connection
+    Async::DBD::Pg::Error::PoolExhausted
+    Async::DBD::Pg::Error::Timeout
+
+## Gotchas
+
+- `Results` is stateful: `next` advances a shared position; call `reset`.
+- `count` is rows in hand; `rows_affected` is what an INSERT/UPDATE changed.
+- `arrays` and `row_array` hand back the result's own arrayrefs, not copies;
+  writing through one changes what `rows` and every view report.
+- `get_column` reads an all-digit argument as an index, so a column aliased
+  `AS "2"` is unreachable by name there.
+- `Column::next` yields values, so NULL, `''` or `0` ends a `while` loop
+  early; test with `defined`.

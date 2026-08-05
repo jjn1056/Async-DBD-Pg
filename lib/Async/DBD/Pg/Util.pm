@@ -21,33 +21,93 @@ sub convert_placeholders {
     my $pos = 0;
 
     my $result = '';
-    my $in_string = 0;
-    my $string_char = '';
     my $i = 0;
     my $len = length($sql);
+
+    # Find the end of a quoted string opening at $start. A doubled quote
+    # always escapes; a backslash escapes only in the E'...' form, because a
+    # standard string treats it as an ordinary character. An unterminated
+    # string runs to the end of the statement, which leaves the syntax error
+    # for PostgreSQL to report on the original text.
+    my $string_end = sub {
+        my ($start, $quote, $backslash_escapes) = @_;
+        my $j = $start + 1;
+        while ($j < $len) {
+            my $c = substr($sql, $j, 1);
+            if ($backslash_escapes && $c eq "\\" && $j + 1 < $len) {
+                $j += 2;
+                next;
+            }
+            if ($c eq $quote) {
+                return $j + 1 unless substr($sql, $j + 1, 1) eq $quote;
+                $j += 2;
+                next;
+            }
+            $j++;
+        }
+        return $len;
+    };
 
     while ($i < $len) {
         my $char = substr($sql, $i, 1);
 
-        if (!$in_string && ($char eq "'" || $char eq '"')) {
-            $in_string = 1;
-            $string_char = $char;
-            $result .= $char;
-            $i++;
+        # Regions where a colon is text rather than a placeholder. Each one
+        # consumes itself whole, so no scanner state survives an iteration.
+
+        # Line comment, running to the newline or to the end of the statement.
+        if ($char eq '-' && substr($sql, $i, 2) eq '--') {
+            my $nl  = index($sql, "\n", $i);
+            my $end = $nl == -1 ? $len : $nl;
+            $result .= substr($sql, $i, $end - $i);
+            $i = $end;
             next;
         }
 
-        if ($in_string) {
-            $result .= $char;
-            if ($char eq $string_char) {
-                if ($i + 1 < $len && substr($sql, $i + 1, 1) eq $string_char) {
-                    $result .= substr($sql, $i + 1, 1);
-                    $i += 2;
-                    next;
-                }
-                $in_string = 0;
+        # Block comment. PostgreSQL nests these, so /* a /* b */ c */ is one
+        # comment and stopping at the first */ would read ' c */' as SQL.
+        if ($char eq '/' && substr($sql, $i, 2) eq '/*') {
+            my $depth = 1;
+            my $j = $i + 2;
+            while ($j < $len && $depth) {
+                my $two = substr($sql, $j, 2);
+                if    ($two eq '/*') { $depth++; $j += 2 }
+                elsif ($two eq '*/') { $depth--; $j += 2 }
+                else                 { $j++ }
             }
-            $i++;
+            $result .= substr($sql, $i, $j - $i);
+            $i = $j;
+            next;
+        }
+
+        # Dollar-quoted string, $$...$$ or $tag$...$tag$, closed only by its
+        # own tag. A positional $1 does not match: a tag cannot start with a
+        # digit, and the empty tag needs a second dollar sign immediately.
+        if ($char eq '$' && substr($sql, $i) =~ /\A(\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$)/) {
+            my $tag   = $1;
+            my $close = index($sql, $tag, $i + length($tag));
+            my $end   = $close == -1 ? $len : $close + length($tag);
+            $result .= substr($sql, $i, $end - $i);
+            $i = $end;
+            next;
+        }
+
+        # E'...' string, where a backslash escapes the character after it.
+        # The prefix has to stand alone rather than end an identifier.
+        if (($char eq 'E' || $char eq 'e')
+            && substr($sql, $i + 1, 1) eq "'"
+            && ($i == 0 || substr($sql, $i - 1, 1) !~ /[A-Za-z0-9_]/)) {
+            my $end = $string_end->($i + 1, "'", 1);
+            $result .= substr($sql, $i, $end - $i);
+            $i = $end;
+            next;
+        }
+
+        # Standard string literal, or a double-quoted identifier. A quote is
+        # escaped by doubling it and a backslash is an ordinary character.
+        if ($char eq "'" || $char eq '"') {
+            my $end = $string_end->($i, $char, 0);
+            $result .= substr($sql, $i, $end - $i);
+            $i = $end;
             next;
         }
 
@@ -202,10 +262,28 @@ PostgreSQL expects, and returns the rewritten statement together with the
 bind values in matching order. A name used more than once is bound once and
 reuses the same position.
 
-Colons that do not introduce a placeholder are left alone: C<::> casts,
-anything inside a single or double quoted string, and array slice bounds
-such as C<arr[1:3]> or C<arr[:2]>, whose bounds are numbers rather than
-identifiers.
+Colons that do not introduce a placeholder are left alone. C<::> casts, and
+array slice bounds such as C<arr[1:3]> or C<arr[:2]>, whose bounds are
+numbers rather than identifiers. So is anything inside one of the regions
+where a colon is text:
+
+=over 4
+
+=item * single and double quoted strings, where a quote is escaped by
+doubling it
+
+=item * C<E'...'> strings, where a backslash escapes the character after it
+as well. A backslash is B<not> an escape in a standard C<'...'> string, so
+C<'a\'> is a complete string whose content is a backslash
+
+=item * dollar-quoted strings, C<$$...$$> and C<$tag$...$tag$>, which only
+the matching tag closes
+
+=item * line comments, C<--> to the end of the line
+
+=item * block comments, which nest: C<< /* a /* b */ c */ >> is one comment
+
+=back
 
 Dies if the statement names a placeholder that C<%params> has no value for.
 Passing the name through would otherwise produce a statement PostgreSQL

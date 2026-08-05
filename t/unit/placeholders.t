@@ -152,4 +152,88 @@ subtest 'colons that are not placeholders are left alone' => sub {
     is $quoted, "SELECT ':id' AS literal", 'colon inside a string literal preserved';
 };
 
+# Everything below guards regions of a statement where a colon must not be
+# read as a placeholder. Each case carries a real :a elsewhere, so a scanner
+# that bails out early fails the same way a scanner that over-matches does.
+
+subtest 'decoy in a dollar-quoted string is not a placeholder' => sub {
+    my ($plain, $plain_bind) = convert_placeholders(
+        'SELECT $$:id$$ AS body, :a', { a => 1 }
+    );
+    is $plain, 'SELECT $$:id$$ AS body, $1', 'untagged dollar-quoted body preserved';
+    is $plain_bind, [1], 'the real placeholder still binds';
+
+    my ($tagged, $tagged_bind) = convert_placeholders(
+        'SELECT $q$:id$q$ AS body, :a', { a => 1 }
+    );
+    is $tagged, 'SELECT $q$:id$q$ AS body, $1', 'tagged dollar-quoted body preserved';
+    is $tagged_bind, [1], 'the real placeholder still binds';
+
+    my ($digits) = convert_placeholders('SELECT $q1$:id$q1$, :a', { a => 1 });
+    is $digits, 'SELECT $q1$:id$q1$, $1', 'tag containing digits preserved';
+
+    # Only the matching tag closes the string, so the $$ inside is body text.
+    my ($nested_tag) = convert_placeholders('SELECT $q$ a $$ :id $q$, :a', { a => 1 });
+    is $nested_tag, 'SELECT $q$ a $$ :id $q$, $1',
+        'a different dollar delimiter inside does not close the string';
+
+    my ($two) = convert_placeholders('SELECT $$:x$$, $$:y$$, :a', { a => 1 });
+    is $two, 'SELECT $$:x$$, $$:y$$, $1', 'two dollar-quoted strings in one statement';
+};
+
+subtest 'decoy in a comment is not a placeholder' => sub {
+    my ($line, $line_bind) = convert_placeholders(
+        "SELECT 1 -- :note\n, :a", { a => 1 }
+    );
+    is $line, "SELECT 1 -- :note\n, \$1", 'line comment preserved';
+    is $line_bind, [1], 'the real placeholder still binds';
+
+    my ($block) = convert_placeholders('SELECT 1 /* :note */, :a', { a => 1 });
+    is $block, 'SELECT 1 /* :note */, $1', 'block comment preserved';
+
+    # PostgreSQL block comments nest, so the decoy sits after the inner close
+    # where a first-*/ scanner would wrongly treat it as live SQL.
+    my ($nested) = convert_placeholders(
+        'SELECT 1 /* a /* b */ :note */, :a', { a => 1 }
+    );
+    is $nested, 'SELECT 1 /* a /* b */ :note */, $1', 'nested block comment preserved';
+
+    my ($trailing) = convert_placeholders('SELECT :a -- :note', { a => 1 });
+    is $trailing, 'SELECT $1 -- :note', 'line comment running to end of statement';
+
+    my ($unterminated) = convert_placeholders('SELECT :a /* :note', { a => 1 });
+    is $unterminated, 'SELECT $1 /* :note', 'unterminated block comment swallows the rest';
+};
+
+subtest 'backslash escapes apply inside E-strings only' => sub {
+    # The scanner previously ended the string at the escaped quote, so the
+    # rest of the statement was read as string content: :a came back
+    # unconverted with an empty bind list, and nothing died. Asserting on the
+    # output rather than on survival is what catches that.
+    my ($upper, $upper_bind) = convert_placeholders("SELECT E'it\\'s ok', :a", { a => 1 });
+    is $upper, "SELECT E'it\\'s ok', \$1", 'E-string with an escaped quote preserved';
+    is $upper_bind, [1], 'the real placeholder still binds';
+
+    my ($lower, $lower_bind) = convert_placeholders("SELECT e'it\\'s ok', :a", { a => 1 });
+    is $lower, "SELECT e'it\\'s ok', \$1", 'lower-case e prefix recognised';
+    is $lower_bind, [1], 'the real placeholder still binds';
+
+    my ($decoy) = convert_placeholders("SELECT E'\\' :id ', :a", { a => 1 });
+    is $decoy, "SELECT E'\\' :id ', \$1", 'a decoy after an escaped quote stays inside the string';
+
+    # In a standard string a backslash is an ordinary character and the
+    # string ends at the next quote. Treating it as an escape here would
+    # swallow the rest of the statement.
+    my ($std, $std_bind) = convert_placeholders("SELECT 'a\\', :a", { a => 1 });
+    is $std, "SELECT 'a\\', \$1", 'trailing backslash in a standard string is literal';
+    is $std_bind, [1], 'the real placeholder still binds';
+
+    # A doubled quote is the standard escape and must keep working in both.
+    my ($doubled) = convert_placeholders("SELECT 'it''s ok', :a", { a => 1 });
+    is $doubled, "SELECT 'it''s ok', \$1", 'doubled quote in a standard string';
+
+    my ($e_doubled) = convert_placeholders("SELECT E'it''s ok', :a", { a => 1 });
+    is $e_doubled, "SELECT E'it''s ok', \$1", 'doubled quote in an E-string';
+};
+
 done_testing;

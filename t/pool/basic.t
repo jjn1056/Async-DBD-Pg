@@ -1144,6 +1144,38 @@ subtest 'with_connection scopes a checkout and forwards arguments' => sub {
     $pg->shutdown(timeout => 2)->get;
 };
 
+subtest 'the pool offers query_row and query_value too' => sub {
+    my $pg = Async::DBD::Pg->new(dsn => test_dsn(), min_connections => 0, max_connections => 3);
+    $pg->query('CREATE TABLE IF NOT EXISTS qr (id int, tag text)')->get;
+    $pg->query('DELETE FROM qr')->get;
+    $pg->query(q{INSERT INTO qr VALUES (1, 'a'), (2, 'b')})->get;
+
+    is $pg->query_row('SELECT * FROM qr WHERE id = $1', 1)->get,
+        { id => 1, tag => 'a' }, 'query_row returns the row';
+    is $pg->query_row('SELECT * FROM qr WHERE id = 99')->get, undef,
+        'and undef when nothing matched';
+
+    is $pg->query_value('SELECT count(*) FROM qr')->get, 2, 'query_value returns the value';
+    is $pg->query_value('SELECT tag FROM qr WHERE id = 99')->get, undef,
+        'and undef when nothing matched';
+
+    my ($id, $tag) = $pg->query_list('SELECT id, tag FROM qr WHERE id = $1', 2)->get;
+    is [$id, $tag], [2, 'b'], 'query_list returns the row as a list';
+    is [ $pg->query_list('SELECT id, tag FROM qr WHERE id = 99')->get ], [],
+        'and an empty list when nothing matched';
+
+    # The pool checks a connection out for each of these, so the thing worth
+    # asserting is that every one of them gives it back.
+    is $pg->active_count, 0, 'no connection is left checked out';
+
+    ok dies { $pg->query_row('SELECT id, id FROM qr WHERE id = 1')->get },
+        'a repeated column name still croaks through the pool';
+    is $pg->active_count, 0, 'and the failing call releases as well';
+
+    $pg->query('DROP TABLE qr')->get;
+    $pg->shutdown(timeout => 2)->get;
+};
+
 subtest 'a cancelled pool call does not strand its connection' => sub {
     my $pg = Async::DBD::Pg->new(dsn => test_dsn(), min_connections => 0, max_connections => 3);
 

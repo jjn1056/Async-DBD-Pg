@@ -20,33 +20,6 @@ use Scalar::Util qw(refaddr weaken);
 # $VERSION is stamped into each package at build time by Dist::Zilla, so it
 # is absent when running straight from a git checkout.
 
-sub _version_gte {
-    my ($got, $want) = @_;
-
-    my @got = split /\./, ($got // 0);
-    my @want = split /\./, ($want // 0);
-    my $len = @got > @want ? scalar @got : scalar @want;
-
-    for my $i (0 .. $len - 1) {
-        my $g = $got[$i] // 0;
-        my $w = $want[$i] // 0;
-        return 1 if $g > $w;
-        return 0 if $g < $w;
-    }
-
-    return 1;
-}
-
-# Check if we can do async connect
-sub _supports_async_connect {
-    my ($self) = @_;
-    return $self->{_async_connect_supported} //= do {
-        # Need DBD::Pg >= 3.19.0 for pg_async_connect
-        my $v = $DBD::Pg::VERSION // 0;
-        _version_gte($v, '3.19.0') ? 1 : 0;
-    };
-}
-
 sub new {
     my ($class, %args) = @_;
 
@@ -68,6 +41,7 @@ sub new {
         on_connect => delete $args{on_connect},
         on_release => delete $args{on_release},
         on_log     => delete $args{on_log},
+        on_query   => delete $args{on_query},
 
         # Pub/sub reconnect. Set on the pool because that is what an
         # application constructs; pubsub takes no arguments.
@@ -178,6 +152,43 @@ async sub query {
     my $guard = Async::DBD::Pg::_ReleaseGuard->new($conn);
 
     return await $conn->query(@args);
+}
+
+# Settable after construction as well, so an application can attach tracing
+# to a pool it was handed rather than one it built.
+sub on_query {
+    my ($self, $callback) = @_;
+
+    $self->{on_query} = $callback if @_ > 1;
+
+    return $self->{on_query};
+}
+
+async sub query_row {
+    my ($self, @args) = @_;
+
+    my $conn  = await $self->connection;
+    my $guard = Async::DBD::Pg::_ReleaseGuard->new($conn);
+
+    return await $conn->query_row(@args);
+}
+
+async sub query_value {
+    my ($self, @args) = @_;
+
+    my $conn  = await $self->connection;
+    my $guard = Async::DBD::Pg::_ReleaseGuard->new($conn);
+
+    return await $conn->query_value(@args);
+}
+
+async sub query_list {
+    my ($self, @args) = @_;
+
+    my $conn  = await $self->connection;
+    my $guard = Async::DBD::Pg::_ReleaseGuard->new($conn);
+
+    return await $conn->query_list(@args);
 }
 
 async sub transaction {
@@ -486,16 +497,19 @@ async sub connection {
     return $conn;
 }
 
-# Create a new connection (async if supported, blocking otherwise)
+# Create a new connection. pg_async_connect needs DBD::Pg 3.19.0 and this
+# distribution requires 3.20.0, so the handshake is always asynchronous.
 async sub _create_connection {
     my ($self) = @_;
 
     my $parsed = $self->{_parsed_dsn};
-    my $use_async = $self->_supports_async_connect;
 
     my %attrs = (
         AutoCommit        => 1,
-        RaiseError        => $use_async ? 0 : 1,
+        # Off for the connect itself: an async connect returns a handle whose
+        # handshake is still in flight, and errors are collected by
+        # _complete_async_connect instead. Restored below once it finishes.
+        RaiseError        => 0,
         PrintError        => 0,
         # A PostgreSQL NOTICE is delivered to DBI as a warning, and Connection
         # routes it through the pool's on_log by wrapping the calls that can
@@ -509,8 +523,7 @@ async sub _create_connection {
         pg_server_prepare => 1,
     );
 
-    # Use async connect if available
-    $attrs{pg_async_connect} = 1 if $use_async;
+    $attrs{pg_async_connect} = 1;
 
     my $dbh = eval {
         DBI->connect(
@@ -530,11 +543,8 @@ async sub _create_connection {
         );
     }
 
-    # Complete async handshake if using async connect
-    if ($use_async) {
-        await $self->_complete_async_connect($dbh);
-        $dbh->{RaiseError} = 1;
-    }
+    await $self->_complete_async_connect($dbh);
+    $dbh->{RaiseError} = 1;
 
     # Set statement timeout if configured
     if (my $timeout = $self->{statement_timeout}) {
@@ -1009,7 +1019,8 @@ abstraction layer. Features include:
 
 =item * Connection pooling with automatic management
 
-=item * Named and positional placeholders
+=item * Named and positional placeholders, leaving C<?> free for PostgreSQL's
+own operators
 
 =item * Transaction support with savepoints
 
@@ -1066,22 +1077,10 @@ compatible with any event loop that has a Future::IO implementation:
 Queries are asynchronous everywhere this module runs, using DBD::Pg's async
 query support combined with L<Future::IO>'s socket readiness detection.
 
-Connection establishment is capability-dependent:
-
-=over 4
-
-=item *
-
-With DBD::Pg 3.19.0+, connect is performed asynchronously using
-C<pg_async_connect>, C<pg_continue_connect>, and L<Future::IO>'s official
-C<poll> API.
-
-=item *
-
-Otherwise, the module falls back to ordinary synchronous C<DBI-E<gt>connect>
-and still provides asynchronous query execution once connected.
-
-=back
+Connection establishment is asynchronous as well, using C<pg_async_connect>,
+C<pg_continue_connect>, and L<Future::IO>'s official C<poll> API. Those
+entry points arrived in DBD::Pg 3.19.0, which is part of why this
+distribution requires 3.20.0. There is no synchronous connect path.
 
 =head2 Advanced DBI Access
 
@@ -1213,6 +1212,50 @@ still reach C<warn> the same way the pool's own diagnostics do; what changes
 is that they no longer bypass C<on_log> and print straight to file
 descriptor 2 regardless of whether a handler is configured.
 
+=head3 on_query
+
+    on_query => sub {
+        my ($event) = @_;
+        warn "slow: $event->{sql}" if $event->{elapsed} > 1;
+    },
+
+Called once per statement, with a hashref describing it:
+
+=over 4
+
+=item * C<sql> -- the statement as sent, after any C<:name> placeholders
+were rewritten
+
+=item * C<binds> -- an arrayref of the bind values
+
+=item * C<elapsed> -- how long it took, in fractional seconds
+
+=item * C<rows> -- the number of rows returned, or C<undef> if it failed
+
+=item * C<error> -- the failure, or C<undef> if it succeeded
+
+=back
+
+Fires on success and on failure alike, so a handler counting statements sees
+all of them.
+
+This one hook is slow-query logging, request tracing, metrics collection,
+and the test assertion "this code path ran two queries". It is deliberately
+one callback rather than an event system; there is nothing to subscribe to
+and no event types to learn.
+
+A handler that dies is reported through L</on_log> and otherwise ignored:
+observing a query must not be able to fail it, nor mask an error it is
+already carrying.
+
+Note that C<binds> holds the values as they were passed. A handler that logs
+them unfiltered will log whatever was bound, including a C<bytea> payload.
+
+It can also be set or replaced after construction:
+
+    $pg->on_query(sub { ... });
+    $pg->on_query(undef);        # and removed
+
 =head3 reconnect
 
 Re-establish the pub/sub listener when its connection fails, re-subscribing
@@ -1305,6 +1348,35 @@ binds and C<timeout> option all apply.
 
 For several statements that need to share one connection, or a transaction,
 see L</with_connection> and L</transaction>.
+
+=head2 query_row
+
+    my $row = await $pg->query_row($sql, @bind);
+
+As L</query>, but returns the first row as a hashref rather than a result, or
+C<undef> when nothing matched. Warns when more than one row matched.
+
+See L<Async::DBD::Pg::Connection/query_row>, including what happens when the
+query's column names repeat.
+
+=head2 query_value
+
+    my $value = await $pg->query_value($sql, @bind);
+
+As L</query>, but returns the first column of the first row, or C<undef> when
+nothing matched. Warns when more than one row matched.
+
+See L<Async::DBD::Pg::Connection/query_value>.
+
+=head2 query_list
+
+    my ($id, $name) = await $pg->query_list($sql, @bind);
+
+As L</query>, but returns the first row as a list of values in column order,
+or an empty list when nothing matched. Warns when more than one row matched.
+
+See L<Async::DBD::Pg::Connection/query_list>, including what scalar context
+gives.
 
 =head2 with_connection
 

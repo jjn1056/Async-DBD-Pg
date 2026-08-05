@@ -18,17 +18,31 @@
 requires 'perl', '5.024';
 
 # Three components, deliberately. DBD::Pg declares its version with qv(),
-# so a single-decimal '3.18' is read as v3.180.0 — a release that will never
-# exist — and every install fails the prerequisite. CI caught this; nothing
+# so a single-decimal '3.20' is read as v3.200.0 -- a release that will never
+# exist -- and every install fails the prerequisite. CI caught this; nothing
 # local would have, because the tests never check the prereq.
-requires 'DBD::Pg', '3.18.0';
+#
+# 3.20.0 rather than the 3.19.0 that first shipped pg_async_connect: 3.20
+# carries async fixes this distribution depends on.
+requires 'DBD::Pg', '3.20.0';
 requires 'DBI', '1.643';
 requires 'Future', '0.49';
 requires 'Future::AsyncAwait', '0.66';
 requires 'Future::IO', '0.23';
 
+# Loaded at the point of use by one method each, so an installer who never
+# calls them never needs them. Recommends rather than requires: a missing one
+# is reported with an install hint by the method that wanted it.
+recommends 'Hash::MultiValue', '0.15';   # Results::multi
+recommends 'JSON::MaybeXS', '1.004';     # Results::expand
+
 on 'test' => sub {
     requires 'Test2::V0', '0.000159';
+
+    # The optional runtime pair above. The suite skips their tests when they
+    # are absent, so this makes the coverage happen rather than enabling it.
+    requires 'Hash::MultiValue', '0.15';
+    requires 'JSON::MaybeXS', '1.004';
 
     # Any Future::IO implementation will do; this one is what the suite
     # loads by default. The tests also pass under Future::IO::Impl::IOAsync,
