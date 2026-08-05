@@ -51,18 +51,31 @@ the first scanner vouched for nothing about the second.
 
 ### The driver's scan: `pg_placeholder_dollaronly`
 
-Measured against live PostgreSQL 16 with DBD::Pg 3.18.0:
+Measured against live PostgreSQL 16 with DBD::Pg 3.18.0, and reproduced
+independently on DBD::Pg 3.20.2 against PostgreSQL 16.0.14 -- both at the
+driver layer and through this library's own `query`, so it is neither
+version-specific nor an artefact of how the dist calls DBI:
 
     SELECT '{"a":1}'::jsonb ? 'a'          -- execute called with an unbound placeholder
-    ... the same with a $1 bind elsewhere  -- Cannot mix placeholder styles "?" and "$1"
+    SELECT '{"a":1}'::jsonb ?| array['a']  -- same
+    SELECT '{"a":1}'::jsonb ?& array['a']  -- same
+    ... any of them with a bind elsewhere  -- Cannot mix placeholder styles "?" and "$1"
     SELECT arr[:2]                         -- unbound placeholder, despite a correct conversion
 
 Every jsonb `?`, `?|` and `?&` operator is unusable, in positional and named
-mode alike. `arr[1:3]`, dollar-quoted strings and comments are handled
-correctly by the driver's scanner; those two are the live failures.
+mode alike -- the mixed-styles error appears even when the caller's own binds
+are `:name`, because by then the converter has already rewritten them to `$1`.
+`arr[1:3]`, dollar-quoted strings and comments are handled correctly by the
+driver's scanner; the above are the live failures.
 
 **Fix:** set `pg_placeholder_dollaronly => 1` in the prepare attributes. One
 call site, and the sweep confirms there are no others.
+
+Verified on the same server: with the attribute set, every statement above
+succeeds, and `$1` binds, a repeated `$1`, multiple positional binds, `:name`
+binds, and a 256-byte `PG_BYTEA` round trip through `bind_param` all continue
+to work. The typed-bind case was the one worth pinning rather than assuming,
+since `bind_param` with `pg_type` is a different mechanism from the scan.
 
 This costs nothing that was promised. The POD documents exactly two placeholder
 forms, `$1` and `:name`; `?` was never one of them. It should be documented as
@@ -503,8 +516,9 @@ a name-to-value map or a single positional value such as a JSONB document. But
 there is no replacement to remove it in favour of. DBD::Pg does support a
 native `:foo` form; it binds only through `bind_param`, and a positional
 `execute()` against it dies with `Placeholders must begin with ':' when using
-the ":foo" style`. This library's async path does not expose `bind_param`, so a
-pass-through cannot serve `query($sql, \%params)` at all. The converter stays,
+the ":foo" style` -- confirmed against a live server rather than read off the
+POD. This library's async path does not expose `bind_param`, so a pass-through
+cannot serve `query($sql, \%params)` at all. The converter stays,
 and with it this library owns placeholder semantics end to end -- which the
 next section turns from an accident into the property being defended.
 
