@@ -32,6 +32,89 @@ obtain them at any price.
 
 Both are fixed by fetching positionally and keeping the metadata.
 
+## Placeholders
+
+The converter's output is not the SQL PostgreSQL receives. `$dbh->prepare`
+runs DBD::Pg's own placeholder scanner over it a second time, and no code in
+the distribution sets the attributes that govern that scan -- there is exactly
+one `prepare` in the dist, at `Connection.pm:279`, carrying only `pg_async`.
+So there are two scanners, and each has defects. **This is invisible to unit
+tests by construction:** a unit test of `convert_placeholders` asserts what our
+scanner emits, and is structurally incapable of seeing what the driver then
+does to it.
+
+That is not hypothetical. The rejection paragraph above previously cited
+`t/unit/placeholders.t` as covering `arr[:2]`. It does cover it -- it asserts
+the converter passes it through untouched, which is correct -- and the
+statement still dies one layer down, inside DBD::Pg, at execute. Coverage of
+the first scanner vouched for nothing about the second.
+
+### The driver's scan: `pg_placeholder_dollaronly`
+
+Measured against live PostgreSQL 16 with DBD::Pg 3.18.0:
+
+    SELECT '{"a":1}'::jsonb ? 'a'          -- execute called with an unbound placeholder
+    ... the same with a $1 bind elsewhere  -- Cannot mix placeholder styles "?" and "$1"
+    SELECT arr[:2]                         -- unbound placeholder, despite a correct conversion
+
+Every jsonb `?`, `?|` and `?&` operator is unusable, in positional and named
+mode alike. `arr[1:3]`, dollar-quoted strings and comments are handled
+correctly by the driver's scanner; those two are the live failures.
+
+**Fix:** set `pg_placeholder_dollaronly => 1` in the prepare attributes. One
+call site, and the sweep confirms there are no others.
+
+This costs nothing that was promised. The POD documents exactly two placeholder
+forms, `$1` and `:name`; `?` was never one of them. It should be documented as
+a feature rather than a workaround -- **`?` is never a placeholder in this
+library**, so PostgreSQL's jsonb operators work unescaped, which a DBI-layer
+library that leaves the driver's scanner on cannot say.
+
+Typed binds go through `bind_param` with `pg_type`, which is a different
+mechanism, so `dollaronly` is expected not to disturb them. Expected is not
+verified: a `PG_BYTEA` round trip pins it.
+
+### Our scan: the converter's holes
+
+Reproduced by calling `convert_placeholders` directly. All of these carry a
+real `:a` elsewhere in the statement that should convert and bind:
+
+    SELECT $$:id$$ AS x, :a                 died: No value supplied for placeholder ':id'
+    SELECT $q$:id$q$ AS x, :a               died: same
+    SELECT $q1$:id$q1$, :a                  died: same
+    SELECT 1 -- :note\n, :a                 died: No value supplied for placeholder ':note'
+    SELECT 1 /* :note */, :a                died: same
+    SELECT 1 /* a /* b */ :note */, :a      died: same
+    SELECT :a -- :note                      died: same
+    SELECT E'it\'s ok', :a                  RETURNED SUCCESSFULLY, :a unconverted, bind []
+
+The dies are spurious but loud, and they break `DO` blocks and function bodies
+under named binds. The last one is the serious case: the scanner misreads the
+E-string's boundary, returns a statement still containing `:a`, and hands back
+an empty bind list. It is the silent-wrong-answer class this whole design
+exists to remove, and it compounds -- `Connection::query`'s "converted equals
+original and no named binds" test then reclassifies the params hashref as a
+single positional bind value.
+
+**Fix the scanner** to pass these through without placeholder interpretation:
+
+- line comments, `--` to end of line, including when the statement ends there
+- block comments, `/* ... */`, which **nest** in PostgreSQL: `/* a /* b */ c */`
+  is one comment, so this needs a depth counter, not a match on the first `*/`
+- dollar-quoted strings, `$$...$$` and `$tag$...$tag$`, where the tag is
+  identifier characters and only the *matching* tag closes it
+- backslash escapes inside `E'...'` strings **only**, case-insensitive on the
+  `E`
+
+That last restriction is load-bearing and easy to over-apply. In a standard
+`'...'` string a quote is escaped only by doubling and a backslash is an
+ordinary character. `SELECT 'a\', :a` converts correctly today, and a fix that
+treats backslash as an escape everywhere would break it. It is a regression
+guard, not an edge case.
+
+The identifier-bound slice limitation -- `arr[lo:hi]` dies in named mode -- is
+documented POD behaviour and stays.
+
 ## The principle
 
 **Positional storage is the truth. Every derived view either represents that
@@ -406,18 +489,28 @@ right.
 **Query building, relationships, `update`/`delete`, schema classes.** ORM
 territory. DBIC should sit on top of this, not be replaced by it.
 
+**`?` positional placeholders**, an escape syntax of our own (`\?`, `\:`),
+identifier-bound slices in named mode, and switching to DBD::Pg's native
+`:foo` binding. Each of these hands part of placeholder semantics back to the
+driver or to an ad-hoc convention. The converter plus `dollaronly` means this
+library owns those semantics end to end, and that is the property worth
+keeping.
+
 **Removing named placeholders** was weighed here and rejected; `:name` stays.
 The case for removing it is real -- it means our own SQL parser, and it forces
 `Connection::query` to decide from the statement text whether a hashref bind is
-a name-to-value map or a single positional value such as a JSONB document.
-Against that: it works, `t/unit/placeholders.t` covers the collisions that
-motivate the concern (`::` casts, `arr[1:3]` and `arr[:2]` slices, `:id` inside
-a quoted literal, a repeated name binding once), and the only known casualty is
-an array slice with identifier bounds, which the POD already documents. DBD::Pg
-does support a native `:foo` form, but binds it through `bind_param`, which
-this library's async path does not expose -- so a pass-through would not be a
-drop-in replacement. Revisiting this needs a fresh decision, not an assumption
-that removal was always intended.
+a name-to-value map or a single positional value such as a JSONB document. But
+there is no replacement to remove it in favour of. DBD::Pg does support a
+native `:foo` form; it binds only through `bind_param`, and a positional
+`execute()` against it dies with `Placeholders must begin with ':' when using
+the ":foo" style`. This library's async path does not expose `bind_param`, so a
+pass-through cannot serve `query($sql, \%params)` at all. The converter stays,
+and with it this library owns placeholder semantics end to end -- which the
+next section turns from an accident into the property being defended.
+
+An earlier draft of this paragraph claimed `t/unit/placeholders.t` covers the
+collisions that motivate the concern. That claim was wrong, and the way it was
+wrong is the reason the next section exists.
 
 ## Compatibility
 
@@ -445,6 +538,16 @@ the deliberate cost of refusing loudly.
 **Strictness differs between `$pg->query(...)->first` and `$pg->query_row(...)`**
 for the same SQL -- the first is lax by design, the second warns. One sentence
 of POD, not a design change.
+
+**A `?` written out of DBI habit is a PostgreSQL syntax error**, not a bind
+error, once `pg_placeholder_dollaronly` is set: the server reports the `?`
+rather than DBD::Pg reporting an unbound placeholder. One sentence of POD
+pointing at `$1` covers it, and the trade is deliberate -- the alternative is
+that jsonb's operators stay broken.
+
+**A raw `:name` that reaches PostgreSQL** -- a typo in positional mode, where
+the converter never runs -- now surfaces as a PostgreSQL syntax error at the
+colon. Also acceptable, also one sentence.
 
 **`Column::first` has no strict counterpart.** Having narrowed to a column,
 several values are expected rather than surprising. An asymmetry in an
@@ -506,8 +609,34 @@ Each shown failing first.
 23. POD examples extract and run green, and every method listed in the machine
     reference exists -- a `can` sweep is enough to stop drift.
 
-Mutation: revert the constructor to `fetchall_arrayref({})`. Tests 1, 2 and 4
-must red on missing data rather than on setup.
+Placeholder hardening, continuing the same list:
+
+24. Integration: jsonb `?`, `?|` and `?&` through `query`, each with no binds,
+    with `$1` positional binds, and with `:name` named binds.
+25. Integration: `SELECT arr[:2]` and `SELECT arr[1:3]` through `query`, in
+    both bind modes.
+26. Integration regression with `pg_placeholder_dollaronly` set: `$1`
+    positional binds, `:name` named binds, and a typed `PG_BYTEA` round trip
+    -- reusing the bytea suite's pattern -- all still work.
+27. Converter: a decoy `:name` inside each of a `$$` string, a `$tag$` string,
+    a line comment, a block comment, and a *nested* block comment is left
+    untouched, while a real `:name` elsewhere in the same statement still
+    converts and binds. The nested case must place the decoy after the inner
+    close -- `/* a /* b */ :note */` -- since `/* a /* b */ c */` passes today
+    by containing no colon at all, and would pass a naive first-`*/` fix too.
+28. Converter: `E'it\'s ok'` followed by a real `:name`. The string passes
+    through byte-identical and the `:name` converts. This fails silently
+    today, so the assertions are on the converted SQL and the bind list --
+    asserting that it does not die would pass against the bug.
+29. Converter regression: every existing `t/unit/placeholders.t` case still
+    passes after the rewrite, and `SELECT 'a\', :a` still converts, which
+    guards against extending backslash escaping beyond `E'...'`.
+
+Mutations. Revert the constructor to `fetchall_arrayref({})`: tests 1, 2 and 4
+must red on missing data rather than on setup. Remove
+`pg_placeholder_dollaronly` from the prepare: tests 24 and 25 must red. Revert
+the scanner's comment handling: test 27 must red on the spurious die, again not
+on setup.
 
 ## Risk
 
