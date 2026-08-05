@@ -13,6 +13,27 @@ use Future::IO;
 BEGIN { Future::IO->load_best_impl; }
 
 use Async::DBD::Pg;
+use Async::DBD::Pg::Util;
+use DBI;
+
+# Terminate this suite's own backends and nobody else's. PGAPPNAME is set by
+# Test::Async::DBD::Pg and carries the pid, so a shared PostgreSQL -- or a
+# second copy of this suite -- is untouched.
+sub kill_this_suites_backends {
+    my $parsed = Async::DBD::Pg::Util::parse_dsn(test_dsn());
+    my $dbh = DBI->connect(
+        $parsed->{dbi_dsn}, $parsed->{user}, $parsed->{password},
+        { RaiseError => 1, PrintError => 0 },
+    );
+    $dbh->do(q{
+        SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+         WHERE datname = current_database()
+           AND pid <> pg_backend_pid()
+           AND application_name = ?
+    }, undef, $ENV{PGAPPNAME});
+    $dbh->disconnect;
+    return;
+}
 
 sub pool {
     my (%args) = @_;
@@ -251,6 +272,52 @@ subtest 'a statement with no placeholders is never cached' => sub {
 
     $conn->query('DROP TABLE cache_bare')->get;
     $conn->release;
+    $pg->shutdown(timeout => 5)->get;
+};
+
+subtest 'healing a dead connection empties its cache' => sub {
+    # The heal warning is expected here, so it is captured and asserted rather
+    # than left to print. Asserting it is also what stops this subtest passing
+    # vacuously: if the pool discarded the connection and built a new one
+    # instead of healing this one, the new Connection would carry an empty
+    # cache and the query would succeed without _replace_dbh ever running.
+    my @logs;
+    my $pg = pool(
+        max_connections       => 1,
+        heal_dead_connections => 1,
+        on_log                => sub { push @logs, "$_[0]: $_[1]" },
+    );
+
+    my $conn = $pg->connection->get;
+    my $sql  = 'SELECT $1::int AS n';
+
+    is $conn->query_value($sql, 1)->get, 1, 'the statement runs and is cached';
+    ok exists $conn->{_stmt_cache}{$sql}, 'and is in the cache';
+
+    # Idle in the pool when its backend dies, which is the state
+    # heal_dead_connections exists for: the next checkout finds this same
+    # Connection object dead and replaces the handle underneath it. The
+    # statement cache holds handles belonging to the handle being replaced,
+    # and executing one of those raises "Cannot call execute on a
+    # disconnected database handle" -- a DBI error with no SQLSTATE, so the
+    # 0A000/26000 recovery cannot catch it either. Healing is supposed to be
+    # invisible to the caller; a cache that outlives the handle makes it
+    # visible on the first use of every statement in it.
+    $conn->release;
+    kill_this_suites_backends();
+
+    my $healed = $pg->connection->get;
+
+    my $value;
+    ok lives { $value = $healed->query_value($sql, 42)->get },
+        'a cached statement still works after the connection is healed';
+    is $value, 42, 'and returns the right answer';
+
+    is [ grep { /already dead/ } @logs ],
+        [ 'warn: replacing a pooled connection that was already dead' ],
+        'the connection really was healed in place, exactly once';
+
+    $healed->release;
     $pg->shutdown(timeout => 5)->get;
 };
 
