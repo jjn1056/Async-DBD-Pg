@@ -37,6 +37,11 @@ sub new {
         statement_timeout => delete $args{statement_timeout},
         max_queries      => delete $args{max_queries},
 
+        # Per-connection prepared-statement cache. Off by default: it holds
+        # server-side statements open, and behind a transaction-pooling
+        # pgbouncer it is actively slower than not caching.
+        statement_cache_size => delete $args{statement_cache_size} // 0,
+
         # Callbacks
         on_connect => delete $args{on_connect},
         on_release => delete $args{on_release},
@@ -556,6 +561,7 @@ async sub _create_connection {
         pool        => $self,
         created_at  => time(),
         query_count => 0,
+        statement_cache_size => $self->{statement_cache_size},
     );
 
     # Run on_connect callback

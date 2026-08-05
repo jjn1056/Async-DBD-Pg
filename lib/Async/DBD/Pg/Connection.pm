@@ -29,6 +29,15 @@ sub new {
         released        => 0,
         in_transaction  => 0,
         _savepoint_depth => 0,
+
+        # Statement cache. Keyed on the converted SQL, so the :name and $1
+        # spellings of one query share an entry. Lives here rather than
+        # anywhere more general because only the connection sees the
+        # statement guard's exits, which is what says whether a handle is
+        # still fit to reuse.
+        statement_cache_size => $args{statement_cache_size} // 0,
+        _stmt_cache          => {},
+        _stmt_lru            => [],
     }, $class;
 
     weaken($self->{pool}) if $self->{pool};
@@ -118,6 +127,7 @@ sub _report_query {
             elapsed => $elapsed,
             rows    => $rows,
             error   => $error,
+            cached  => $self->{_last_was_cached} ? 1 : 0,
         });
         1;
     } or $pool->_log(warn => "on_query handler failed: $@");
@@ -388,9 +398,40 @@ sub _capture_pg_notices {
 }
 
 # Core async query execution using DBD::Pg async support
-async sub _execute_async {
-    my ($self, $sql, $bind) = @_;
-    $bind //= [];
+# Look the statement up, or prepare and remember it. Returns the handle and
+# whether it came from the cache, which the on_query event reports.
+sub _statement_for {
+    my ($self, $sql) = @_;
+
+    my $size = $self->{statement_cache_size};
+
+    return ($self->_prepare_statement($sql), 0) unless $size;
+
+    if (my $sth = $self->{_stmt_cache}{$sql}) {
+        # Most recently used goes to the end.
+        @{ $self->{_stmt_lru} } = grep { $_ ne $sql } @{ $self->{_stmt_lru} };
+        push @{ $self->{_stmt_lru} }, $sql;
+
+        return ($sth, 1);
+    }
+
+    my $sth = $self->_prepare_statement($sql);
+
+    $self->{_stmt_cache}{$sql} = $sth;
+    push @{ $self->{_stmt_lru} }, $sql;
+
+    # Dropping the reference is what makes DBD::Pg deallocate the server-side
+    # statement, so the bound is a server-memory bound as much as a local one.
+    while (@{ $self->{_stmt_lru} } > $size) {
+        my $oldest = shift @{ $self->{_stmt_lru} };
+        delete $self->{_stmt_cache}{$oldest};
+    }
+
+    return ($sth, 0);
+}
+
+sub _prepare_statement {
+    my ($self, $sql) = @_;
 
     my $dbh = $self->{dbh};
 
@@ -406,9 +447,71 @@ async sub _execute_async {
             pg_placeholder_dollaronly => 1,
         })
     };
-    if ($@ || !$sth) {
-        $self->_throw_query_error($@ || $dbh->errstr, $sql);
-    }
+
+    $self->_throw_query_error($@ || $dbh->errstr, $sql) if $@ || !$sth;
+
+    return $sth;
+}
+
+# Forget a cached statement. Called whenever a handle's state stops being
+# known to be good: an error, a cancellation, or a server that says the
+# prepared statement it names is not there.
+sub _evict_statement {
+    my ($self, $sql) = @_;
+
+    return unless defined $sql && $self->{statement_cache_size};
+
+    delete $self->{_stmt_cache}{$sql};
+    @{ $self->{_stmt_lru} } = grep { $_ ne $sql } @{ $self->{_stmt_lru} };
+
+    return;
+}
+
+# The two states a cached statement can fail with that say the cache is
+# stale rather than the query wrong.
+#
+# 0A000 is a schema change under a cached plan; 26000 is the server not
+# having the named statement at all, which is what a pooler in
+# transaction-pooling mode produces when consecutive transactions land on
+# different backends.
+#
+# Both fail at parse or bind time, before the statement executes, so
+# evicting and preparing again cannot double-execute anything. That is the
+# whole reason this recovers by itself instead of reaching the caller.
+my %CACHE_STALE = map { $_ => 1 } qw(0A000 26000);
+
+async sub _execute_async {
+    my ($self, $sql, $bind) = @_;
+
+    my $result = eval { await $self->_execute_once($sql, $bind) };
+    my $err = $@;
+
+    return $result unless $err;
+
+    # Once, never in a loop: a second failure with the same state means
+    # something other than a stale cache entry.
+    die $err unless $self->{statement_cache_size};
+    die $err unless ref $err && $CACHE_STALE{ eval { $err->state } // '' };
+
+    $self->_evict_statement($sql);
+
+    return await $self->_execute_once($sql, $bind);
+}
+
+async sub _execute_once {
+    my ($self, $sql, $bind) = @_;
+    $bind //= [];
+
+    my $dbh = $self->{dbh};
+
+    # dollaronly confines DBD::Pg's own placeholder scan to $1, which is the
+    # only form reaching it: positional binds arrive as $1 already, and
+    # convert_placeholders has rewritten :name into $1 by now. Left off, that
+    # scan reads PostgreSQL's own syntax as placeholders -- jsonb's ?, ?| and
+    # ?& operators, and the open array slice arr[:2] -- and the statement dies
+    # at execute on a placeholder the caller never wrote.
+    my ($sth, $cached) = $self->_statement_for($sql);
+    $self->{_last_was_cached} = $cached;
 
     # Hold the in-flight handle on the connection. A query abandoned part way
     # through has its async sub torn down along with the lexicals inside it,
@@ -417,7 +520,12 @@ async sub _execute_async {
     # A guard rather than a release at the end, because a caller cancelling
     # the query stops this sub where it is suspended and nothing after the
     # await runs.
-    my $statement = Async::DBD::Pg::Connection::_StatementGuard->new($self, $sth);
+    #
+    # The guard carries the cache key so its exits can decide the entry's
+    # fate: hand_over means Results finished the handle cleanly and it stays;
+    # release and destruction both mean the handle's state is unknown, and an
+    # unknown handle must not be handed to the next caller.
+    my $statement = Async::DBD::Pg::Connection::_StatementGuard->new($self, $sth, $sql);
 
     my $rv = eval {
         $self->_capture_pg_notices(sub {
@@ -875,29 +983,33 @@ use warnings;
 use Scalar::Util qw(weaken);
 
 sub new {
-    my ($class, $conn, $sth) = @_;
+    my ($class, $conn, $sth, $sql) = @_;
 
     $conn->{_active_sth} = $sth;
 
-    my $self = bless { conn => $conn }, $class;
+    my $self = bless { conn => $conn, sql => $sql }, $class;
     weaken($self->{conn});
 
     return $self;
 }
 
-# The statement is finished with and nobody is going to read it.
+# The statement is finished with and nobody is going to read it. This is an
+# error path, so the handle's state is unknown and it must not be reused.
 sub release {
     my ($self) = @_;
 
     my $conn = delete $self->{conn} or return;
+    $conn->_evict_statement(delete $self->{sql});
     $conn->_release_active_sth;
 }
 
-# Ownership passes to the caller, who finishes the handle instead.
+# Ownership passes to the caller, who finishes the handle instead. The only
+# exit that leaves the statement fit to reuse, so the only one that keeps it.
 sub hand_over {
     my ($self) = @_;
 
     my $conn = delete $self->{conn} or return;
+    delete $self->{sql};
     delete $conn->{_active_sth};
 }
 
