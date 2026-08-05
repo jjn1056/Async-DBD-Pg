@@ -172,4 +172,90 @@ subtest 'walking a live result' => sub {
     $conn->_close_dbh;
 };
 
+subtest 'query_row returns one row' => sub {
+    my $conn = make_connection();
+
+    $conn->query('CREATE TEMP TABLE res_one (id int, tag text)')->get;
+    $conn->query(q{INSERT INTO res_one VALUES (1, 'a'), (2, 'b')})->get;
+
+    is $conn->query_row('SELECT * FROM res_one WHERE id = $1', 1)->get,
+        { id => 1, tag => 'a' }, 'the matching row, as a hashref';
+
+    # No match is an ordinary outcome to branch on, not an exception to trap.
+    my $missing;
+    my $quiet;
+    {
+        local $SIG{__WARN__} = sub { $quiet = shift };
+        $missing = $conn->query_row('SELECT * FROM res_one WHERE id = 99')->get;
+    }
+    is $missing, undef, 'no match is undef';
+    is $quiet, undef, 'and is not warned about';
+
+    # Asking for one and getting several usually means the query is wrong.
+    my ($row, $warning);
+    {
+        local $SIG{__WARN__} = sub { $warning = shift };
+        $row = $conn->query_row('SELECT * FROM res_one ORDER BY id')->get;
+    }
+    is $row, { id => 1, tag => 'a' }, 'the first row is still returned';
+    like $warning, qr/query_row/, 'the warning names the method';
+    like $warning, qr/2 rows/, 'and how many matched';
+
+    $conn->_close_dbh;
+};
+
+subtest 'query_row croaks on repeated column names' => sub {
+    my $conn = make_connection();
+
+    $conn->query('CREATE TEMP TABLE res_dup (id int, tag text)')->get;
+    $conn->query(q{INSERT INTO res_dup VALUES (1, 'a')})->get;
+
+    my $err = dies {
+        $conn->query_row('SELECT id, id FROM res_dup')->get
+    };
+
+    like $err, qr/Column 'id' appears 2 times at positions 0, 1/,
+        'names the column and its positions';
+    like $err, qr/in query_row/, 'and where it happened';
+    like $err, qr/query\(\.\.\.\)->single/,
+        'points at the call that can handle it';
+
+    $conn->_close_dbh;
+};
+
+subtest 'query_value returns one value and never builds a hash' => sub {
+    my $conn = make_connection();
+
+    $conn->query('CREATE TEMP TABLE res_val (id int, tag text)')->get;
+    $conn->query(q{INSERT INTO res_val VALUES (1, 'a'), (2, 'b')})->get;
+
+    is $conn->query_value('SELECT count(*) FROM res_val')->get, 2, 'the value';
+
+    my $missing;
+    my $quiet;
+    {
+        local $SIG{__WARN__} = sub { $quiet = shift };
+        $missing = $conn->query_value('SELECT id FROM res_val WHERE id = 99')->get;
+    }
+    is $missing, undef, 'no match is undef';
+    is $quiet, undef, 'and is not warned about';
+
+    my ($value, $warning);
+    {
+        local $SIG{__WARN__} = sub { $warning = shift };
+        $value = $conn->query_value('SELECT id FROM res_val ORDER BY id')->get;
+    }
+    is $value, 1, 'the first value';
+    like $warning, qr/query_value/, 'the warning names the method';
+
+    # Positional all the way down, so repeated names cannot stop it. This is
+    # the escape hatch query_row's croak points away from.
+    my $duplicated;
+    ok lives { $duplicated = $conn->query_value('SELECT id, id FROM res_val WHERE id = 1')->get },
+        'a repeated column name is not an error here';
+    is $duplicated, 1, 'and the value is right';
+
+    $conn->_close_dbh;
+};
+
 done_testing;

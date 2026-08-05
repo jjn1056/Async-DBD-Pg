@@ -74,24 +74,33 @@ sub count         { scalar @{ $_[0]{_rows} } }
 sub rows_affected { $_[0]{_rows_affected} }
 sub is_empty      { !@{ $_[0]{_rows} } }
 
+# The first repeated column name and where it appears, or nothing. Callers
+# that build their own message -- Connection::query_row points one tier down
+# rather than at ->arrays -- ask for this instead of catching a croak.
+sub _repeated_column {
+    my ($self) = @_;
+
+    for my $name (@{ $self->{_names} }) {
+        my $at = $self->{_positions}{$name};
+        return ($name, $at) if @$at > 1;
+    }
+
+    return;
+}
+
 # Croak before building any hash from a result whose names repeat. Returning
 # a hash with the duplicates collapsed is a wrong answer that reports success,
 # which is the failure this class is shaped to prevent.
 sub _assert_addressable_by_name {
     my ($self) = @_;
 
-    for my $name (@{ $self->{_names} }) {
-        my $at = $self->{_positions}{$name};
-        next if @$at == 1;
+    my ($name, $at) = $self->_repeated_column or return;
 
-        croak sprintf(
-            "Column '%s' appears %d times at positions %s; "
-          . "alias the columns in your SQL, or use ->arrays or ->as",
-            $name, scalar @$at, join(', ', @$at),
-        );
-    }
-
-    return;
+    croak sprintf(
+        "Column '%s' appears %d times at positions %s; "
+      . "alias the columns in your SQL, or use ->arrays or ->as",
+        $name, scalar @$at, join(', ', @$at),
+    );
 }
 
 sub _hash_row {

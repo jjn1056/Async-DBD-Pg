@@ -3,6 +3,7 @@ package Async::DBD::Pg::Connection;
 use strict;
 use warnings;
 
+use Carp qw(carp croak);
 use Future;
 use Future::AsyncAwait;
 use Future::IO qw(POLLIN);
@@ -82,6 +83,54 @@ async sub query {
     }
 
     return $result;
+}
+
+# One row, or undef. The pair with query_value below covers the two shapes
+# almost every query has: give me the row I identified, give me the value I
+# counted. asyncpg spells them fetchrow and fetchval.
+async sub query_row {
+    my ($self, @args) = @_;
+
+    my $result = await $self->query(@args);
+
+    if (my ($name, $at) = $result->_repeated_column) {
+        # query_row takes a bind list and has nowhere to put an option, so
+        # the way out is one tier down rather than an argument here.
+        croak sprintf(
+            "Column '%s' appears %d times at positions %s in query_row; "
+          . 'alias the columns, or use query(...)->single (optionally with ->as)',
+            $name, scalar @$at, join(', ', @$at),
+        );
+    }
+
+    _warn_if_several($result, 'query_row');
+
+    return $result->first;
+}
+
+# The first column of the first row, or undef. Positional throughout, so a
+# repeated column name cannot stop it -- which is what makes it the answer
+# query_row's croak sends people to.
+async sub query_value {
+    my ($self, @args) = @_;
+
+    my $result = await $self->query(@args);
+
+    _warn_if_several($result, 'query_value');
+
+    my $row = $result->row_array(0) or return undef;
+
+    return $row->[0];
+}
+
+sub _warn_if_several {
+    my ($result, $method) = @_;
+
+    my $n = $result->count;
+
+    carp "$method expected one row but $n rows matched" if $n > 1;
+
+    return;
 }
 
 sub _parse_query_args {
@@ -816,6 +865,45 @@ thrown. Without it a query waits as long as the server takes.
 
 Fails with an L<Async::DBD::Pg::Error/Async::DBD::Pg::Error::Query> carrying
 the SQLSTATE and the diagnostics the server returned.
+
+=head2 query_row
+
+    my $row = await $conn->query_row($sql, @bind);
+
+The first row as a hashref, or C<undef> when nothing matched. Takes the same
+arguments as L</query>.
+
+    my $user = await $conn->query_row('SELECT * FROM users WHERE id = $1', $id)
+        or return;
+
+C<undef> for no match, because that is an ordinary outcome to branch on
+rather than an exception to trap. A warning when more than one row matched,
+because asking for one and getting several usually means the query is wrong;
+the first row is still returned.
+
+Because it builds a hashref, a query whose column names repeat is an error:
+
+    Column 'id' appears 2 times at positions 0, 1 in query_row;
+    alias the columns, or use query(...)->single (optionally with ->as)
+
+C<query_row> takes a bind list and so has nowhere to put an option, which is
+why the way out is one tier down rather than an argument here. See
+L<Async::DBD::Pg::Results/"Repeated column names">.
+
+=head2 query_value
+
+    my $value = await $conn->query_value($sql, @bind);
+
+The first column of the first row, or C<undef> when nothing matched. Takes
+the same arguments as L</query>.
+
+    my $total = await $conn->query_value('SELECT count(*) FROM users');
+
+C<undef> for no match, and a warning for more than one row, matching
+L</query_row>.
+
+Positional throughout: it never builds a hashref, so unlike L</query_row> it
+works on a query whose column names repeat.
 
 =head2 transaction
 

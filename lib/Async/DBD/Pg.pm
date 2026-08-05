@@ -153,6 +153,24 @@ async sub query {
     return await $conn->query(@args);
 }
 
+async sub query_row {
+    my ($self, @args) = @_;
+
+    my $conn  = await $self->connection;
+    my $guard = Async::DBD::Pg::_ReleaseGuard->new($conn);
+
+    return await $conn->query_row(@args);
+}
+
+async sub query_value {
+    my ($self, @args) = @_;
+
+    my $conn  = await $self->connection;
+    my $guard = Async::DBD::Pg::_ReleaseGuard->new($conn);
+
+    return await $conn->query_value(@args);
+}
+
 async sub transaction {
     my ($self, @rest) = @_;
 
@@ -1266,6 +1284,25 @@ binds and C<timeout> option all apply.
 
 For several statements that need to share one connection, or a transaction,
 see L</with_connection> and L</transaction>.
+
+=head2 query_row
+
+    my $row = await $pg->query_row($sql, @bind);
+
+As L</query>, but returns the first row as a hashref rather than a result, or
+C<undef> when nothing matched. Warns when more than one row matched.
+
+See L<Async::DBD::Pg::Connection/query_row>, including what happens when the
+query's column names repeat.
+
+=head2 query_value
+
+    my $value = await $pg->query_value($sql, @bind);
+
+As L</query>, but returns the first column of the first row, or C<undef> when
+nothing matched. Warns when more than one row matched.
+
+See L<Async::DBD::Pg::Connection/query_value>.
 
 =head2 with_connection
 
