@@ -157,6 +157,38 @@ async sub notify {
     return await $self->pubsub->notify(@args);
 }
 
+# Check out, run, release -- including when the work fails or the caller
+# cancels mid-flight. A guard rather than a release after the await: a
+# cancelled async sub never resumes, so anything written after the await would
+# not run, which is exactly how a checkout gets stranded. See
+# Async::DBD::Pg::PubSub::_CheckoutGuard, which exists for the same reason.
+async sub with_connection {
+    my ($self, $code, @args) = @_;
+
+    my $conn  = await $self->connection;
+    my $guard = Async::DBD::Pg::_ReleaseGuard->new($conn);
+
+    return await $code->($conn, @args);
+}
+
+async sub query {
+    my ($self, @args) = @_;
+
+    my $conn  = await $self->connection;
+    my $guard = Async::DBD::Pg::_ReleaseGuard->new($conn);
+
+    return await $conn->query(@args);
+}
+
+async sub transaction {
+    my ($self, @rest) = @_;
+
+    my $conn  = await $self->connection;
+    my $guard = Async::DBD::Pg::_ReleaseGuard->new($conn);
+
+    return await $conn->transaction(@rest);
+}
+
 # Close the pool. Idle connections go at once, connections still checked out
 # are waited for so their owners are not cut off mid-query, and anyone queued
 # is told rather than left waiting for a connection that is not coming.
@@ -904,6 +936,36 @@ sub DESTROY {
     $pool->{_connecting}--;
 }
 
+# Releases the connection checked out by query(), transaction() and
+# with_connection(), however the call ends -- success, the work dying, or the
+# caller cancelling while suspended at the await above it. A cancelled async
+# sub never resumes past its current await, so a plain release written after
+# it would simply not run, which is exactly how a checkout gets stranded. See
+# Async::DBD::Pg::PubSub::_CheckoutGuard (PubSub.pm), which exists for the
+# same reason.
+#
+# Never disarmed: the checkout this guard holds is never published anywhere
+# else -- it is handed only to $code or to $conn->query/$conn->transaction,
+# both of which return before this guard goes out of scope -- so it always
+# wants exactly one release, on every path.
+package Async::DBD::Pg::_ReleaseGuard;
+
+use strict;
+use warnings;
+
+sub new {
+    my ($class, $conn) = @_;
+
+    return bless { conn => $conn }, $class;
+}
+
+sub DESTROY {
+    my ($self) = @_;
+
+    my $conn = delete $self->{conn} or return;
+    $conn->release;
+}
+
 package Async::DBD::Pg;
 
 1;
@@ -1229,6 +1291,49 @@ flapping is visible rather than silently absorbed.
     my $conn = await $pg->connection;
 
 Get a connection from the pool. Returns a L<Async::DBD::Pg::Connection>.
+
+=head2 query
+
+    my $result = await $pg->query($sql);
+    my $result = await $pg->query($sql, @bind);
+
+Checks out a connection, runs one statement on it, and returns it -- whether
+the statement succeeds, fails, or the caller cancels while it is in flight.
+Arguments are passed straight through to
+L<Async::DBD::Pg::Connection/query>, so the same placeholder forms, typed
+binds and C<timeout> option all apply.
+
+For several statements that need to share one connection, or a transaction,
+see L</with_connection> and L</transaction>.
+
+=head2 with_connection
+
+    my $result = await $pg->with_connection(async sub {
+        my ($conn, @args) = @_;
+        await $conn->query(...);
+        return await $conn->query(...);
+    }, @args);
+
+Checks out a connection, runs C<$code> with it, and returns it -- whether
+C<$code> returns, dies, or the caller cancels while it is running. Whatever
+C<$code> returns is returned. Arguments after C<$code> are forwarded to it as
+C<< $code->($conn, @args) >>, letting a caller pass values in rather than
+close over them.
+
+Use this for a scope that needs several statements on the same connection --
+a single statement can use L</query> instead, and does not need a callback at
+all.
+
+=head2 transaction
+
+    my $result = await $pg->transaction($code, @args);
+    my $result = await $pg->transaction({ isolation => 'serializable' }, $code, @args);
+
+Checks out a connection and runs C<$code> inside a transaction on it,
+returning the connection whether the transaction commits, rolls back, or the
+caller cancels while it is in flight. Arguments are passed straight through to
+L<Async::DBD::Pg::Connection/transaction>, so the leading-options form, the
+argument forwarding, and savepoint nesting all apply.
 
 =head2 idle_count, active_count, waiting_count, total_count
 

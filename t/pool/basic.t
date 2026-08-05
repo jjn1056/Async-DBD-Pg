@@ -1098,4 +1098,59 @@ subtest 'cancelling one queued caller leaves the others queued' => sub {
     $pg->shutdown->get;
 };
 
+subtest 'the pool runs a single statement without a manual checkout' => sub {
+    my $pg = Async::DBD::Pg->new(dsn => test_dsn(), min_connections => 0, max_connections => 3);
+
+    is $pg->query('SELECT 42 AS answer')->get->first->{answer}, 42, 'the pool ran it';
+    is $pg->active_count, 0, 'and released the connection';
+    is $pg->idle_count, 1, 'back to idle, reusable';
+    is $pg->query('SELECT $1::int AS n', 7)->get->first->{n}, 7, 'binds pass through';
+
+    $pg->shutdown->get;
+};
+
+subtest 'the pool releases its connection when the statement fails' => sub {
+    my $pg = Async::DBD::Pg->new(dsn => test_dsn(), min_connections => 0, max_connections => 3);
+
+    ok dies { $pg->query('SELECT * FROM no_such_table')->get }, 'the failure reaches the caller';
+    is $pg->active_count, 0,
+        'and the connection is returned -- the leak this helper exists to prevent';
+    ok $pg->query('SELECT 1')->get, 'the pool still works afterwards';
+
+    $pg->shutdown->get;
+};
+
+subtest 'with_connection scopes a checkout and forwards arguments' => sub {
+    my $pg = Async::DBD::Pg->new(dsn => test_dsn(), min_connections => 0, max_connections => 3);
+    $pg->query('CREATE TABLE IF NOT EXISTS wc (id int, tag text)')->get;
+    $pg->query('DELETE FROM wc')->get;
+
+    my $out = $pg->with_connection(async sub {
+        my ($conn, $id, $tag) = @_;
+        await $conn->query('INSERT INTO wc VALUES ($1, $2)', $id, $tag);
+        return await $conn->query('SELECT tag FROM wc WHERE id = $1', $id);
+    }, 5, 'scoped')->get;
+
+    is $out->first->{tag}, 'scoped', 'the callback ran with its arguments';
+    is $pg->active_count, 0, 'and the connection came back';
+
+    ok dies { $pg->with_connection(async sub { die "boom\n" })->get }, 'a dying body fails the caller';
+    is $pg->active_count, 0, 'and still releases';
+
+    $pg->query('DROP TABLE wc')->get;
+    $pg->shutdown->get;
+};
+
+subtest 'a cancelled pool call does not strand its connection' => sub {
+    my $pg = Async::DBD::Pg->new(dsn => test_dsn(), min_connections => 0, max_connections => 3);
+
+    my $slow = $pg->query('SELECT pg_sleep(5)');
+    ok wait_until(sub { $pg->active_count == 1 }, 'query in flight', 3), 'the statement is running';
+    $slow->cancel;
+    ok wait_until(sub { $pg->active_count == 0 }, 'released after cancel', 5),
+        'cancelling releases the checkout rather than stranding it';
+
+    $pg->shutdown->get;
+};
+
 done_testing;
