@@ -204,4 +204,31 @@ subtest 'transaction takes its options first, where they are visible' => sub {
     $pg->shutdown->get;
 };
 
+subtest 'a nested transaction forwards arguments too' => sub {
+    my $pg   = Async::DBD::Pg->new(dsn => test_dsn(), min_connections => 0, max_connections => 3);
+    my $conn = $pg->connection->get;
+    $conn->query('CREATE TEMP TABLE nestargs (tag text)')->get;
+
+    # The inner transaction takes the savepoint path, a different $code->()
+    # call site from the outer, top-level one. Forwarding was added to both;
+    # the subtests above only ever exercised the top-level one.
+    $conn->transaction(async sub {
+        my ($c, $outer) = @_;
+        await $c->query('INSERT INTO nestargs VALUES ($1)', $outer);
+
+        await $c->transaction(async sub {
+            my ($c2, $inner) = @_;
+            await $c2->query('INSERT INTO nestargs VALUES ($1)', $inner);
+        }, 'from-savepoint');
+    }, 'from-outer')->get;
+
+    my @tags = map { $_->{tag} }
+        @{ $conn->query('SELECT tag FROM nestargs ORDER BY tag')->get->rows };
+    is \@tags, ['from-outer', 'from-savepoint'],
+        'both the outer and the nested callback received their arguments';
+
+    $conn->release;
+    $pg->shutdown->get;
+};
+
 done_testing;
