@@ -642,15 +642,8 @@ async sub _replace_dbh {
     delete $conn->{_cached_sock};
     delete $conn->{_cached_fd};
 
-    # Prepared statements belong to the backend that made them, and that
-    # backend is the one just closed. Executing a handle held over from it
-    # fails with "Cannot call execute on a disconnected database handle" -- a
-    # DBI error carrying no SQLSTATE, so the cache's own 0A000/26000 recovery
-    # does not see it either. Healing exists to be invisible to the caller,
-    # and a cache outliving its handle would make it visible on the first use
-    # of every statement in it.
-    %{ $conn->{_stmt_cache} } = ();
-    @{ $conn->{_stmt_lru} }   = ();
+    # The statement cache is emptied by _close_dbh above, which owns that
+    # invariant: prepared statements belong to the backend that made them.
 
     return $conn;
 }

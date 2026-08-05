@@ -940,6 +940,18 @@ sub _close_dbh {
         eval { $self->{dbh}->disconnect };
         $self->{dbh} = undef;
     }
+
+    # A prepared statement belongs to the backend that made it, so the cache
+    # is derived state of the handle and cannot outlive it. Enforced here
+    # rather than at the one call site that currently keeps using the
+    # Connection afterwards -- _replace_dbh, which heals a dead connection in
+    # place -- because every other caller discards the Connection entirely
+    # and only the ordering of a future one would decide whether this matters
+    # again. Executing a statement held over from a closed handle fails with
+    # "Cannot call execute on a disconnected database handle", a DBI error
+    # carrying no SQLSTATE, which the 0A000/26000 recovery does not see.
+    %{ $self->{_stmt_cache} } = ();
+    @{ $self->{_stmt_lru} }   = ();
 }
 
 sub DESTROY {
