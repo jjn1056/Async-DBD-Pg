@@ -41,6 +41,7 @@ sub new {
         on_connect => delete $args{on_connect},
         on_release => delete $args{on_release},
         on_log     => delete $args{on_log},
+        on_query   => delete $args{on_query},
 
         # Pub/sub reconnect. Set on the pool because that is what an
         # application constructs; pubsub takes no arguments.
@@ -151,6 +152,16 @@ async sub query {
     my $guard = Async::DBD::Pg::_ReleaseGuard->new($conn);
 
     return await $conn->query(@args);
+}
+
+# Settable after construction as well, so an application can attach tracing
+# to a pool it was handed rather than one it built.
+sub on_query {
+    my ($self, $callback) = @_;
+
+    $self->{on_query} = $callback if @_ > 1;
+
+    return $self->{on_query};
 }
 
 async sub query_row {

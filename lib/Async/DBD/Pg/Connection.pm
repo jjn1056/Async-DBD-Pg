@@ -11,6 +11,7 @@ use IO::Socket;
 use DBD::Pg qw(:async);
 use POSIX qw(dup);
 use Scalar::Util qw(weaken);
+use Time::HiRes ();
 
 use Async::DBD::Pg::Cursor;
 use Async::DBD::Pg::Error;
@@ -74,15 +75,61 @@ async sub query {
     $self->{query_count}++;
     $self->{last_used} = time();
 
-    my $result;
-    if (my $timeout = $opts->{timeout}) {
-        $result = await $self->_query_with_timeout($sql, $bind, $timeout);
-    }
-    else {
-        $result = await $self->_execute_async($sql, $bind);
+    # Monotonic, so a clock adjustment mid-query cannot produce a negative or
+    # wildly wrong duration. Captured here rather than reconstructed later,
+    # for the same reason the column types are: afterwards it is gone.
+    my $started = _now();
+
+    my $result = eval {
+        $opts->{timeout}
+            ? await $self->_query_with_timeout($sql, $bind, $opts->{timeout})
+            : await $self->_execute_async($sql, $bind);
+    };
+    my $error = $@;
+
+    my $elapsed = _now() - $started;
+
+    if ($error) {
+        $self->_report_query($sql, $bind, $elapsed, undef, $error);
+        die $error;
     }
 
+    $result->{_elapsed} = $elapsed;
+    $self->_report_query($sql, $bind, $elapsed, $result->count, undef);
+
     return $result;
+}
+
+# One hook, deliberately: slow-query logging, tracing, metrics and the test
+# assertion "this path ran two queries" are all this shape, and none of them
+# needs an event system to sit on.
+sub _report_query {
+    my ($self, $sql, $bind, $elapsed, $rows, $error) = @_;
+
+    my $pool = $self->{pool} or return;
+    my $hook = $pool->{on_query} or return;
+
+    # A handler that dies must not turn a working query into a failed one,
+    # nor mask the error a failing one is already carrying.
+    eval {
+        $hook->({
+            sql     => $sql,
+            binds   => $bind,
+            elapsed => $elapsed,
+            rows    => $rows,
+            error   => $error,
+        });
+        1;
+    } or $pool->_log(warn => "on_query handler failed: $@");
+
+    return;
+}
+
+sub _now {
+    return Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC())
+        if defined &Time::HiRes::CLOCK_MONOTONIC;
+
+    return Time::HiRes::time();
 }
 
 # One row, or undef. The pair with query_value below covers the two shapes

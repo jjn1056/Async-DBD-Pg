@@ -258,4 +258,83 @@ subtest 'query_value returns one value and never builds a hash' => sub {
     $conn->_close_dbh;
 };
 
+subtest 'elapsed is captured on every result' => sub {
+    my $conn = make_connection();
+
+    my $quick = $conn->query('SELECT 1 AS n')->get;
+    ok defined $quick->elapsed, 'a SELECT carries its duration';
+    ok $quick->elapsed > 0, 'which is positive';
+    ok $quick->elapsed < 10, 'and plausible for a trivial statement';
+
+    # A slow statement must measure slower than a fast one, or the number is
+    # decorative rather than a measurement.
+    my $slow = $conn->query('SELECT pg_sleep(0.25)')->get;
+    ok $slow->elapsed > 0.2, 'a deliberately slow query measures slow';
+    ok $slow->elapsed > $quick->elapsed, 'and slower than the quick one';
+
+    my $insert = $conn->query('CREATE TEMP TABLE res_time (id int)')->get;
+    ok defined $insert->elapsed, 'a statement returning no rows has one too';
+
+    my $returning = $conn->query(
+        'INSERT INTO res_time VALUES (1) RETURNING id'
+    )->get;
+    ok defined $returning->elapsed, 'and so does RETURNING';
+
+    # A view is the same query's result, so it reports the same duration.
+    my $r = $conn->query('SELECT 1 AS n')->get;
+    is $r->as(['x'])->elapsed, $r->elapsed, 'a view carries it through';
+
+    $conn->_close_dbh;
+};
+
+subtest 'on_query sees every statement, successful or not' => sub {
+    my @events;
+    my $pg = Async::DBD::Pg->new(
+        dsn             => test_dsn(),
+        min_connections => 0,
+        max_connections => 2,
+        on_query        => sub { push @events, $_[0] },
+    );
+
+    $pg->query('SELECT $1::int AS n', 7)->get;
+
+    is scalar @events, 1, 'one statement, one event';
+    is $events[0]{sql}, 'SELECT $1::int AS n', 'the statement';
+    is $events[0]{binds}, [7], 'its binds';
+    is $events[0]{rows}, 1, 'the row count';
+    is $events[0]{error}, undef, 'and no error';
+    ok $events[0]{elapsed} > 0, 'with a duration';
+
+    @events = ();
+    ok dies { $pg->query('SELECT * FROM no_such_table_here')->get },
+        'a failing statement still fails';
+
+    is scalar @events, 1, 'and still reports';
+    is $events[0]{rows}, undef, 'with no row count';
+    like $events[0]{error}, qr/no_such_table_here/, 'and the error';
+
+    # This is the "did this code path run two queries" use, which is why the
+    # hook is worth having rather than four separate features.
+    @events = ();
+    $pg->query_row('SELECT 1 AS n')->get;
+    $pg->query_value('SELECT 2')->get;
+    is scalar @events, 2, 'query_row and query_value report too';
+
+    # A handler that dies must not take the caller's query down with it.
+    my @logged;
+    $pg->{on_log} = sub { push @logged, $_[1] };
+    $pg->on_query(sub { die "handler exploded\n" });
+
+    my $survived;
+    ok lives { $survived = $pg->query('SELECT 42 AS n')->get },
+        'a dying handler does not fail the query';
+    is $survived->first->{n}, 42, 'which returns its result as normal';
+    like $logged[-1], qr/on_query handler failed/, 'and the failure is logged';
+
+    $pg->on_query(undef);
+    ok lives { $pg->query('SELECT 1')->get }, 'the hook can be removed again';
+
+    $pg->shutdown(timeout => 2)->get;
+};
+
 done_testing;

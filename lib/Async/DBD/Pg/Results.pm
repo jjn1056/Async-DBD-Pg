@@ -11,7 +11,7 @@ use Async::DBD::Pg::Column;
 # cannot hold a repeated column name, so storing hashes loses data on any
 # self-join; storing arrays loses nothing and measures faster besides.
 sub new {
-    my ($class, $sth) = @_;
+    my ($class, $sth, $elapsed) = @_;
 
     # Order matters, and not for style. On an async statement handle, reading
     # NAME or pg_type before the fetch leaves the handle with "no statement
@@ -28,7 +28,7 @@ sub new {
     my $rows_affected = $sth->rows;
     $sth->finish;
 
-    return $class->_build($rows, $names, $types, $rows_affected);
+    return $class->_build($rows, $names, $types, $rows_affected, $elapsed);
 }
 
 # Build a result from data already in hand, without a statement handle.
@@ -40,17 +40,19 @@ sub new_from_data {
         $args{columns} // [],
         $args{types}   // [],
         $args{rows_affected} // 0,
+        $args{elapsed},
     );
 }
 
 sub _build {
-    my ($class, $rows, $names, $types, $rows_affected) = @_;
+    my ($class, $rows, $names, $types, $rows_affected, $elapsed) = @_;
 
     return bless {
         _rows          => $rows,
         _names         => $names,
         _types         => $types,
         _rows_affected => $rows_affected,
+        _elapsed       => $elapsed,
         _position      => 0,
         # One pass now so that no hash-producing call has to scan for this,
         # and so arrays consumers never pay for a problem they do not have.
@@ -72,6 +74,7 @@ sub columns       { $_[0]{_names} }
 sub types         { $_[0]{_types} }
 sub count         { scalar @{ $_[0]{_rows} } }
 sub rows_affected { $_[0]{_rows_affected} }
+sub elapsed       { $_[0]{_elapsed} }
 sub is_empty      { !@{ $_[0]{_rows} } }
 
 # The first repeated column name and where it appears, or nothing. Callers
@@ -314,7 +317,7 @@ sub as {
     }
 
     return ref($self)->_build(
-        $self->{_rows}, $names, $self->{_types}, $self->{_rows_affected},
+        $self->{_rows}, $names, $self->{_types}, $self->{_rows_affected}, $self->{_elapsed},
     );
 }
 
@@ -331,7 +334,7 @@ sub expand {
     my @json = grep { ($types->[$_] // '') =~ /\A jsonb? \z/x } 0 .. $#$types;
 
     return ref($self)->_build(
-        [ @{ $self->{_rows} } ], $self->{_names}, $types, $self->{_rows_affected},
+        [ @{ $self->{_rows} } ], $self->{_names}, $types, $self->{_rows_affected}, $self->{_elapsed},
     ) unless @json;
 
     my $decoder = _json_decoder();
@@ -354,7 +357,7 @@ sub expand {
     }
 
     return ref($self)->_build(
-        \@rows, $self->{_names}, $types, $self->{_rows_affected},
+        \@rows, $self->{_names}, $types, $self->{_rows_affected}, $self->{_elapsed},
     );
 }
 
