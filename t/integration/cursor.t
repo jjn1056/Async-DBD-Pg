@@ -2,6 +2,7 @@ use strict;
 use warnings;
 use Test2::V0;
 use Future::AsyncAwait;
+use File::Temp qw(tempfile);
 
 use lib 't/lib';
 use Test::Async::DBD::Pg qw(skip_without_postgres test_dsn);
@@ -20,6 +21,33 @@ sub make_pool {
         min_connections => 0,
         max_connections => 2,
     );
+}
+
+# See t/integration/pubsub.t for why this captures the file descriptor
+# rather than trusting a warning handler alone.
+sub capture_stderr {
+    my ($code) = @_;
+
+    my ($fh, $path) = tempfile(UNLINK => 1);
+    close $fh;
+
+    open my $saved_stderr, '>&', \*STDERR or die "dup stderr: $!";
+    open STDERR, '>', $path or die "redirect stderr: $!";
+
+    my $ok = eval { $code->(); 1 };
+    my $err = $@;
+
+    open STDERR, '>&', $saved_stderr or die "restore stderr: $!";
+    close $saved_stderr;
+
+    die $err unless $ok;
+
+    open my $read_fh, '<', $path or die "read captured stderr: $!";
+    local $/;
+    my $captured = <$read_fh>;
+    close $read_fh;
+
+    return $captured;
 }
 
 subtest 'next walks the result in batches' => sub {
@@ -160,6 +188,67 @@ subtest 'closing twice is harmless' => sub {
     ok lives { $cursor->close->get }, 'second close does nothing';
 
     $conn->release;
+};
+
+subtest 'draining a cursor finishes it' => sub {
+    my $pg   = Async::DBD::Pg->new(dsn => test_dsn(), min_connections => 0, max_connections => 3);
+    my $conn = $pg->connection->get;
+    $conn->query('CREATE TEMP TABLE drained AS SELECT g AS id FROM generate_series(1,250) g')->get;
+
+    my $cursor = $conn->cursor('SELECT id FROM drained', { batch_size => 100 })->get;
+
+    my $seen = 0;
+    my $noise = capture_stderr(sub {
+        $cursor->each(async sub { $seen++ })->get;
+    });
+
+    is $seen, 250, 'every row was delivered';
+    ok $cursor->is_exhausted, 'the cursor knows it is exhausted';
+    ok $cursor->is_closed, 'and closed itself rather than warning about it later';
+    ok !$conn->in_transaction,
+        'the transaction the cursor opened was ended, not left on the connection';
+    is $noise, '', 'nothing was written to stderr';
+
+    $conn->release;
+    $pg->shutdown->get;
+};
+
+subtest 'a cursor abandoned before exhaustion still warns' => sub {
+    my $pg   = Async::DBD::Pg->new(dsn => test_dsn(), min_connections => 0, max_connections => 3);
+    my $conn = $pg->connection->get;
+    $conn->query('CREATE TEMP TABLE partial AS SELECT g AS id FROM generate_series(1,250) g')->get;
+
+    # Closing on exhaustion must not silence the case the warning is for:
+    # a caller who walks away mid-stream still leaves a cursor open.
+    my $noise = capture_stderr(sub {
+        my $cursor = $conn->cursor('SELECT id FROM partial', { batch_size => 10 })->get;
+        $cursor->next->get;
+        undef $cursor;
+    });
+    like $noise, qr/discarded without close/,
+        'abandoning a cursor part-way through is still reported';
+
+    $conn->release;
+    $pg->shutdown->get;
+};
+
+subtest 'each forwards trailing arguments to its callback' => sub {
+    my $pg   = Async::DBD::Pg->new(dsn => test_dsn(), min_connections => 0, max_connections => 3);
+    my $conn = $pg->connection->get;
+    $conn->query('CREATE TEMP TABLE eachargs AS SELECT g AS id FROM generate_series(1,5) g')->get;
+
+    my $cursor = $conn->cursor('SELECT id FROM eachargs', { batch_size => 2 })->get;
+    my @seen;
+    $cursor->each(async sub {
+        my ($row, $prefix) = @_;
+        push @seen, "$prefix$row->{id}";
+    }, 'row-')->get;
+
+    is scalar(@seen), 5, 'every row was delivered';
+    is $seen[0], 'row-1', 'and the trailing argument came with it';
+
+    $conn->release;
+    $pg->shutdown->get;
 };
 
 done_testing;

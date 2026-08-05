@@ -154,8 +154,8 @@ subtest 'query errors carry PostgreSQL diagnostics' => sub {
     };
 
     isa_ok $err, 'Async::DBD::Pg::Error::Query';
-    is $err->code, '23505', 'SQLSTATE recorded';
-    is $err->state, 'unique_violation', 'SQLSTATE mapped to a state name';
+    is $err->state, '23505', 'SQLSTATE recorded';
+    is $err->state_name, 'unique_violation', 'SQLSTATE mapped to a state name';
     is $err->constraint, 'diag_email_unique', 'violated constraint named';
     like $err->detail, qr/already exists/i, 'detail carries the server explanation';
     is $err->table, 'diag', 'offending table named';
@@ -175,7 +175,7 @@ subtest 'syntax errors report their position' => sub {
     my $err = dies { $conn->query('SELECT * FROM WHERE')->get };
 
     isa_ok $err, 'Async::DBD::Pg::Error::Query';
-    is $err->code, '42601', 'syntax error SQLSTATE';
+    is $err->state, '42601', 'syntax error SQLSTATE';
     ok defined $err->position, 'statement position populated';
     ok $err->position > 0, 'position points into the statement';
 

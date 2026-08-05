@@ -40,11 +40,6 @@ my %STATE_MAP = (
     '08006' => 'connection_failure',
 );
 
-sub _state_from_code {
-    my ($code) = @_;
-    return $STATE_MAP{$code} // 'unknown';
-}
-
 
 package Async::DBD::Pg::Error::Query;
 
@@ -56,7 +51,6 @@ sub new {
     return $self;
 }
 
-sub code       { shift->{code} }
 sub constraint { shift->{constraint} }
 sub detail     { shift->{detail} }
 sub hint       { shift->{hint} }
@@ -67,9 +61,14 @@ sub table      { shift->{table} }
 sub column     { shift->{column} }
 sub context    { shift->{context} }
 
-sub state {
-    my $self = shift;
-    return Async::DBD::Pg::Error::_state_from_code($self->{code});
+# The five-character SQLSTATE. This is what DBI's own state() returns, what
+# PostgreSQL's documentation is indexed by, and what callers compare against.
+sub state { $_[0]->{code} }
+
+# The readable name for the codes worth naming, 'unknown' otherwise.
+sub state_name {
+    my ($self) = @_;
+    return $STATE_MAP{ $self->{code} // '' } // 'unknown';
 }
 
 
@@ -110,7 +109,7 @@ Async::DBD::Pg::Error - Error classes for Async::DBD::Pg
     if (my $err = $@) {
         if ($err->isa('Async::DBD::Pg::Error::Query')) {
             warn "Query failed: " . $err->message;
-            warn "SQLSTATE: " . $err->code;
+            warn "SQLSTATE: " . $err->state;
         }
     }
 
@@ -135,11 +134,14 @@ Raised when a statement fails. Its accessors are populated from the
 diagnostics PostgreSQL returned with the error, so most are only defined when
 they apply to that particular error.
 
-=head3 code
-
-The five character SQLSTATE, for example C<23505>.
-
 =head3 state
+
+The five character SQLSTATE, for example C<23505>, as DBI's own C<state>
+documents it. This changed meaning: it used to return a readable name, which
+made code comparing C<state> against a SQLSTATE such as C<'23505'> never
+match. Readable names are now C<state_name>.
+
+=head3 state_name
 
 The SQLSTATE mapped to a readable name, for example C<unique_violation>.
 Returns C<unknown> for codes this module does not name.

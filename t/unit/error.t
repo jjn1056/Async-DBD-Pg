@@ -27,12 +27,29 @@ subtest 'query error' => sub {
     isa_ok $err, 'Async::DBD::Pg::Error';
     isa_ok $err, 'Async::DBD::Pg::Error::Query';
 
-    is $err->code, '23505', 'SQLSTATE code';
+    is $err->state, '23505', 'SQLSTATE code';
     is $err->constraint, 'users_email_key', 'constraint name';
     is $err->detail, 'Key (email)=(test@example.com) already exists.', 'detail';
     is $err->hint, undef, 'hint can be undef';
     is $err->position, 42, 'position';
-    is $err->state, 'unique_violation', 'human-readable state from code';
+    is $err->state_name, 'unique_violation', 'human-readable state from code';
+};
+
+subtest 'state is the SQLSTATE, matching DBI' => sub {
+    my $err = Async::DBD::Pg::Error::Query->new(
+        message => 'boom', code => '23505',
+    );
+
+    is $err->state, '23505',
+        'state is the five-character SQLSTATE, as DBI documents it';
+    is $err->state_name, 'unique_violation',
+        'the readable name moved to state_name';
+    ok !Async::DBD::Pg::Error::Query->can('code'),
+        'code is gone rather than aliased -- one accessor, one meaning';
+
+    my $odd = Async::DBD::Pg::Error::Query->new(message => 'x', code => '99999');
+    is $odd->state, '99999', 'an unmapped code still reports its SQLSTATE';
+    is $odd->state_name, 'unknown', 'and only the name is unknown';
 };
 
 subtest 'connection error' => sub {
@@ -98,7 +115,7 @@ subtest 'every mapped SQLSTATE resolves to its name' => sub {
             message => 'boom',
             code    => $code,
         );
-        is $err->state, $expected{$code}, "$code is $expected{$code}";
+        is $err->state_name, $expected{$code}, "$code is $expected{$code}";
     }
 };
 
@@ -108,7 +125,7 @@ subtest 'unmapped SQLSTATE resolves to unknown' => sub {
             message => 'boom',
             code    => $code,
         );
-        is $err->state, 'unknown', "unmapped '$code' reports unknown";
+        is $err->state_name, 'unknown', "unmapped '$code' reports unknown";
     }
 };
 
@@ -161,7 +178,7 @@ subtest 'errors can be thrown and caught' => sub {
 
     ok $caught, 'error was thrown';
     isa_ok $caught, 'Async::DBD::Pg::Error::Query';
-    is $caught->code, '42601', 'caught error has correct code';
+    is $caught->state, '42601', 'caught error has correct code';
 };
 
 done_testing;
