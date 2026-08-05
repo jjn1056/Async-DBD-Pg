@@ -276,7 +276,18 @@ async sub _execute_async {
 
     my $dbh = $self->{dbh};
 
-    my $sth = eval { $dbh->prepare($sql, { pg_async => PG_ASYNC }) };
+    # dollaronly confines DBD::Pg's own placeholder scan to $1, which is the
+    # only form reaching it: positional binds arrive as $1 already, and
+    # convert_placeholders has rewritten :name into $1 by now. Left off, that
+    # scan reads PostgreSQL's own syntax as placeholders -- jsonb's ?, ?| and
+    # ?& operators, and the open array slice arr[:2] -- and the statement dies
+    # at execute on a placeholder the caller never wrote.
+    my $sth = eval {
+        $dbh->prepare($sql, {
+            pg_async                  => PG_ASYNC,
+            pg_placeholder_dollaronly => 1,
+        })
+    };
     if ($@ || !$sth) {
         $self->_throw_query_error($@ || $dbh->errstr, $sql);
     }
@@ -745,6 +756,22 @@ take theirs from a hashref, and are rewritten to positional form before the
 statement is sent; naming a placeholder with no matching key is an error
 rather than something passed through to the server. The two forms cannot be
 mixed in one statement.
+
+There is no third form: B<C<?> is never a placeholder here>. That is
+deliberate, and it is what makes PostgreSQL's own syntax usable unescaped:
+
+    # the jsonb existence operators, which need no escaping
+    await $conn->query(q{SELECT data ? 'key' FROM docs WHERE id = $1}, $id);
+    await $conn->query(q{SELECT data ?| array['a','b'] FROM docs});
+
+    # an array slice with an omitted bound
+    await $conn->query('SELECT tags[:2] FROM posts WHERE id = $1', $id);
+
+Coming from DBI, where C<?> is the usual placeholder, a statement written
+with C<?> reaches PostgreSQL with the question marks intact and fails as a
+syntax error naming the C<?>. Use C<$1> instead. For the same reason a
+C<:name> typed by mistake in a statement with no hashref of parameters
+reaches the server literally and is reported as a syntax error at the colon.
 
 =head3 Typed bind parameters
 

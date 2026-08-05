@@ -1009,7 +1009,8 @@ abstraction layer. Features include:
 
 =item * Connection pooling with automatic management
 
-=item * Named and positional placeholders
+=item * Named and positional placeholders, leaving C<?> free for PostgreSQL's
+own operators
 
 =item * Transaction support with savepoints
 
