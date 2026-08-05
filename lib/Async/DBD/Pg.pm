@@ -1203,6 +1203,50 @@ still reach C<warn> the same way the pool's own diagnostics do; what changes
 is that they no longer bypass C<on_log> and print straight to file
 descriptor 2 regardless of whether a handler is configured.
 
+=head3 on_query
+
+    on_query => sub {
+        my ($event) = @_;
+        warn "slow: $event->{sql}" if $event->{elapsed} > 1;
+    },
+
+Called once per statement, with a hashref describing it:
+
+=over 4
+
+=item * C<sql> -- the statement as sent, after any C<:name> placeholders
+were rewritten
+
+=item * C<binds> -- an arrayref of the bind values
+
+=item * C<elapsed> -- how long it took, in fractional seconds
+
+=item * C<rows> -- the number of rows returned, or C<undef> if it failed
+
+=item * C<error> -- the failure, or C<undef> if it succeeded
+
+=back
+
+Fires on success and on failure alike, so a handler counting statements sees
+all of them.
+
+This one hook is slow-query logging, request tracing, metrics collection,
+and the test assertion "this code path ran two queries". It is deliberately
+one callback rather than an event system; there is nothing to subscribe to
+and no event types to learn.
+
+A handler that dies is reported through L</on_log> and otherwise ignored:
+observing a query must not be able to fail it, nor mask an error it is
+already carrying.
+
+Note that C<binds> holds the values as they were passed. A handler that logs
+them unfiltered will log whatever was bound, including a C<bytea> payload.
+
+It can also be set or replaced after construction:
+
+    $pg->on_query(sub { ... });
+    $pg->on_query(undef);        # and removed
+
 =head3 reconnect
 
 Re-establish the pub/sub listener when its connection fails, re-subscribing

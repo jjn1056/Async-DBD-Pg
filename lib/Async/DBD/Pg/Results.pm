@@ -622,6 +622,21 @@ nothing reports 0 and is not an error.
 
 True when no rows were returned.
 
+=head2 elapsed
+
+    say sprintf '%.3fs', $result->elapsed;
+
+How long the query took, in fractional seconds, measured on a monotonic
+clock so a clock adjustment mid-query cannot distort it. Present on every
+result, including statements that return no rows.
+
+Captured because it cannot be recovered afterwards. For a hook that sees
+this for every query rather than one at a time, see
+L<Async::DBD::Pg/on_query>.
+
+A view reports the same figure as the result it came from, being the same
+query.
+
 =head2 first
 
     my $row = $result->first;
