@@ -61,22 +61,53 @@ subtest 'next walks the result in batches' => sub {
     is $cursor->batch_size, 10, 'batch size recorded';
     ok !$cursor->is_exhausted, 'not exhausted before fetching';
 
-    my $first = $cursor->next->get;
-    is scalar @$first, 10, 'first batch is a full batch';
-    is $first->[0]{n}, 1, 'starts at the first row';
+    # next yields one row, so a cursor loop reads the same way an eager one
+    # does. batch_size is how many rows come back per round trip, which is a
+    # transport detail rather than something the caller sees.
+    my @seen;
+    while (defined(my $row = $cursor->next->get)) {
+        push @seen, $row->{n};
+    }
 
-    my $second = $cursor->next->get;
-    is scalar @$second, 10, 'second full batch';
-    is $second->[0]{n}, 11, 'continues where the first left off';
-
-    # A short batch means the end has been reached.
-    my $third = $cursor->next->get;
-    is scalar @$third, 5, 'final partial batch';
-    ok $cursor->is_exhausted, 'short batch marks the cursor exhausted';
-
-    is $cursor->next->get, undef, 'next returns undef once exhausted';
+    is scalar @seen, 25, 'every row was delivered one at a time';
+    is [ @seen[0, 1] ], [1, 2], 'in order from the first';
+    is $seen[-1], 25, 'through to the last';
+    ok $cursor->is_exhausted, 'exhausted once the rows run out';
+    is $cursor->next->get, undef, 'and stays undef';
 
     $cursor->close->get;
+    $conn->release;
+};
+
+subtest 'batch_size changes round trips, not results' => sub {
+    my $pg = make_pool();
+    my $conn = $pg->connection->get;
+
+    # The connection counts every statement it runs, which is how the cost of
+    # a batch size can be observed at all now that the caller only sees rows.
+    my $fetches = sub {
+        my ($size) = @_;
+
+        my $before = $conn->query_count;
+        my $cursor = $conn->cursor(
+            'SELECT generate_series(1, 20) AS n', { batch_size => $size }
+        )->get;
+
+        my @rows;
+        while (defined(my $row = $cursor->next->get)) { push @rows, $row->{n} }
+        $cursor->close->get;
+
+        return ($conn->query_count - $before, \@rows);
+    };
+
+    my ($few_trips, $rows_a) = $fetches->(20);
+    my ($many_trips, $rows_b) = $fetches->(2);
+
+    is $rows_a, [1 .. 20], 'twenty rows at a batch size of twenty';
+    is $rows_b, [1 .. 20], 'the same twenty rows at a batch size of two';
+    ok $many_trips > $few_trips,
+        "a smaller batch costs more round trips ($many_trips against $few_trips)";
+
     $conn->release;
 };
 
@@ -106,12 +137,14 @@ subtest 'all collects the remaining rows' => sub {
         'SELECT generate_series(1, 5) AS n', { batch_size => 2 }
     )->get;
 
-    # Take one batch first, so "remaining" is what is actually returned.
+    # Take one row first, so "remaining" is what is actually returned. The
+    # rest of that row's batch is already in hand and must not be lost.
     my $first = $cursor->next->get;
-    is scalar @$first, 2, 'one batch taken';
+    is $first->{n}, 1, 'one row taken';
 
     my $rest = $cursor->all->get;
-    is [ map { $_->{n} } @$rest ], [3, 4, 5], 'all returns what was left';
+    is [ map { $_->{n} } @$rest ], [2, 3, 4, 5],
+        'all returns every row that was left, buffered ones included';
 
     $cursor->close->get;
     $conn->release;
@@ -123,7 +156,7 @@ subtest 'a cursor over no rows is exhausted immediately' => sub {
 
     my $cursor = $conn->cursor('SELECT 1 AS n WHERE false')->get;
 
-    is $cursor->next->get, undef, 'no batch to fetch';
+    is $cursor->next->get, undef, 'no row to fetch';
     ok $cursor->is_exhausted, 'exhausted';
     is $cursor->all->get, [], 'all returns nothing';
 

@@ -36,13 +36,15 @@ my $cursor = $conn->cursor(
     { batch_size => 50 }
 )->get;
 
-my $batch = 0;
-while (my $rows = $cursor->next->get) {
-    $batch++;
-    print "Batch $batch: rows ",
-        $rows->[0]{id}, " - ", $rows->[-1]{id},
-        " (", scalar(@$rows), " rows)\n";
+# next yields one row at a time. batch_size above is how many rows come back
+# per round trip, which this loop never has to think about.
+my ($seen, $first, $last) = (0, undef, undef);
+while (my $row = $cursor->next->get) {
+    $seen++;
+    $first //= $row->{id};
+    $last = $row->{id};
 }
+print "Streamed $seen rows, ids $first - $last, 50 at a time\n";
 $cursor->close->get;
 
 print "\nCursor with parameters:\n";
@@ -53,8 +55,8 @@ $cursor = $conn->cursor(
 )->get;
 
 my $count = 0;
-while (my $rows = $cursor->next->get) {
-    $count += @$rows;
+while (my $row = $cursor->next->get) {
+    $count++;
 }
 $cursor->close->get;
 print "  fetched $count rows\n";

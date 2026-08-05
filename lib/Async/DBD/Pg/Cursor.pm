@@ -71,25 +71,44 @@ sub batch_size  { shift->{batch_size} }
 sub is_exhausted { shift->{exhausted} }
 sub is_closed   { shift->{closed} }
 
-# Fetch next batch of rows
+# One row at a time, so a cursor loop reads the way an eager one does:
+#
+#     while (my $row = $rs->next)        { ... }
+#     while (my $row = await $cur->next) { ... }
+#
+# batch_size stays what it always was underneath -- how many rows come back
+# per round trip -- but it is now a transport detail rather than the shape
+# the caller has to iterate.
 async sub next {
     my ($self) = @_;
 
-    return undef if $self->{exhausted} || $self->{closed};
+    if (!@{ $self->{buffer} }) {
+        return undef if $self->{exhausted} || $self->{closed};
+        await $self->_fetch_batch;
+    }
 
-    my $conn = $self->{conn};
-    my $name = $self->{name};
+    return shift @{ $self->{buffer} };
+}
+
+async sub _fetch_batch {
+    my ($self) = @_;
+
     my $batch_size = $self->{batch_size};
 
-    my $result = await $conn->query("FETCH $batch_size FROM $name");
+    my $result = await $self->{conn}->query("FETCH $batch_size FROM $self->{name}");
     my $rows = $result->rows;
 
+    # Close before buffering, not after: close empties the buffer so that a
+    # caller who closes part-way through stops getting rows, and the final
+    # short batch would be thrown away if it were already sitting there.
     if (@$rows < $batch_size) {
         $self->{exhausted} = 1;
         await $self->close;
     }
 
-    return @$rows ? $rows : undef;
+    push @{ $self->{buffer} }, @$rows;
+
+    return;
 }
 
 # Iterate over all rows, calling callback for each
@@ -97,11 +116,9 @@ async sub each {
     my ($self, $callback, @args) = @_;
 
     my $count = 0;
-    while (my $batch = await $self->next) {
-        for my $row (@$batch) {
-            $callback->($row, @args);
-            $count++;
-        }
+    while (defined(my $row = await $self->next)) {
+        $callback->($row, @args);
+        $count++;
     }
 
     return $count;
@@ -112,8 +129,8 @@ async sub all {
     my ($self) = @_;
 
     my @all_rows;
-    while (my $batch = await $self->next) {
-        push @all_rows, @$batch;
+    while (defined(my $row = await $self->next)) {
+        push @all_rows, $row;
     }
 
     return \@all_rows;
@@ -125,6 +142,11 @@ async sub close {
 
     return if $self->{closed};
     $self->{closed} = 1;
+
+    # A caller who closes part-way through has said they are done, so rows
+    # already fetched but not yet handed over go no further. _fetch_batch
+    # buffers after calling this, so the final short batch is unaffected.
+    @{ $self->{buffer} } = ();
 
     if (my $conn = $self->{conn}) {
         eval { await $conn->query("CLOSE " . $self->{name}) };
@@ -192,14 +214,28 @@ Async::DBD::Pg::Cursor - Streaming cursor for large result sets
 
 =head2 next
 
-    while (my $rows = await $cursor->next) {
-        ...
+    while (my $row = await $cursor->next) {
+        say $row->{name};
     }
 
-Fetches the next batch, returning an arrayref of rows or C<undef> once the
-cursor is exhausted. Each call is one round trip returning up to
-C<batch_size> rows. The batch that empties the cursor closes it, the same as
-calling L</close> explicitly.
+The next row as a hashref, or C<undef> once the cursor is exhausted. This
+reads the same as walking an eager result with
+L<Async::DBD::Pg::Results/next>, so switching a query between the two does
+not change the shape of the loop.
+
+Rows are fetched C<batch_size> at a time and handed out one by one, so most
+calls cost nothing and only every C<batch_size>th is a round trip.
+C<batch_size> tunes that traffic; it does not change what this returns. The
+fetch that empties the cursor closes it, the same as calling L</close>
+explicitly.
+
+There is no C<reset>. A server-side cursor is consumed as it is read, and
+re-running the query is a different guarantee rather than a rewind, so it is
+not offered under a name that would suggest otherwise.
+
+A row that is false in boolean context is not possible here, since every row
+is a hashref, so C<while (my $row = ...)> is safe. That is not true of
+L<Async::DBD::Pg::Column/next>, which yields values.
 
 =head2 each
 
