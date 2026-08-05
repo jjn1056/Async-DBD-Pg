@@ -1106,7 +1106,10 @@ subtest 'the pool runs a single statement without a manual checkout' => sub {
     is $pg->idle_count, 1, 'back to idle, reusable';
     is $pg->query('SELECT $1::int AS n', 7)->get->first->{n}, 7, 'binds pass through';
 
-    $pg->shutdown->get;
+    # Bounded rather than an unconditional wait: if a checkout were ever
+    # stranded, this reports as a missed time bound instead of hanging the
+    # rest of the file behind a drain that can never complete.
+    $pg->shutdown(timeout => 2)->get;
 };
 
 subtest 'the pool releases its connection when the statement fails' => sub {
@@ -1117,7 +1120,7 @@ subtest 'the pool releases its connection when the statement fails' => sub {
         'and the connection is returned -- the leak this helper exists to prevent';
     ok $pg->query('SELECT 1')->get, 'the pool still works afterwards';
 
-    $pg->shutdown->get;
+    $pg->shutdown(timeout => 2)->get;
 };
 
 subtest 'with_connection scopes a checkout and forwards arguments' => sub {
@@ -1138,7 +1141,7 @@ subtest 'with_connection scopes a checkout and forwards arguments' => sub {
     is $pg->active_count, 0, 'and still releases';
 
     $pg->query('DROP TABLE wc')->get;
-    $pg->shutdown->get;
+    $pg->shutdown(timeout => 2)->get;
 };
 
 subtest 'a cancelled pool call does not strand its connection' => sub {
@@ -1150,7 +1153,7 @@ subtest 'a cancelled pool call does not strand its connection' => sub {
     ok wait_until(sub { $pg->active_count == 0 }, 'released after cancel', 5),
         'cancelling releases the checkout rather than stranding it';
 
-    $pg->shutdown->get;
+    $pg->shutdown(timeout => 2)->get;
 };
 
 done_testing;
