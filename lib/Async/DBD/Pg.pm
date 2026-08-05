@@ -1185,6 +1185,48 @@ Statements a connection may run before it is closed and replaced. Unset by
 default, meaning connections are kept indefinitely. Useful against slow growth
 in a long-lived backend.
 
+=head3 statement_cache_size
+
+Prepared statements each connection keeps for reuse. C<0>, the default,
+disables the cache, and nothing below applies.
+
+The cache holds a server-side prepared statement per entry, so what it saves
+is B<planning>, not round trips. That makes the workload decide whether it is
+worth anything. Measured here against PostgreSQL 16, 300 statements per run:
+
+=over 4
+
+=item * Statements the planner disposes of instantly -- C<SELECT $1::int> and
+the like -- gain nothing measurable, at any latency.
+
+=item * A three-table join with an C<ORDER BY> saves around 400 microseconds
+per execution, which was 22% end to end over a loopback socket and 5.7% with
+2ms of round-trip latency in the way. The absolute saving barely moves with
+latency; the percentage shrinks because the round trips grow.
+
+=back
+
+Size it to hold the working set. A cache too small for the statements in
+rotation evicts an entry on every query and re-prepares it on the next,
+which costs a round trip that not caching at all would never have paid: two
+statements sharing a cache of one measured 36% B<slower> than C<0> on the
+join workload and 131% slower on the trivial one. Undersized is worse than
+absent, so prefer to leave this off rather than guess low.
+
+Only statements carrying placeholders are cached. DBD::Pg gives a
+server-side prepared statement to those and to no others, so for the rest an
+entry would hold nothing the server knows about. Enabling the cache also
+sets C<pg_switch_prepared> to C<1> on every connection it opens, which is
+what makes that statement exist from the first execution rather than the
+second.
+
+Do not enable this behind a connection pooler in transaction-pooling mode.
+Consecutive transactions land on different backends there, and a prepared
+statement belongs to the backend that made it. Recovery is automatic -- the
+missing statement comes back as SQLSTATE 26000 and the query is retried on a
+freshly prepared one -- but paying for that on most queries is slower than
+never having cached. Session pooling is unaffected.
+
 =head3 on_connect
 
     on_connect => async sub {
@@ -1253,6 +1295,12 @@ were rewritten
 =item * C<rows> -- the number of rows returned, or C<undef> if it failed
 
 =item * C<error> -- the failure, or C<undef> if it succeeded
+
+=item * C<cached> -- true if the statement was reused from the connection's
+prepared-statement cache. Always false when L</statement_cache_size> is C<0>,
+and always false for a statement without placeholders, which is never cached.
+A hit rate well below 1 says the cache is too small for the working set,
+which is the case where it costs more than it saves.
 
 =back
 

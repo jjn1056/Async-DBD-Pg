@@ -23,9 +23,12 @@ the payoff starts at the third execution of a statement.
 
 `pg_switch_prepared` is a **database handle** attribute, not a prepare
 attribute: setting it in the attribute hash passed to `prepare` has no effect,
-and it applies connection-wide to cached and uncached statements alike. It
-therefore belongs in the benchmark matrix as a connection setting, not as
-something the cache turns on for its own handles.
+and it applies connection-wide to cached and uncached statements alike.
+
+The table above also shows this promotion never happens at all for a statement
+without placeholders, at any setting -- see "Only statements with a server-side
+prepared statement may be cached" below, which is what settles both the value
+of caching such a statement and the safety of it.
 
 Measured cost of not caching, 500 repeated queries on loopback:
 
@@ -86,6 +89,47 @@ retrying a statement that might already have run would be unsafe.
 
 Anything else propagates untouched.
 
+### Only statements with a server-side prepared statement may be cached
+
+0A000 is not merely one recoverable state among several. It is the only thing
+standing between a reused handle and a **segfault**.
+
+Re-executing a DBD::Pg statement handle after its result shape has changed
+crashes the process. The handle keeps the field count from its first execute
+and the fetch walks off it. Measured against DBD::Pg 3.20.2 with plain
+synchronous DBI and none of this library involved, in both directions of the
+change (`ADD COLUMN` and `DROP COLUMN`), and whether or not `NAME` is read
+first. It is not catchable: there is no error, no warning, and no exception --
+the process dies during the fetch.
+
+What normally prevents it is PostgreSQL rather than the driver. A **named**
+server-side prepared statement has a cached plan, so the server rejects the
+execute with 0A000 and nothing is ever fetched. The crash needs a handle with
+no such plan.
+
+DBD::Pg promotes **only statements that carry placeholders**. `SELECT * FROM t`
+never gets a named prepared statement however often it runs, so it has no
+cached plan, gets no 0A000, and is exactly the case that crashes.
+
+Two consequences, both load-bearing:
+
+- **Cache a handle only when it carries placeholders.** Verified with
+  `NUM_OF_PARAMS`, which is readable straight after `prepare`. This costs
+  almost nothing: with no server-side statement to keep alive, caching an
+  unparameterized statement bought DBI's local re-parse and no round trip.
+- **Set `pg_switch_prepared` to 1** on any connection whose cache is enabled.
+  At the default of 2, promotion happens on a handle's *second* execute -- but
+  an uncached handle is dropped before then, so every execute is a first one
+  and nothing is ever promoted. Without this the cache never holds anything.
+  It also closes the window in which a cached placeholder-carrying handle
+  exists without its plan: measured, one execute at the default and then a
+  shape change still crashes.
+
+Reuse re-checks that `pg_prepare_name` is still set, and evicts if it is not.
+Nothing observed puts a handle in that state; it is checked rather than
+assumed because the cost of the invariant failing is a crash, not a wrong
+answer.
+
 ### The 26000 rationale is transaction pooling, not rollback
 
 An earlier theory held that a statement prepared inside a transaction is lost
@@ -145,6 +189,38 @@ trip.** The two runs therefore answer different questions:
 The POD claim takes the shape: *saves ~X us per repeated execution; ~Y%
 end-to-end at loopback, ~Z% at 1 ms RTT.*
 
+**Measured, PostgreSQL 16, 300 statements per run, best of 3, cache hits
+counted in every cell so that a run where nothing was cached cannot be read as
+a result:**
+
+    workload  latency   cache          off        on   speedup  saved/query  hits
+    trivial   loopback  size 10     0.149s    0.146s      2.0%      10.2 us  300/300
+    trivial   2.0ms     size 10     1.591s    1.636s     -2.9%    -152.1 us  300/300
+    trivial   loopback  size 1      0.165s    0.381s   -130.9%    -720.7 us    1/300
+    joins     loopback  size 10     0.626s    0.487s     22.2%     463.4 us  300/300
+    joins     2.0ms     size 10     2.097s    1.978s      5.7%     396.7 us  300/300
+    joins     loopback  size 1      0.579s    0.789s    -36.3%    -700.4 us    1/300
+
+What this says, and it is not what the projection above assumed: **the cache
+buys planning, not round trips.** A statement the planner disposes of instantly
+gains nothing at any latency. A three-table join with an `ORDER BY` saves about
+400 microseconds per execution, and that absolute saving barely moves as
+latency grows -- the percentage falls only because the round trips grow around
+it. That is the signature of amortized planning and is what makes the number
+credible.
+
+The adversarial cell is the one that changes the advice. Two statements in a
+cache of one thrash: every query evicts, re-prepares, and pays a round trip
+that not caching would never have paid. That is 36% slower than off on the
+join workload and 131% slower on the trivial one. **An undersized cache is
+substantially worse than no cache**, so the documentation tells the reader to
+leave it off rather than guess low, and `on_query` reports `cached` so a poor
+hit rate is observable rather than inferred.
+
+`pg_switch_prepared` is no longer a free axis of this matrix: the cache
+requires it at 1 to function at all, so it is set with the cache rather than
+crossed against it.
+
 Latency is injected by `t/lib/Test/Async/DBD/Pg/DelayProxy.pm`, a TCP proxy
 built on `Future::IO` that accepts locally, connects through to PostgreSQL and
 sleeps before relaying each chunk. `tc`/`netem` is not used: unavailable in the
@@ -188,8 +264,15 @@ Each shown failing first.
 5. 26000 recovery: execute twice, **assert `pg_prepare_name` is non-empty**,
    `DEALLOCATE ALL` out of band, reuse. Recovers transparently, exactly one
    re-prepare, correct result.
-6. 0A000 recovery: cache a `SELECT *`, `ALTER TABLE` to change the result type,
-   reuse. Recovers transparently.
+6. 0A000 recovery: cache a `SELECT *` **carrying a placeholder**, assert it has
+   a named prepared statement, `ALTER TABLE` to change the result type, reuse.
+   Recovers transparently and reports the new shape. The placeholder is not
+   incidental -- without one the statement is not cached, and the subtest would
+   pass while exercising nothing.
+6a. A statement without placeholders is never cached, so the same shape change
+   cannot reach a reused handle. Asserted directly on the cache, because the
+   behaviour it buys is the absence of a crash and there is nothing else to
+   observe.
 7. Retry-once bound: a statement that fails 26000 again after re-preparing
    surfaces the error rather than looping.
 8. Eviction inside an aborted transaction neither dies nor poisons the
