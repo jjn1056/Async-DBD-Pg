@@ -551,6 +551,20 @@ async sub _create_connection {
     await $self->_complete_async_connect($dbh);
     $dbh->{RaiseError} = 1;
 
+    # Promote to a named server-side prepared statement on the first execute
+    # rather than the second. This is a handle attribute, not a per-statement
+    # one, and the statement cache does not work without it: DBD::Pg's default
+    # of 2 promotes on a handle's second execute, but a handle the cache has
+    # not kept is gone before then, so every execute would be a first one and
+    # nothing would ever be promoted.
+    #
+    # It is also what makes a cached handle safe to reuse. Only a named
+    # statement has a server-side cached plan, and only a cached plan makes
+    # PostgreSQL raise 0A000 when a schema change alters the result shape.
+    # Without that error the reused handle fetches the new shape through a row
+    # buffer sized for the old one, which segfaults DBD::Pg 3.20.2.
+    $dbh->{pg_switch_prepared} = 1 if $self->{statement_cache_size};
+
     # Set statement timeout if configured
     if (my $timeout = $self->{statement_timeout}) {
         $dbh->do("SET statement_timeout = '${timeout}s'");

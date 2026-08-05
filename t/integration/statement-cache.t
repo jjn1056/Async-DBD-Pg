@@ -25,10 +25,11 @@ sub pool {
     );
 }
 
-# DBD::Pg only promotes a handle to a named server-side prepared statement on
-# its second execute (pg_switch_prepared defaults to 2). Every assertion about
-# the named statement therefore has to get past that threshold first, and say
-# so, or it passes without touching the path it claims to test.
+# The named server-side prepared statement is the thing the cache exists to
+# keep alive, and the thing whose absence makes a reused handle unsafe. The
+# pool sets pg_switch_prepared to 1 whenever caching is on, so it exists from
+# the first execute; asserting on it is what stops these subtests passing
+# while the cache silently holds nothing.
 sub prepare_name {
     my ($conn, $sql) = @_;
     my $sth = $conn->{_stmt_cache}{$sql} or return undef;
@@ -83,20 +84,25 @@ subtest 'the cache is bounded and evicts the oldest' => sub {
     my $pg = pool(statement_cache_size => 2);
     my $conn = $pg->connection->get;
 
-    $conn->query('SELECT 1 AS a')->get;
-    $conn->query('SELECT 2 AS b')->get;
+    # Every statement here carries a placeholder, because only those are
+    # cached at all -- an unparameterized one would leave the cache empty and
+    # this subtest would pass while measuring nothing.
+    my ($a, $b, $c, $d) = map { "SELECT \$1::int AS $_" } qw(a b c d);
+
+    $conn->query($a, 1)->get;
+    $conn->query($b, 1)->get;
     is scalar(keys %{ $conn->{_stmt_cache} }), 2, 'two entries at size two';
 
-    $conn->query('SELECT 3 AS c')->get;
+    $conn->query($c, 1)->get;
     is scalar(keys %{ $conn->{_stmt_cache} }), 2, 'still two after a third';
-    ok !exists $conn->{_stmt_cache}{'SELECT 1 AS a'}, 'the oldest went';
-    ok exists $conn->{_stmt_cache}{'SELECT 3 AS c'}, 'the newest stayed';
+    ok !exists $conn->{_stmt_cache}{$a}, 'the oldest went';
+    ok exists $conn->{_stmt_cache}{$c}, 'the newest stayed';
 
     # Using an entry makes it recent, so the other one is next out.
-    $conn->query('SELECT 2 AS b')->get;
-    $conn->query('SELECT 4 AS d')->get;
-    ok exists $conn->{_stmt_cache}{'SELECT 2 AS b'}, 'a reused entry survives';
-    ok !exists $conn->{_stmt_cache}{'SELECT 3 AS c'}, 'the untouched one goes';
+    $conn->query($b, 1)->get;
+    $conn->query($d, 1)->get;
+    ok exists $conn->{_stmt_cache}{$b}, 'a reused entry survives';
+    ok !exists $conn->{_stmt_cache}{$c}, 'the untouched one goes';
 
     $conn->release;
     $pg->shutdown(timeout => 5)->get;
@@ -150,10 +156,9 @@ subtest 'a missing prepared statement recovers by itself' => sub {
 
     my $sql = 'SELECT $1::int AS n';
 
-    # Twice, because DBD::Pg does not create the named server-side statement
-    # until the second execute. Asserting the name is what stops this test
-    # passing vacuously if that default ever changes -- executing once,
-    # deallocating and reusing succeeds while touching nothing.
+    # Asserting the name below is what stops this test passing vacuously: with
+    # no named statement on the server, deallocating and reusing succeeds
+    # while touching none of the recovery this claims to exercise.
     $conn->query($sql, 1)->get;
     $conn->query($sql, 2)->get;
 
@@ -178,37 +183,73 @@ subtest 'a missing prepared statement recovers by itself' => sub {
 };
 
 subtest 'a changed result type recovers by itself' => sub {
-    # BLOCKED, not passing. Reusing a cached handle after ALTER TABLE changes
-    # the result shape segfaults this library, while the identical sequence
-    # through raw DBI with pg_async survives. So it is ours, not DBD::Pg's,
-    # and it happens with the retry removed as well -- it is the reuse, not
-    # the recovery.
-    #
-    # Left in place, and skipped rather than deleted, because it is the test
-    # that found the defect and it has to go green before the cache can be
-    # enabled by anyone.
-    skip_all 'reusing a cached handle across a result-shape change segfaults';
-
     my $pg = pool();
     my $conn = $pg->connection->get;
 
+    # The setup drop is expected to find nothing, and its NOTICE would reach
+    # the pool's logger and print. Silenced here rather than left to scroll
+    # past, so anything the suite does print is worth reading.
+    $conn->query("SET client_min_messages = warning")->get;
     $conn->query('DROP TABLE IF EXISTS cache_shape')->get;
     $conn->query('CREATE TABLE cache_shape (id int)')->get;
     $conn->query('INSERT INTO cache_shape VALUES (1)')->get;
 
-    my $sql = 'SELECT * FROM cache_shape';
+    # Carries a placeholder, which is what gets it a named server-side
+    # prepared statement, which is what gets the shape change reported as
+    # 0A000 instead of fetched off the end of a stale row buffer.
+    my $sql = 'SELECT * FROM cache_shape WHERE id = $1';
 
-    $conn->query($sql)->get;
-    $conn->query($sql)->get;
+    $conn->query($sql, 1)->get;
+    ok exists $conn->{_stmt_cache}{$sql}, 'the statement is cached';
+    ok defined prepare_name($conn, $sql) && length prepare_name($conn, $sql),
+        'and has a named prepared statement, so the server guards its plan';
 
-    # Changing the shape invalidates the cached plan: 0A000.
+    # Changing the shape invalidates that cached plan: 0A000.
     $conn->query('ALTER TABLE cache_shape ADD COLUMN tag text')->get;
 
     my $after;
-    ok lives { $after = $conn->query($sql)->get }, 'the next use recovers';
+    ok lives { $after = $conn->query($sql, 1)->get }, 'the next use recovers';
     is $after->columns, ['id', 'tag'], 'and reports the new shape';
 
     $conn->query('DROP TABLE cache_shape')->get;
+    $conn->release;
+    $pg->shutdown(timeout => 5)->get;
+};
+
+subtest 'a statement with no placeholders is never cached' => sub {
+    my $pg = pool();
+    my $conn = $pg->connection->get;
+
+    $conn->query("SET client_min_messages = warning")->get;
+    $conn->query('DROP TABLE IF EXISTS cache_bare')->get;
+    $conn->query('CREATE TABLE cache_bare (id int)')->get;
+    $conn->query('INSERT INTO cache_bare VALUES (1)')->get;
+
+    # DBD::Pg only promotes a statement that carries placeholders to a named
+    # server-side prepared statement. Without one there is no cached plan, so
+    # a result-shape change raises nothing -- and re-executing the handle
+    # fetches the new shape through a row buffer sized for the old one, which
+    # segfaults the process. Measured against DBD::Pg 3.20.2 with plain
+    # synchronous DBI and no code of ours involved, so it is not something
+    # this library can catch or recover from. Not caching such a handle is
+    # what makes it unreachable, and costs nothing: with no server-side
+    # statement to keep alive, caching bought only DBI's local re-parse.
+    my $sql = 'SELECT * FROM cache_bare';
+
+    $conn->query($sql)->get;
+    ok !exists $conn->{_stmt_cache}{$sql},
+        'it is left out of the cache, so it can never be re-executed';
+
+    $conn->query($sql)->get;
+
+    $conn->query('ALTER TABLE cache_bare ADD COLUMN tag text')->get;
+
+    my $after;
+    ok lives { $after = $conn->query($sql)->get },
+        'so the query survives a result-shape change';
+    is $after->columns, ['id', 'tag'], 'and reports the new shape';
+
+    $conn->query('DROP TABLE cache_bare')->get;
     $conn->release;
     $pg->shutdown(timeout => 5)->get;
 };

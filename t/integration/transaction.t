@@ -168,9 +168,10 @@ subtest 'retry gives up, and refuses errors that will not improve' => sub {
 
     # A plain string exception carries no SQLSTATE and is not retryable.
     my $plain = 0;
-    dies {
+    my $plain_err = dies {
         $conn->transaction({ retry => 5 }, async sub { $plain++; die "boom\n" })->get
     };
+    like $plain_err, qr/boom/, 'an ordinary die reaches the caller';
     is $plain, 1, 'an ordinary die is attempted once';
 
     $conn->_close_dbh;
@@ -180,7 +181,7 @@ subtest 'retry is off unless asked for' => sub {
     my $conn = make_connection();
 
     my $tries = 0;
-    dies {
+    my $err = dies {
         $conn->transaction(async sub {
             $tries++;
             die Async::DBD::Pg::Error::Query->new(
@@ -189,6 +190,8 @@ subtest 'retry is off unless asked for' => sub {
         })->get
     };
 
+    like "$err", qr/serialization failure/,
+        'the retryable error reaches the caller instead';
     is $tries, 1, 'a retryable error is not retried by default';
 
     $conn->_close_dbh;

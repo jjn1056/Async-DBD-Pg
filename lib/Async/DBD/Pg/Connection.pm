@@ -408,14 +408,31 @@ sub _statement_for {
     return ($self->_prepare_statement($sql), 0) unless $size;
 
     if (my $sth = $self->{_stmt_cache}{$sql}) {
-        # Most recently used goes to the end.
-        @{ $self->{_stmt_lru} } = grep { $_ ne $sql } @{ $self->{_stmt_lru} };
-        push @{ $self->{_stmt_lru} }, $sql;
+        # A cached handle that has lost its server-side statement has lost the
+        # cached plan whose 0A000 is the only thing standing between a
+        # result-shape change and a segfault. Nothing observed today puts a
+        # handle in that state, which is exactly why it is checked here rather
+        # than assumed: the invariant this cache rests on is cheap to confirm
+        # and fatal to get wrong.
+        if (length($sth->{pg_prepare_name} // '')) {
+            # Most recently used goes to the end.
+            @{ $self->{_stmt_lru} } = grep { $_ ne $sql } @{ $self->{_stmt_lru} };
+            push @{ $self->{_stmt_lru} }, $sql;
 
-        return ($sth, 1);
+            return ($sth, 1);
+        }
+
+        $self->_evict_statement($sql);
     }
 
     my $sth = $self->_prepare_statement($sql);
+
+    # Only a statement carrying placeholders is ever promoted to a named
+    # server-side prepared statement, and only a named statement is safe to
+    # reuse -- see the note on pg_switch_prepared where the handle is
+    # created. Caching the rest would buy DBI's local re-parse and nothing on
+    # the server, at the price of the one crash this cache can cause.
+    return ($sth, 0) unless $sth->{NUM_OF_PARAMS};
 
     $self->{_stmt_cache}{$sql} = $sth;
     push @{ $self->{_stmt_lru} }, $sql;
