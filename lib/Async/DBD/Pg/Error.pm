@@ -15,6 +15,10 @@ sub new {
 
 sub message { shift->{message} }
 
+# Answerable on every error so a caller never has to guard the call. Only a
+# query error can be retryable, and only for the two states below.
+sub is_retryable { 0 }
+
 sub throw {
     my $self = shift;
     die ref $self ? $self : $self->new(@_);
@@ -69,6 +73,21 @@ sub state { $_[0]->{code} }
 sub state_name {
     my ($self) = @_;
     return $STATE_MAP{ $self->{code} // '' } // 'unknown';
+}
+
+# Exactly the two states whose documented remedy is to run the transaction
+# again: a serialization failure under SERIALIZABLE or REPEATABLE READ, and a
+# deadlock the server broke by choosing a victim. Both mean this transaction
+# lost a race it could win next time.
+#
+# Nothing else belongs here. A unique violation will violate uniqueness again,
+# a syntax error will not parse next time either, and a lost connection is not
+# something a retry on that connection can fix.
+my %RETRYABLE = map { $_ => 1 } qw(40001 40P01);
+
+sub is_retryable {
+    my ($self) = @_;
+    return $RETRYABLE{ $self->{code} // '' } ? 1 : 0;
 }
 
 
@@ -182,6 +201,26 @@ from one. Reported for syntax errors.
 =head3 context
 
 The server's call stack context, for errors raised inside PL/pgSQL.
+
+=head2 is_retryable
+
+    if ($err->is_retryable) { ... }
+
+True for the two SQLSTATEs whose documented remedy is to run the transaction
+again: C<40001>, a serialization failure under C<SERIALIZABLE> or
+C<REPEATABLE READ>, and C<40P01>, a deadlock the server broke by picking a
+victim. Both mean this transaction lost a race that it might win next time.
+
+False for everything else, deliberately. A unique violation will violate
+uniqueness again, a syntax error will not parse next time either, and a lost
+connection is not something retrying on that connection can fix.
+
+Answerable on every error this distribution raises, not only on a query
+error, so it never needs guarding with C<can>.
+
+Retrying correctly means re-running the whole transaction rather than the
+statement that failed, which
+L<Async::DBD::Pg::Connection/"Retrying a transaction"> does.
 
 =head2 Async::DBD::Pg::Error::Connection
 

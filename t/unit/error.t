@@ -52,6 +52,37 @@ subtest 'state is the SQLSTATE, matching DBI' => sub {
     is $odd->state_name, 'unknown', 'and only the name is unknown';
 };
 
+subtest 'is_retryable names the two states PostgreSQL says to retry' => sub {
+    # PostgreSQL documents exactly these as "retry the transaction". Anything
+    # broader would retry a query that will fail again forever, or one whose
+    # first attempt already had an effect.
+    my $query_error = sub {
+        return Async::DBD::Pg::Error::Query->new(message => 'x', code => $_[0]);
+    };
+
+    for my $code (qw(40001 40P01)) {
+        ok $query_error->($code)->is_retryable, "$code is retryable";
+    }
+
+    # A unique violation, a syntax error and a cancelled query are all
+    # permanent for the same transaction; retrying is just a slower failure.
+    for my $code (qw(23505 42601 57014 08006 99999)) {
+        ok !$query_error->($code)->is_retryable, "$code is not retryable";
+    }
+
+    my $stateless = Async::DBD::Pg::Error::Query->new(message => 'x');
+    ok !$stateless->is_retryable, 'an error with no SQLSTATE is not retryable';
+
+    # Answerable on any of our errors, so callers need no can() dance.
+    my $conn_err = Async::DBD::Pg::Error::Connection->new(message => 'x');
+    my $timeout  = Async::DBD::Pg::Error::Timeout->new(message => 'x');
+    my $pool_err = Async::DBD::Pg::Error::PoolExhausted->new(message => 'x');
+
+    ok !$conn_err->is_retryable, 'a connection error is not retryable';
+    ok !$timeout->is_retryable, 'nor is a timeout';
+    ok !$pool_err->is_retryable, 'nor pool exhaustion';
+};
+
 subtest 'connection error' => sub {
     my $err = Async::DBD::Pg::Error::Connection->new(
         message => 'Connection refused',

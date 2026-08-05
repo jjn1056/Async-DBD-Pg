@@ -558,6 +558,89 @@ sub cancel {
 }
 
 # Execute code within a transaction
+# Advisory locks, transaction-scoped. PostgreSQL releases these when the
+# transaction ends, whether it commits or rolls back, so nothing here has to
+# be undone by hand and a cancelled caller cannot leak one.
+#
+# The session-scoped form (pg_advisory_lock) is deliberately not offered: it
+# outlives the transaction, so a connection carrying one would go back to the
+# pool still holding it, and the next caller to check that connection out
+# would silently own someone else's mutex.
+async sub advisory_lock {
+    my ($self, @key) = @_;
+
+    await $self->_advisory('pg_advisory_xact_lock', 'advisory_lock', @key);
+
+    return 1;
+}
+
+# Takes the lock if it is free, and says so either way rather than waiting.
+async sub try_advisory_lock {
+    my ($self, @key) = @_;
+
+    my $got = await $self->_advisory(
+        'pg_try_advisory_xact_lock', 'try_advisory_lock', @key,
+    );
+
+    return $got ? 1 : 0;
+}
+
+async sub _advisory {
+    my ($self, $function, $method, @key) = @_;
+
+    # Outside an explicit transaction the lock is released the instant the
+    # implicit single-statement one ends, so it would guard nothing. A mutex
+    # that silently does not lock is worse than no mutex.
+    croak "$method needs a transaction to hold the lock; "
+        . 'call it inside transaction(), which is what releases it'
+        unless $self->{in_transaction};
+
+    croak "$method takes one 64-bit key or two 32-bit keys"
+        unless @key == 1 || @key == 2;
+
+    my $placeholders = join ', ', map { "\$$_" } 1 .. @key;
+
+    my $result = await $self->query(
+        "SELECT $function($placeholders) AS locked", @key,
+    );
+
+    return $result->first_value;
+}
+
+# Run the whole transaction again when the server says it lost a race it
+# could win next time. Only 40001 and 40P01 qualify, which is the entire
+# point: retrying anything else is a slower failure, and retrying a single
+# statement rather than the transaction is the mistake this replaces.
+#
+# Each attempt is an ordinary transaction, so a failed one has already been
+# rolled back before the next BEGIN -- without that, a retry would re-apply
+# whatever the first attempt wrote.
+async sub _transaction_with_retry {
+    my ($self, $retries, $opts, $code, @args) = @_;
+
+    my %inner = %$opts;
+    delete $inner{retry};
+
+    my $backoff = $opts->{retry_delay} // 0.05;
+    my $attempt = 0;
+
+    while (1) {
+        $attempt++;
+
+        my $result = eval { await $self->transaction(\%inner, $code, @args) };
+        my $err = $@;
+
+        return $result unless $err;
+
+        die $err if $attempt > $retries;
+        die $err unless ref $err && eval { $err->is_retryable };
+
+        # Exponential, so a deadlock between two workers does not have them
+        # collide again on the same schedule.
+        await Future::IO->sleep($backoff * (2 ** ($attempt - 1)));
+    }
+}
+
 async sub transaction {
     my ($self, @rest) = @_;
 
@@ -569,6 +652,18 @@ async sub transaction {
 
     my $isolation = $opts{isolation};
     my $savepoint_depth = $self->{_savepoint_depth} // 0;
+
+    if (my $retry = $opts{retry}) {
+        # Retrying an inner block would re-run a savepoint rather than the
+        # transaction, which is the wrong-scope bug this option exists to
+        # stop people writing by hand. Refuse rather than quietly do the
+        # weaker thing.
+        croak 'retry applies to the outermost transaction only; '
+            . 'this one is nested inside another'
+            if $savepoint_depth > 0;
+
+        return await $self->_transaction_with_retry($retry, \%opts, $code, @args);
+    }
 
     if ($savepoint_depth > 0) {
         my $savepoint = "sp_$savepoint_depth";
@@ -1031,6 +1126,81 @@ C<repeatable_read> becomes C<REPEATABLE READ>. Ignored for nested blocks,
 which join the transaction already running.
 
 =back
+
+=head3 Retrying a transaction
+
+    await $conn->transaction({ retry => 3 }, async sub { ... });
+
+Runs the whole block again when it fails with a SQLSTATE whose documented
+remedy is to retry: C<40001> (serialization failure) and C<40P01> (deadlock
+detected). Nothing else is ever retried, and nothing is retried unless this
+option is given.
+
+Each attempt is a complete transaction, so a failed one is rolled back before
+the next C<BEGIN> and no work from it survives. The delay between attempts
+doubles, starting at 0.05 seconds; C<retry_delay> sets the first one.
+
+The value is the number of B<retries>, so C<< retry => 3 >> means up to four
+attempts. When they are exhausted the last failure propagates unchanged.
+
+Two things to know before using it:
+
+=over 4
+
+=item *
+
+B<The block runs more than once, so anything it does outside the database
+happens more than once.> Sending mail, charging a card, or writing a file
+from inside a retried transaction will do it again on every attempt. Keep
+such work outside the block, or after it.
+
+=item *
+
+B<It applies to the outermost transaction only.> A nested C<transaction> is
+a savepoint, and retrying one would re-run the savepoint rather than the
+transaction -- the wrong-scope mistake this option exists to prevent.
+Asking for C<retry> on a nested call is an error.
+
+=back
+
+Whether an error qualifies is L<Async::DBD::Pg::Error/is_retryable>, which
+can be asked directly if you would rather handle it yourself.
+
+=head2 advisory_lock
+
+    await $pg->transaction(async sub {
+        my ($conn) = @_;
+        await $conn->advisory_lock($id);
+        ...
+    });
+
+    await $conn->advisory_lock($classifier, $id);   # two 32-bit keys
+
+Takes a PostgreSQL advisory lock on an arbitrary number, waiting until it is
+free. Locks taken this way are held by the B<transaction> and released when
+it ends, whether it commits or rolls back.
+
+Calling it outside a transaction is an error. PostgreSQL would release a
+transaction-scoped lock at the end of the implicit single-statement
+transaction, which is to say immediately, and a mutex that silently fails to
+lock is worse than no mutex.
+
+The key is one 64-bit integer, or two 32-bit ones -- a classifier plus an id
+is the usual reason for the second form. The two key spaces are separate and
+do not collide.
+
+The session-scoped C<pg_advisory_lock> is deliberately not offered. It
+outlives its transaction, so a pooled connection would be returned still
+holding it and the next caller to check that connection out would silently
+own someone else's lock.
+
+=head2 try_advisory_lock
+
+    if (await $conn->try_advisory_lock($id)) { ... }
+
+As L</advisory_lock>, but returns false immediately rather than waiting when
+another session holds the lock. This is what to use for "run this if nobody
+else is running it", where waiting would be pointless.
 
 =head2 cursor
 

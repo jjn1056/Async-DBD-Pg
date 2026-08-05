@@ -68,6 +68,9 @@ over. A transaction holds its connection across every await inside the body.
     await $conn->query_row($sql, @bind)
     await $conn->query_value($sql, @bind)
     await $conn->transaction($code, @args)   # nests via savepoints
+    await $conn->transaction({ retry => 3 }, $code)  # retries 40001/40P01 only
+    await $conn->advisory_lock($key)         # xact-scoped; inside a transaction
+    await $conn->try_advisory_lock($key)     # false rather than waiting
     await $conn->cursor($sql, @bind, { batch_size => 100 })
     $conn->cancel  $conn->release  $conn->dbh
     $conn->in_transaction  $conn->is_released  $conn->query_count
@@ -168,7 +171,9 @@ broadcast namespace, not a work queue.
 
 Failures are objects that stringify, thrown as exceptions:
 
-    Async::DBD::Pg::Error::Query          # has ->sqlstate, ->sql
+    Async::DBD::Pg::Error::Query          # ->state, ->state_name, ->constraint,
+                                          # ->detail, ->hint, ->table, ->column,
+                                          # ->is_retryable
     Async::DBD::Pg::Error::Connection
     Async::DBD::Pg::Error::PoolExhausted
     Async::DBD::Pg::Error::Timeout
