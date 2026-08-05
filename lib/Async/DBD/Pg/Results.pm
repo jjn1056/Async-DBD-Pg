@@ -574,9 +574,13 @@ collapse. See L</"Repeated column names">.
 
 =head2 Repeated column names
 
-C<SELECT * FROM a JOIN b USING (id)> can return two columns called C<id>. A
-Perl hash holds one value per key, so a hashref row can only carry one of
-them, and which one it keeps depends on column order.
+C<SELECT * FROM a JOIN b ON a.id = b.id> returns two columns called C<id>
+and, if both tables have one, two called C<name>. A Perl hash holds one value
+per key, so a hashref row can only carry one of each, and which one it keeps
+depends on column order.
+
+(C<JOIN ... USING (id)> merges the join column, so that form yields one
+C<id> -- but any other name the two tables share still comes back twice.)
 
 Rather than lose a value silently, every method that builds a hashref croaks:
 

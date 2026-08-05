@@ -7,7 +7,10 @@ implemented on top of DBD::Pg.
 
 ```perl
 use Future::AsyncAwait;
+use Future::IO;
 use Async::DBD::Pg;
+
+BEGIN { Future::IO->load_best_impl }
 
 my $pg = Async::DBD::Pg->new(
     dsn             => 'postgresql://user:pass@host/db',
@@ -16,11 +19,30 @@ my $pg = Async::DBD::Pg->new(
 );
 
 (async sub {
-    my $conn = await $pg->connection;
-    my $result = await $conn->query('SELECT * FROM users WHERE id = :id', { id => 1 });
-    print $result->first->{name}, "\n";
-    $conn->release;
+    # One row, one value, or a row as a list -- the pool checks a connection
+    # out and gives it back for each.
+    my $user  = await $pg->query_row('SELECT * FROM users WHERE id = $1', 1);
+    my $total = await $pg->query_value('SELECT count(*) FROM users');
+    my ($id, $name) = await $pg->query_list('SELECT id, name FROM users LIMIT 1');
+
+    print "$user->{name} of $total\n";
+
+    # Or the whole result
+    my $rs = await $pg->query('SELECT id, name FROM users WHERE active');
+    print $_->{name}, "\n" for @{ $rs->rows };
 })->()->get;
+```
+
+Several statements that must share a connection go through `with_connection`
+or `transaction`, which hold the checkout across every `await` and give it
+back however the block ends:
+
+```perl
+await $pg->transaction(async sub {
+    my ($conn) = @_;
+    await $conn->query('INSERT INTO orders (user_id) VALUES ($1)', $id);
+    await $conn->query('UPDATE users SET orders = orders + 1 WHERE id = $1', $id);
+});
 ```
 
 ## Features
@@ -31,9 +53,38 @@ my $pg = Async::DBD::Pg->new(
 - **Async queries** - Non-blocking query execution using DBD::Pg's async support
 - **Async connect** - Non-blocking connect using `pg_async_connect` and Future::IO's official `poll` API
 - **Pub/sub** - `LISTEN`, `UNLISTEN`, and `NOTIFY` over a dedicated listener connection
-- **Named placeholders** - `:name` style in addition to `$1` positional
+- **Named placeholders** - `:name` style in addition to `$1` positional, leaving `?` free for PostgreSQL's own operators
 - **Transactions** - With savepoint support for nesting
-- **Cursors** - Streaming large result sets
+- **Cursors** - Streaming large result sets, one row at a time
+- **Results that don't lose data** - a repeated column name is an error, not a silent collapse
+
+## Results
+
+Rows are stored positionally and hashes are derived on demand, which is what
+lets a result carry a column name twice:
+
+```perl
+my $rs = await $pg->query('SELECT * FROM a JOIN b ON a.id = b.id');
+$rs->columns;  # ['id', 'name', 'id', 'name']
+
+$rs->rows;     # croaks: Column 'id' appears 2 times at positions 0, 2
+$rs->arrays;   # works: every value, positionally
+$rs->as(['a_id', 'a_name', 'b_id', 'b_name'])->rows;   # works: renamed
+```
+
+A hash cannot hold both values, so asking for one is refused rather than
+answered wrongly. Everything positional keeps working on that same result,
+and so does `multi`, which is lossless.
+
+The rest of the surface:
+
+```perl
+$rs->columns  $rs->types  $rs->count  $rs->elapsed
+$rs->first  $rs->single  $rs->first_value  $rs->first_list
+$rs->get_column('name')->all
+$rs->by('id')  $rs->groups('dept')  $rs->expand
+say $rs->preview;   # column names, types, row count, first few rows
+```
 
 ## Requirements
 

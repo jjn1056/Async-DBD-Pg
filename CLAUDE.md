@@ -69,9 +69,13 @@ DATABASE_URL="postgresql://postgres:test@localhost:5432/test" perl -Ilib example
 
 - **Async::DBD::Pg::PubSub** (`lib/Async/DBD/Pg/PubSub.pm`) - Dedicated LISTEN/NOTIFY connection with per-channel callback management and a background listener loop.
 
-- **Async::DBD::Pg::Cursor** (`lib/Async/DBD/Pg/Cursor.pm`) - Streaming result sets via PostgreSQL cursors with batch fetching. Provides `next()`, `each()`, `all()` iterators.
+- **Async::DBD::Pg::Cursor** (`lib/Async/DBD/Pg/Cursor.pm`) - Streaming result sets via PostgreSQL cursors. `next()` yields one row, buffering `batch_size` rows per round trip; `each()` and `all()` walk the rest. No `reset()`: a server-side cursor is consumed.
 
-- **Async::DBD::Pg::Results** (`lib/Async/DBD/Pg/Results.pm`) - Eagerly-fetched query result wrapper with column names and convenience accessors (`first()`, `scalar()`, `is_empty()`).
+- **Async::DBD::Pg::Results** (`lib/Async/DBD/Pg/Results.pm`) - Query result wrapper. Rows are stored **positionally** with the column names and `pg_type` kept alongside; hashes are derived on demand. Every method that builds a hashref (`rows`, `first`, `single`, `next`, `all`, `by`, `groups`) croaks when column names repeat, rather than collapsing them. Positional access (`arrays`, `row_array`, `first_value`, `first_list`, `preview`, `get_column` by index) works regardless, as does `multi`, which is lossless. Views — `as`, `expand`, `multi` — share the rows and carry their own iterator position.
+
+- **Async::DBD::Pg::Collection** (`lib/Async/DBD/Pg/Collection.pm`) - A blessed arrayref returned wherever a list of rows or values is handed back, so every arrayref idiom keeps working. Deliberately no `map`/`grep`/`sort`/`reduce`.
+
+- **Async::DBD::Pg::Column** (`lib/Async/DBD/Pg/Column.pm`) - One column's values, from `Results::get_column`. The only way to reach a column whose name is repeated.
 
 - **Async::DBD::Pg::Error** (`lib/Async/DBD/Pg/Error.pm`) - Error class hierarchy with stringification overload. Subclasses: `Error::Query` (with SQLSTATE), `Error::Connection`, `Error::PoolExhausted`, `Error::Timeout`.
 
@@ -83,7 +87,11 @@ DATABASE_URL="postgresql://postgres:test@localhost:5432/test" perl -Ilib example
 - **Future::IO abstraction**: Works with any event loop (UV, IO::Async, etc.) - the test suite uses `Future::IO::Impl::UV`.
 - **Socket fd duplication**: Uses `POSIX::dup()` to wrap the Pg socket in an `IO::Socket` without ownership conflicts.
 - **Async connect**: `pg_async_connect` arrived in DBD::Pg 3.19.0 and the required version is 3.20.0, so connect is always asynchronous. There is no runtime capability check and no synchronous fallback.
-- **Named placeholders**: `:name` syntax is converted to PostgreSQL `$N` positional params, handling string literals and `::` type casts to avoid false matches.
+- **Named placeholders**: `:name` syntax is converted to PostgreSQL `$N` positional params. The converter passes over the regions where a colon is text: quoted strings, `E'...'` escapes, dollar-quoted bodies, and comments (which nest). Removing this was weighed and rejected — see the rejected section of the result-access spec.
+
+- **Two placeholder scanners**: the converter's output is re-parsed by DBD::Pg at `prepare`. `pg_placeholder_dollaronly => 1` confines that second scan to `$1`, which is why jsonb's `?`, `?|` and `?&` operators and the `arr[:2]` slice work here. A unit test of the converter cannot see this layer; only an integration test can.
+
+- **Lossless or loud**: no view may silently drop, collapse, or invent data. Refusals are `croak`s. The `single`/`single_value`/`single_list` warnings are the one exception — they report a row-count expectation mismatch, not data loss.
 
 ### Test Structure
 

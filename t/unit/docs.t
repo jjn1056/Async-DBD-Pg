@@ -28,6 +28,7 @@ my %CLASS_OF = (
     c          => 'Async::DBD::Pg::Connection',
     result     => 'Async::DBD::Pg::Results',
     r          => 'Async::DBD::Pg::Results',
+    rs         => 'Async::DBD::Pg::Results',
     results    => 'Async::DBD::Pg::Results',
     view       => 'Async::DBD::Pg::Results',
     v          => 'Async::DBD::Pg::Results',
@@ -128,6 +129,22 @@ subtest 'the machine reference lists only methods that exist' => sub {
         my $class = $CLASS_OF{$var};
 
         ok $class->can($method), "llms.txt: $class->$method";
+    }
+};
+
+subtest 'the README lists only methods that exist' => sub {
+    open my $fh, '<', 'README.md' or die "cannot read README.md: $!";
+    my @lines = <$fh>;
+    close $fh;
+
+    my $calls = calls_in(\@lines);
+    ok scalar @$calls > 10, sprintf('the README shows real API usage (%d calls)', scalar @$calls);
+
+    for my $call (@$calls) {
+        my ($var, $method) = @$call;
+        my $class = $CLASS_OF{$var};
+
+        ok $class->can($method), "README.md: $class->$method";
     }
 };
 
