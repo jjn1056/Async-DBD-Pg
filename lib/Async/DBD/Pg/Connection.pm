@@ -94,7 +94,7 @@ async sub query {
         die $error;
     }
 
-    $result->{_elapsed} = $elapsed;
+    $result->_record_elapsed($elapsed);
     $self->_report_query($sql, $bind, $elapsed, $result->count, undef);
 
     return $result;

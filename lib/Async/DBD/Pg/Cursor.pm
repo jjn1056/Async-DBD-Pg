@@ -196,14 +196,13 @@ Async::DBD::Pg::Cursor - Streaming cursor for large result sets
         { batch_size => 100 }
     );
 
-    # Iterate over batches
-    while (my $batch = await $cursor->next) {
-        for my $row (@$batch) {
-            process($row);
-        }
+    # One row at a time. batch_size above is how many rows come back per
+    # round trip, which this loop never has to think about.
+    while (my $row = await $cursor->next) {
+        process($row);
     }
 
-    # Or use each() for row-by-row processing
+    # Or hand each row to a callback
     await $cursor->each(sub {
         my ($row) = @_;
         process($row);

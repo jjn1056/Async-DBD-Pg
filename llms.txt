@@ -175,11 +175,11 @@ Failures are objects that stringify, thrown as exceptions:
 
 ## Gotchas
 
-- `?` is never a placeholder; use `$1`. A `?` reaches PostgreSQL as a syntax
-  error.
-- `bytea` and other binary values need `{ type => PG_BYTEA, value => ... }`,
-  or a NUL byte truncates them and the statement still reports success.
-- `rows`/`first`/`single`/`next`/`all` croak when column names repeat.
 - `Results` is stateful: `next` advances a shared position; call `reset`.
 - `count` is rows in hand; `rows_affected` is what an INSERT/UPDATE changed.
-- `Cursor::next` returns a row, not a batch.
+- `arrays` and `row_array` hand back the result's own arrayrefs, not copies;
+  writing through one changes what `rows` and every view report.
+- `get_column` reads an all-digit argument as an index, so a column aliased
+  `AS "2"` is unreachable by name there.
+- `Column::next` yields values, so NULL, `''` or `0` ends a `while` loop
+  early; test with `defined`.

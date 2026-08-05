@@ -106,6 +106,33 @@ subtest 'duplicate column names make every hash view croak' => sub {
         'the message names the ways out';
 };
 
+subtest 'the duplicate croak does not depend on how many rows came back' => sub {
+    # A query whose columns collide is wrong however many rows it matched
+    # today, and the zero-row day is exactly when that ships unnoticed. So
+    # the refusal is about the shape of the result, not its contents.
+    my $empty = results(
+        columns => ['id', 'id'],
+        types   => ['int4', 'int4'],
+        rows    => [],
+    );
+
+    my $expected = qr/Column 'id' appears 2 times at positions 0, 1/;
+
+    like dies { $empty->rows },   $expected, 'rows croaks on an empty result';
+    like dies { $empty->first },  $expected, 'and so does first';
+    like dies { $empty->single }, $expected, 'and single';
+    like dies { $empty->next },   $expected, 'and next';
+    like dies { $empty->all },    $expected, 'and all';
+    like dies { $empty->by('id') }, $expected, 'and by';
+
+    # The positional views still work on it, as they do when it has rows.
+    is $empty->columns, ['id', 'id'], 'columns';
+    is $empty->arrays->size, 0, 'arrays';
+    is $empty->first_value, undef, 'first_value';
+    is [ $empty->first_list ], [], 'first_list';
+    ok $empty->is_empty, 'is_empty';
+};
+
 subtest 'first takes what is there, single expects exactly one' => sub {
     my $r = people();
 

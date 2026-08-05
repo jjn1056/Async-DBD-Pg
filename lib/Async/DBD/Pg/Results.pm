@@ -11,7 +11,7 @@ use Async::DBD::Pg::Column;
 # cannot hold a repeated column name, so storing hashes loses data on any
 # self-join; storing arrays loses nothing and measures faster besides.
 sub new {
-    my ($class, $sth, $elapsed) = @_;
+    my ($class, $sth) = @_;
 
     # Order matters, and not for style. On an async statement handle, reading
     # NAME or pg_type before the fetch leaves the handle with "no statement
@@ -28,7 +28,19 @@ sub new {
     my $rows_affected = $sth->rows;
     $sth->finish;
 
-    return $class->_build($rows, $names, $types, $rows_affected, $elapsed);
+    # Not a constructor argument: the duration covers the timeout race around
+    # the execute, which happens a layer above whoever builds this. The
+    # connection stamps it with _record_elapsed once it knows.
+    return $class->_build($rows, $names, $types, $rows_affected, undef);
+}
+
+# Called by Async::DBD::Pg::Connection once the query it timed has finished.
+sub _record_elapsed {
+    my ($self, $seconds) = @_;
+
+    $self->{_elapsed} = $seconds;
+
+    return $self;
 }
 
 # Build a result from data already in hand, without a statement handle.
@@ -164,8 +176,12 @@ sub row_array {
 sub first {
     my ($self) = @_;
 
-    my $row = $self->{_rows}[0] or return undef;
+    # Before looking at the rows, not after: a query whose column names
+    # collide is wrong however many rows it happened to match, and the
+    # zero-row day is exactly when that would ship unnoticed.
     $self->_assert_addressable_by_name;
+
+    my $row = $self->{_rows}[0] or return undef;
 
     return $self->_hash_row($row);
 }
@@ -232,8 +248,9 @@ sub _warn_if_several {
 sub next {
     my ($self) = @_;
 
-    my $row = $self->{_rows}[ $self->{_position} ] or return undef;
     $self->_assert_addressable_by_name;
+
+    my $row = $self->{_rows}[ $self->{_position} ] or return undef;
     $self->{_position}++;
 
     return $self->_hash_row($row);
@@ -619,6 +636,16 @@ Rows as arrayrefs, in column order, in a collection. This is the lossless
 view: it works whatever the column names are, and it is what to use when the
 query's columns are not known ahead of time.
 
+The arrayrefs are the result's own, not copies, which is what makes this the
+cheap view. Writing through one changes the result itself, and so changes
+what L</rows>, L</row_array> and every view built with L</as> report:
+
+    $result->arrays->[0][1] = 'x';   # $result->rows->[0]{name} is now 'x'
+
+Copy first if you mean to modify -- C<< [ @$row ] >> per row, or
+L<Async::DBD::Pg::Collection/to_array> for the outer list. The same applies
+to L</row_array>.
+
 =head2 columns
 
     my $names = $result->columns;
@@ -743,6 +770,9 @@ still returned.
 One row as an arrayref, by index, or C<undef> past the end. Positional, so it
 works whatever the column names are.
 
+As with L</arrays>, this is the result's own arrayref rather than a copy;
+writing through it changes the result.
+
 =head2 next
 
     while (my $row = $result->next) { ... }
@@ -788,6 +818,11 @@ later:
     Column index 7 out of range; result has 4 columns
 
 A repeated name is resolved by asking for the position instead.
+
+An argument made only of digits is read as an index, so a column deliberately
+aliased to a number -- C<SELECT x AS "2"> -- cannot be reached by its name
+here. Find its position in L</columns> and ask for that, or read it from
+L</rows>, where the key is an ordinary string.
 
 =head2 multi
 
