@@ -20,8 +20,7 @@ print "=" x 60, "\n\n";
 print "Capabilities:\n";
 print "  DBD::Pg version: $DBD::Pg::VERSION\n";
 print "  Future::IO impl: $Future::IO::IMPL\n";
-my $test_pg = Async::DBD::Pg->new(dsn => $dsn, min_connections => 0);
-print "  Async connect: ", ($test_pg->_supports_async_connect ? "YES" : "NO"), "\n";
+print "  Async connect: always (requires DBD::Pg 3.20.0)\n";
 print "  Future::IO poll: ", (Future::IO->can('poll') ? "YES" : "NO"), "\n\n";
 
 # Create a ticker that ticks every 50ms

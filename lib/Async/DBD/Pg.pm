@@ -20,33 +20,6 @@ use Scalar::Util qw(refaddr weaken);
 # $VERSION is stamped into each package at build time by Dist::Zilla, so it
 # is absent when running straight from a git checkout.
 
-sub _version_gte {
-    my ($got, $want) = @_;
-
-    my @got = split /\./, ($got // 0);
-    my @want = split /\./, ($want // 0);
-    my $len = @got > @want ? scalar @got : scalar @want;
-
-    for my $i (0 .. $len - 1) {
-        my $g = $got[$i] // 0;
-        my $w = $want[$i] // 0;
-        return 1 if $g > $w;
-        return 0 if $g < $w;
-    }
-
-    return 1;
-}
-
-# Check if we can do async connect
-sub _supports_async_connect {
-    my ($self) = @_;
-    return $self->{_async_connect_supported} //= do {
-        # Need DBD::Pg >= 3.19.0 for pg_async_connect
-        my $v = $DBD::Pg::VERSION // 0;
-        _version_gte($v, '3.19.0') ? 1 : 0;
-    };
-}
-
 sub new {
     my ($class, %args) = @_;
 
@@ -486,16 +459,19 @@ async sub connection {
     return $conn;
 }
 
-# Create a new connection (async if supported, blocking otherwise)
+# Create a new connection. pg_async_connect needs DBD::Pg 3.19.0 and this
+# distribution requires 3.20.0, so the handshake is always asynchronous.
 async sub _create_connection {
     my ($self) = @_;
 
     my $parsed = $self->{_parsed_dsn};
-    my $use_async = $self->_supports_async_connect;
 
     my %attrs = (
         AutoCommit        => 1,
-        RaiseError        => $use_async ? 0 : 1,
+        # Off for the connect itself: an async connect returns a handle whose
+        # handshake is still in flight, and errors are collected by
+        # _complete_async_connect instead. Restored below once it finishes.
+        RaiseError        => 0,
         PrintError        => 0,
         # A PostgreSQL NOTICE is delivered to DBI as a warning, and Connection
         # routes it through the pool's on_log by wrapping the calls that can
@@ -509,8 +485,7 @@ async sub _create_connection {
         pg_server_prepare => 1,
     );
 
-    # Use async connect if available
-    $attrs{pg_async_connect} = 1 if $use_async;
+    $attrs{pg_async_connect} = 1;
 
     my $dbh = eval {
         DBI->connect(
@@ -530,11 +505,8 @@ async sub _create_connection {
         );
     }
 
-    # Complete async handshake if using async connect
-    if ($use_async) {
-        await $self->_complete_async_connect($dbh);
-        $dbh->{RaiseError} = 1;
-    }
+    await $self->_complete_async_connect($dbh);
+    $dbh->{RaiseError} = 1;
 
     # Set statement timeout if configured
     if (my $timeout = $self->{statement_timeout}) {
@@ -1070,11 +1042,7 @@ query support combined with L<Future::IO>'s socket readiness detection.
 Connection establishment is asynchronous as well, using C<pg_async_connect>,
 C<pg_continue_connect>, and L<Future::IO>'s official C<poll> API. Those
 entry points arrived in DBD::Pg 3.19.0, which is part of why this
-distribution requires 3.20.0.
-
-A synchronous C<DBI-E<gt>connect> fallback remains in place for a DBD::Pg
-older than 3.19.0, but no such version satisfies this distribution's
-prerequisites.
+distribution requires 3.20.0. There is no synchronous connect path.
 
 =head2 Advanced DBI Access
 
