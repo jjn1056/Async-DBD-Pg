@@ -182,6 +182,15 @@ async sub query_value {
     return await $conn->query_value(@args);
 }
 
+async sub query_list {
+    my ($self, @args) = @_;
+
+    my $conn  = await $self->connection;
+    my $guard = Async::DBD::Pg::_ReleaseGuard->new($conn);
+
+    return await $conn->query_list(@args);
+}
+
 async sub transaction {
     my ($self, @rest) = @_;
 
@@ -1358,6 +1367,16 @@ As L</query>, but returns the first column of the first row, or C<undef> when
 nothing matched. Warns when more than one row matched.
 
 See L<Async::DBD::Pg::Connection/query_value>.
+
+=head2 query_list
+
+    my ($id, $name) = await $pg->query_list($sql, @bind);
+
+As L</query>, but returns the first row as a list of values in column order,
+or an empty list when nothing matched. Warns when more than one row matched.
+
+See L<Async::DBD::Pg::Connection/query_list>, including what scalar context
+gives.
 
 =head2 with_connection
 

@@ -258,6 +258,42 @@ subtest 'query_value returns one value and never builds a hash' => sub {
     $conn->_close_dbh;
 };
 
+subtest 'query_list gives one row as a list' => sub {
+    my $conn = make_connection();
+
+    $conn->query('CREATE TEMP TABLE res_list (id int, tag text, n int)')->get;
+    $conn->query(q{INSERT INTO res_list VALUES (1, 'a', 10), (2, 'b', 20)})->get;
+
+    # The idiom this exists for.
+    my ($id, $tag, $n) = $conn->query_list(
+        'SELECT id, tag, n FROM res_list WHERE id = $1', 1
+    )->get;
+    is [$id, $tag, $n], [1, 'a', 10], 'every column, in order, as a list';
+
+    my @none = $conn->query_list('SELECT id, tag FROM res_list WHERE id = 99')->get;
+    is \@none, [], 'no match is an empty list';
+
+    my ($first, $warning);
+    {
+        local $SIG{__WARN__} = sub { $warning = shift };
+        ($first) = $conn->query_list('SELECT id FROM res_list ORDER BY id')->get;
+    }
+    is $first, 1, 'several rows still returns the first';
+    like $warning, qr/query_list/, 'and warns, naming the method';
+
+    # Positional, so it works where query_row croaks -- the same escape
+    # hatch query_value offers, but for the whole row.
+    my @dup = $conn->query_list('SELECT id, id FROM res_list WHERE id = 1')->get;
+    is \@dup, [1, 1], 'a repeated column name is not an error here';
+
+    # An async sub cannot see its caller's context, so the future carries a
+    # list and scalar context takes its first value rather than an arrayref.
+    my $scalar = $conn->query_list('SELECT id, tag FROM res_list WHERE id = 2')->get;
+    is $scalar, 2, 'awaited in scalar context, the first value';
+
+    $conn->_close_dbh;
+};
+
 subtest 'elapsed is captured on every result' => sub {
     my $conn = make_connection();
 

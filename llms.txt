@@ -44,6 +44,7 @@ truncates the value:
     await $pg->query($sql, @bind)        # Results
     await $pg->query_row($sql, @bind)    # one hashref, or undef
     await $pg->query_value($sql, @bind)  # one value, or undef
+    await $pg->query_list($sql, @bind)   # one row as a list: my ($id, $name) = ...
     await $pg->connection                # check out a Connection yourself
     await $pg->with_connection($code, @args)  # scoped checkout, always released
     await $pg->transaction($code, @args)      # commit, or rollback and rethrow
@@ -85,6 +86,8 @@ Rows are stored positionally; hashes are derived on demand.
     $r->single        # first row, warns if more than one matched
     $r->first_value   # first column of first row, no complaint
     $r->single_value  # same, but warns if more than one row matched
+    $r->first_list    # my ($id, $name) = $r->first_list  (arrayref in scalar ctx)
+    $r->single_list   # same, but warns if more than one row matched
     $r->row_array($i) # one row, positional
     $r->next  $r->reset  $r->all
     $r->get_column($name_or_index)   # a Column
@@ -141,7 +144,7 @@ Streams a large result without holding it in memory.
     my $cur = await $conn->cursor('SELECT * FROM big', { batch_size => 500 });
     while (my $row = await $cur->next) { ... }   # one row at a time
     await $cur->each(sub { my ($row) = @_ }, @args);
-    await $cur->all;                             # arrayref of rows
+    await $cur->all;                             # Collection of rows
     await $cur->close;
     $cur->name  $cur->batch_size  $cur->is_exhausted  $cur->is_closed
 

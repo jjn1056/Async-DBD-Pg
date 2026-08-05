@@ -170,6 +170,28 @@ async sub query_value {
     return $row->[0];
 }
 
+# One row as a list of values, for the idiom this is named after:
+#
+#     my ($id, $name) = await $conn->query_list($sql, @bind);
+#
+# The future completes with the list, so awaiting it in list context yields
+# every column. An async sub cannot see its caller's context -- wantarray in
+# the body reports whatever the machinery set, not what the call site wants
+# -- so unlike Results::first_list this cannot hand back an arrayref instead.
+# Awaited in scalar context it yields the first value, the same as
+# query_value would.
+async sub query_list {
+    my ($self, @args) = @_;
+
+    my $result = await $self->query(@args);
+
+    _warn_if_several($result, 'query_list');
+
+    # return evaluates its expression in list context inside an async sub,
+    # which is what puts every column into the future rather than just one.
+    return $result->first_list;
+}
+
 sub _warn_if_several {
     my ($result, $method) = @_;
 
@@ -951,6 +973,28 @@ L</query_row>.
 
 Positional throughout: it never builds a hashref, so unlike L</query_row> it
 works on a query whose column names repeat.
+
+=head2 query_list
+
+    my ($id, $name) = await $conn->query_list($sql, @bind);
+
+The first row as a list of values, in column order, for the common case of
+wanting a few fields out of one row without naming them twice:
+
+    my ($id, $name, $email)
+        = await $conn->query_list('SELECT id, name, email FROM users WHERE id = $1', $id);
+
+An empty list when nothing matched, and a warning when more than one row
+matched, matching L</query_row> and L</query_value>.
+
+Positional throughout, so like L</query_value> and unlike L</query_row> it
+works on a query whose column names repeat.
+
+Awaited in scalar context it gives the first value rather than an arrayref,
+because the future carries the values as a list. This is the one place it
+differs from L<Async::DBD::Pg::Results/first_list>, which does return an
+arrayref there: an async sub cannot see the context of the code awaiting it.
+Use C<< (await $conn->query($sql))->first_list >> if you want the arrayref.
 
 =head2 transaction
 

@@ -195,6 +195,29 @@ sub single_value {
     return $self->first_value;
 }
 
+# The whole row as a list, for the "my ($id, $name) = ..." idiom. Scalar
+# context gives the arrayref rather than a count: a count is a
+# plausible-looking wrong number, which is the failure this library is
+# built to refuse.
+sub first_list {
+    my ($self) = @_;
+
+    my $row = $self->{_rows}[0]
+        or return wantarray ? () : undef;
+
+    return wantarray ? @$row : [@$row];
+}
+
+sub single_list {
+    my ($self) = @_;
+
+    $self->_warn_if_several('single_list');
+
+    # return propagates the caller's context, so this stays a list for a
+    # list-context caller and an arrayref for a scalar-context one.
+    return $self->first_list;
+}
+
 sub _warn_if_several {
     my ($self, $method) = @_;
 
@@ -684,6 +707,30 @@ matched, matching L</single>.
 
 Positional, so it never builds a hash and works whatever the column names
 are.
+
+=head2 first_list
+
+    my ($id, $name) = $result->first_list;
+
+The first row as a list of values, in column order. An empty list when there
+are no rows. Takes what is there without complaint; see L</single_list> to
+be told when more than one matched.
+
+In scalar context it returns an arrayref, not a count. A count is a
+plausible-looking wrong number, which is the failure mode this library is
+built to refuse:
+
+    my $values = $result->first_list;   # [1, 'Alice']
+
+Positional, so it never builds a hash and works whatever the column names
+are.
+
+=head2 single_list
+
+    my ($id, $name) = $result->single_list;
+
+As L</first_list>, but warns when more than one row matched. The first row is
+still returned.
 
 =head2 row_array
 

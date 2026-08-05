@@ -143,8 +143,10 @@ subtest 'all collects the remaining rows' => sub {
     is $first->{n}, 1, 'one row taken';
 
     my $rest = $cursor->all->get;
+    isa_ok $rest, 'Async::DBD::Pg::Collection';
     is [ map { $_->{n} } @$rest ], [2, 3, 4, 5],
         'all returns every row that was left, buffered ones included';
+    is $rest->size, 4, 'and it is the same collection Results::all returns';
 
     $cursor->close->get;
     $conn->release;

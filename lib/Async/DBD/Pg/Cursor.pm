@@ -4,6 +4,7 @@ use strict;
 use warnings;
 
 use Future::AsyncAwait;
+use Async::DBD::Pg::Collection;
 use Async::DBD::Pg::Results;
 
 my $cursor_counter = 0;
@@ -124,7 +125,9 @@ async sub each {
     return $count;
 }
 
-# Collect all remaining rows into an array
+# Collect all remaining rows. A Collection, matching Results::all: both mean
+# "the rows from here on", and a caller switching a query between the eager
+# and the lazy form should not have to switch what it does with them.
 async sub all {
     my ($self) = @_;
 
@@ -133,7 +136,7 @@ async sub all {
         push @all_rows, $row;
     }
 
-    return \@all_rows;
+    return Async::DBD::Pg::Collection->new(@all_rows);
 }
 
 # Close the cursor
@@ -259,10 +262,14 @@ close over them.
 
     my $rows = await $cursor->all;
 
-Collects every remaining row into a single arrayref. This defeats the point of
-a cursor on a large result, since the whole set ends up in memory; prefer
-L</each> or L</next> unless the result is known to be small. Draining the
-cursor this way closes it too.
+Collects every remaining row into an L<Async::DBD::Pg::Collection>, the same
+as L<Async::DBD::Pg::Results/all> returns, so a query can move between the
+eager and the lazy form without its caller changing. A collection is a
+blessed arrayref, so C<@$rows> and C<< $rows->[0] >> work as before.
+
+This defeats the point of a cursor on a large result, since the whole set
+ends up in memory; prefer L</each> or L</next> unless the result is known to
+be small. Draining the cursor this way closes it too.
 
 =head2 close
 

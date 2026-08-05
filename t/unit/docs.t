@@ -153,7 +153,8 @@ subtest 'the public API is covered by the machine reference' => sub {
     # to everyone reading the reference, which is the drift this catches.
     my @results_api = qw(
         rows arrays columns types count rows_affected is_empty elapsed
-        first single first_value single_value row_array next reset all get_column
+        first single first_value single_value first_list single_list row_array
+        next reset all get_column
         preview as multi expand by groups
     );
 
@@ -161,7 +162,7 @@ subtest 'the public API is covered by the machine reference' => sub {
     is \@missing, [], 'every Results method appears in llms.txt';
 
     my @pool_api = qw(
-        query query_row query_value connection with_connection transaction
+        query query_row query_value query_list connection with_connection transaction
         shutdown on_query stats
     );
 

@@ -183,6 +183,59 @@ subtest 'first_value is the lax counterpart to single_value' => sub {
     is duplicated()->first_value, 1, 'works on a duplicate-column result';
 };
 
+subtest 'first_list gives one row as a list of values' => sub {
+    my $r = people();
+
+    my ($id, $name) = $r->first_list;
+    is $id, 1, 'first column';
+    is $name, 'Alice', 'second column';
+
+    # Scalar context returns the arrayref rather than a count, because a
+    # count is a plausible-looking wrong number and an arrayref is not.
+    my $aref = $r->first_list;
+    is $aref, [1, 'Alice'], 'scalar context gives an arrayref';
+
+    my $none = results(columns => ['id'], types => ['int4']);
+    is [ $none->first_list ], [], 'no rows is an empty list';
+    is scalar($none->first_list), undef, 'and undef in scalar context';
+
+    # Positional, so a repeated column name cannot stop it. This is the
+    # escape hatch from query_row's croak, alongside query_value.
+    is [ duplicated()->first_list ], [1, 2, 'Alice', 'Bob'],
+        'every value of a duplicate-column row';
+
+    my $quiet;
+    {
+        local $SIG{__WARN__} = sub { $quiet = shift };
+        $r->first_list;
+    }
+    is $quiet, undef, 'first_list takes what is there without complaint';
+};
+
+subtest 'single_list is the strict counterpart' => sub {
+    my $r = people();
+
+    my ($id, $name, $warning);
+    {
+        local $SIG{__WARN__} = sub { $warning = shift };
+        ($id, $name) = $r->single_list;
+    }
+
+    is [$id, $name], [1, 'Alice'], 'the first row is still returned';
+    like $warning, qr/single_list/, 'the warning names the method';
+    like $warning, qr/3 rows/, 'and how many matched';
+
+    my $one = results(
+        columns => ['id', 'name'], types => ['int4', 'text'], rows => [[9, 'Zoe']],
+    );
+    my $silent;
+    {
+        local $SIG{__WARN__} = sub { $silent = shift };
+        is [ $one->single_list ], [9, 'Zoe'], 'exactly one row';
+    }
+    is $silent, undef, 'is not warned about';
+};
+
 subtest 'next and reset walk the rows' => sub {
     my $r = people();
 

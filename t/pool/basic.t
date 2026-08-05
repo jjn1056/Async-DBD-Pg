@@ -1159,6 +1159,11 @@ subtest 'the pool offers query_row and query_value too' => sub {
     is $pg->query_value('SELECT tag FROM qr WHERE id = 99')->get, undef,
         'and undef when nothing matched';
 
+    my ($id, $tag) = $pg->query_list('SELECT id, tag FROM qr WHERE id = $1', 2)->get;
+    is [$id, $tag], [2, 'b'], 'query_list returns the row as a list';
+    is [ $pg->query_list('SELECT id, tag FROM qr WHERE id = 99')->get ], [],
+        'and an empty list when nothing matched';
+
     # The pool checks a connection out for each of these, so the thing worth
     # asserting is that every one of them gives it back.
     is $pg->active_count, 0, 'no connection is left checked out';
