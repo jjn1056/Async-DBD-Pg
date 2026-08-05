@@ -127,6 +127,32 @@ sub arrays {
     return Async::DBD::Pg::Collection->new(@{ $self->{_rows} });
 }
 
+# Addressable by name and lossless, so this is the one name-keyed view a
+# result with repeated column names supports without renaming. It has nothing
+# to refuse and so is exempt from the croak the other hash views make.
+#
+# Built on every call and never cached: a Hash::MultiValue per row is real
+# work, and hiding that behind a cache would only move the cost somewhere
+# harder to see.
+sub multi {
+    my ($self) = @_;
+
+    eval { require Hash::MultiValue; 1 }
+        or croak 'multi needs Hash::MultiValue, which is not installed. '
+               . 'Install it, or use ->arrays for a lossless view with no dependency';
+
+    my $names = $self->{_names};
+
+    return Async::DBD::Pg::Collection->new(
+        map {
+            my $row = $_;
+            Hash::MultiValue->new(
+                map { ( $names->[$_] => $row->[$_] ) } 0 .. $#$names
+            );
+        } @{ $self->{_rows} }
+    );
+}
+
 sub row_array {
     my ($self, $i) = @_;
     return $self->{_rows}[$i];
@@ -197,6 +223,246 @@ sub all {
     return Async::DBD::Pg::Collection->new(
         map { $self->_hash_row($_) } grep { defined } @remaining
     );
+}
+
+# Lookup keyed by a column's value. The hand-rolled map version of this keeps
+# the last row when key values repeat, which is the same silent loss as a
+# collapsed column, so it is refused the same way and points at groups.
+sub by {
+    my ($self, $column) = @_;
+
+    # Before _index_of, so a repeated column name is reported as something
+    # ->as can fix rather than with get_column's "ask for one by index",
+    # which is advice by cannot take: it keys on a name.
+    $self->_assert_addressable_by_name;
+    my $index = $self->_index_of($column);
+
+    my %seen;
+    for my $row (@{ $self->{_rows} }) {
+        $seen{ $self->_key_of($row, $index, $column) }++;
+    }
+
+    for my $row (@{ $self->{_rows} }) {
+        my $value = $row->[$index];
+        next if $seen{$value} == 1;
+
+        croak sprintf(
+            "Value '%s' in column '%s' appears %d times; use ->groups",
+            $value, $column, $seen{$value},
+        );
+    }
+
+    return { map { ( $_->[$index] => $self->_hash_row($_) ) } @{ $self->{_rows} } };
+}
+
+# A hash key is a string, so a NULL would become the empty string and merge
+# with a row that genuinely holds one. Refuse instead of choosing for them.
+sub _key_of {
+    my ($self, $row, $index, $column) = @_;
+
+    my $value = $row->[$index];
+
+    croak "Column '$column' holds NULL, which cannot key a lookup; "
+        . 'filter the NULLs out in your SQL, or key on a NOT NULL column'
+        unless defined $value;
+
+    return $value;
+}
+
+# The lossless half of the pair: every row survives, gathered under its key.
+sub groups {
+    my ($self, $column) = @_;
+
+    $self->_assert_addressable_by_name;
+    my $index = $self->_index_of($column);
+
+    my %grouped;
+    for my $row (@{ $self->{_rows} }) {
+        push @{ $grouped{ $self->_key_of($row, $index, $column) } },
+            $self->_hash_row($row);
+    }
+
+    return {
+        map { ( $_ => Async::DBD::Pg::Collection->new(@{ $grouped{$_} }) ) }
+        keys %grouped
+    };
+}
+
+# A view: a fresh result over the same rows, with the names swapped. The rows
+# arrayref is shared rather than copied, and the view carries its own
+# position, so iterating one does not move the other and calling this on a
+# half-read result is well defined.
+sub as {
+    my ($self, $spec) = @_;
+
+    my $names = ref $spec eq 'HASH'  ? $self->_renamed_by_index($spec)
+              : ref $spec eq 'ARRAY' ? $self->_renamed_from_list($spec)
+              : croak 'as expects an arrayref of names or a hashref of index => name';
+
+    # Refuse here rather than at the next ->rows: a rename that still
+    # collides has not solved the problem it was called to solve, and
+    # reporting it later would point at the wrong line.
+    my $positions = _index_names($names);
+    for my $name (@$names) {
+        my $at = $positions->{$name};
+        next if @$at == 1;
+
+        croak sprintf(
+            "Renaming leaves '%s' at positions %s; every column needs a distinct name",
+            $name, join(', ', @$at),
+        );
+    }
+
+    return ref($self)->_build(
+        $self->{_rows}, $names, $self->{_types}, $self->{_rows_affected},
+    );
+}
+
+# Decode the json and jsonb columns, chosen by the stored pg_type rather than
+# by sniffing values -- which is the direct payoff of keeping the types. A
+# view like as: a fresh result over new rows, leaving the original untouched.
+#
+# Decoding happens here rather than per row on access, so the cost is paid
+# once and is visible at the call site instead of scattered through a loop.
+sub expand {
+    my ($self) = @_;
+
+    my $types = $self->{_types};
+    my @json = grep { ($types->[$_] // '') =~ /\A jsonb? \z/x } 0 .. $#$types;
+
+    return ref($self)->_build(
+        [ @{ $self->{_rows} } ], $self->{_names}, $types, $self->{_rows_affected},
+    ) unless @json;
+
+    my $decoder = _json_decoder();
+
+    my @rows;
+    for my $i (0 .. $#{ $self->{_rows} }) {
+        my @row = @{ $self->{_rows}[$i] };
+
+        for my $col (@json) {
+            next unless defined $row[$col];
+
+            $row[$col] = eval { $decoder->decode($row[$col]) };
+            croak sprintf(
+                "Could not decode column '%s' of row %d as %s: %s",
+                $self->{_names}[$col], $i, $types->[$col], $@,
+            ) if $@;
+        }
+
+        push @rows, \@row;
+    }
+
+    return ref($self)->_build(
+        \@rows, $self->{_names}, $types, $self->{_rows_affected},
+    );
+}
+
+sub _json_decoder {
+    eval { require JSON::MaybeXS; 1 }
+        or croak 'expand needs JSON::MaybeXS, which is not installed. '
+               . 'Install it, or decode the column yourself';
+
+    return JSON::MaybeXS->new(utf8 => 0);
+}
+
+sub _renamed_from_list {
+    my ($self, $list) = @_;
+
+    my $wanted = @{ $self->{_names} };
+
+    croak sprintf(
+        'as expects %d names for %d columns, got %d',
+        $wanted, $wanted, scalar @$list,
+    ) if @$list != $wanted;
+
+    return [@$list];
+}
+
+sub _renamed_by_index {
+    my ($self, $map) = @_;
+
+    my @names = @{ $self->{_names} };
+
+    for my $index (sort { $a <=> $b } keys %$map) {
+        croak sprintf(
+            'Column index %s out of range; result has %d columns',
+            $index, scalar @names,
+        ) if $index !~ /\A[0-9]+\z/ || $index > $#names;
+
+        $names[$index] = $map->{$index};
+    }
+
+    return \@names;
+}
+
+# Shape and a sample, never a flood. Bounded in both directions by design:
+# this is what gets printed into a log, a REPL, or an agent's context, and
+# any of those is worse off with the whole result set in it.
+sub preview {
+    my ($self, $limit) = @_;
+    $limit = 5 unless defined $limit;
+
+    my $names = $self->{_names};
+    my $total = @{ $self->{_rows} };
+
+    return "no columns; rows_affected: $self->{_rows_affected}" unless @$names;
+
+    my @header = map {
+        my $type = $self->{_types}[$_];
+        defined $type ? "$names->[$_] $type" : $names->[$_];
+    } 0 .. $#$names;
+
+    my $summary = sprintf '%d row%s; %d column%s: %s',
+        $total, ($total == 1 ? '' : 's'),
+        scalar @$names, (@$names == 1 ? '' : 's'),
+        join(', ', @header);
+
+    return $summary unless $total;
+
+    # Positional, so this works on the result that most needs inspecting:
+    # the one whose column names collide and whose hash views refuse.
+    my @shown = map { [ map { _cell($_) } @$_ ] }
+                @{ $self->{_rows} }[ 0 .. ($total < $limit ? $total : $limit) - 1 ];
+
+    my @width = map {
+        my $col = $_;
+        my $w = length $names->[$col];
+        for my $row (@shown) {
+            $w = length $row->[$col] if length $row->[$col] > $w;
+        }
+        $w;
+    } 0 .. $#$names;
+
+    # Padding the final column would leave trailing spaces on every line,
+    # which is noise in a log and a diff.
+    my $line = sub {
+        my ($cells) = @_;
+        my $out = join ' | ',
+            map { sprintf '%-*s', $width[$_], $cells->[$_] } 0 .. $#$names;
+        $out =~ s/\s+\z//;
+        return $out;
+    };
+
+    my @lines = ($summary, $line->($names));
+    push @lines, $line->($_) for @shown;
+
+    push @lines, sprintf '... %d more', $total - @shown if $total > @shown;
+
+    return join "\n", @lines;
+}
+
+# NULL has to be distinguishable from an empty string here, and a single wide
+# value must not blow the line out.
+sub _cell {
+    my ($value) = @_;
+
+    return 'NULL' unless defined $value;
+    return "\x7b...\x7d" if ref $value;
+
+    $value =~ s/\s+/ /g;
+
+    return length $value > 30 ? substr($value, 0, 27) . '...' : $value;
 }
 
 # Take a name or an index, and never choose on the caller's behalf.
@@ -437,6 +703,114 @@ later:
     Column index 7 out of range; result has 4 columns
 
 A repeated name is resolved by asking for the position instead.
+
+=head2 multi
+
+    my $rows = $result->multi;
+    my @ids  = $rows->first->get_all('id');
+
+Rows as L<Hash::MultiValue> objects, in a collection. Addressable by name
+B<and> lossless, so this is the one name-keyed view that works on a result
+whose column names repeat, and the only one exempt from the croak.
+
+Scalar access keeps the last value of a repeated name, the same as assigning
+a repeated key into a plain hash would; C<get_all> returns every one.
+
+L<Hash::MultiValue> is an optional dependency, loaded when this is called.
+
+Built on every call and never cached: an object per row is real work. Hold
+the result if you loop over it, and prefer L</arrays> for large result sets.
+
+=head2 expand
+
+    my $rows = $result->expand->rows;
+    say $rows->[0]{payload}{user}{name};
+
+A view with the C<json> and C<jsonb> columns decoded into Perl structures.
+Which columns those are comes from L</types>, never from looking at the
+values, so a C<text> column that happens to contain JSON is left alone.
+
+Decoding happens once, when this is called, rather than per access. The
+original result is not modified. A column that cannot be decoded is an error
+naming the column and the row: PostgreSQL cannot return malformed C<jsonb>,
+so it means something is badly wrong.
+
+L<JSON::MaybeXS> is an optional dependency, loaded when this is called.
+
+Composes with the other views:
+
+    $result->as({ 1 => 'body' })->expand->by('id');
+
+=head2 as
+
+    my $view = $result->as(['seller_id', 'buyer_id', 'name']);
+    my $view = $result->as({ 0 => 'seller_id', 1 => 'buyer_id' });
+
+A view of the same rows under different column names. This is the fix for a
+result whose names repeat: rename them and every hash view works again.
+
+The arrayref form names every column and must be exactly as long as
+L</columns>. The hashref form renames by index and leaves the rest alone.
+Renaming is always by position, never by current name, because the case that
+needs renaming is exactly the one where a name does not identify a column.
+
+The view shares the rows rather than copying them, and carries its own
+position, so iterating the view does not move the original's L</next> and
+calling this on a half-read result is well defined. C<types> stay aligned by
+position. The original still reports its raw names.
+
+Three things are refused, all at the point of renaming rather than at the
+next use: a list of the wrong length, an index that names no column, and a
+rename that still leaves two columns sharing a name.
+
+=head2 by
+
+    my $users = $result->by('id');
+    say $users->{42}{name};
+
+A plain hashref of column value to row, for the lookups that otherwise get
+written as a C<map>.
+
+Refuses to lose a row. If the key column repeats a value, that C<map> would
+silently keep the last one, so this croaks and points at L</groups> instead.
+A NULL in the key column is refused for the same reason: as a hash key it
+would become the empty string and merge with a row that holds one.
+
+Croaks on a column name that is not present, listing the ones that are, and
+on a result whose column names repeat.
+
+=head2 groups
+
+    my $teams = $result->groups('dept');
+    say $teams->{eng}->size;
+
+The lossless counterpart to L</by>: a hashref of column value to a
+collection of every row with that value.
+
+Croaks on a missing column and on a NULL key, as L</by> does.
+
+=head2 preview
+
+    say $result->preview;
+    say $result->preview(20);
+
+A short string describing the result: the column names with their types, the
+row count, and the first few rows as an aligned table. Five rows by default.
+
+    3 rows; 4 columns: id int4, name text, dept text, note text
+    id | name  | dept  | note
+    1  | Alice | eng   | NULL
+    2  | Bob   | sales | a much longer note than fit...
+    ... 1 more
+
+Bounded in both directions on purpose: rows are capped and wide values are
+truncated, because this is what goes into a log, a REPL, or an agent's
+context, and none of those is better off holding the whole result set.
+
+Positional, so it works on a result whose column names repeat -- which is
+the one that most needs looking at. On a view it shows the view's names. A
+statement returning no rows still describes its shape, and one with no
+columns reports its C<rows_affected>.
 
 =head1 CONSTRUCTORS
 

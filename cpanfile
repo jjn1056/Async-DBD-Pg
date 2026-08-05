@@ -30,8 +30,19 @@ requires 'Future', '0.49';
 requires 'Future::AsyncAwait', '0.66';
 requires 'Future::IO', '0.23';
 
+# Loaded at the point of use by one method each, so an installer who never
+# calls them never needs them. Recommends rather than requires: a missing one
+# is reported with an install hint by the method that wanted it.
+recommends 'Hash::MultiValue', '0.15';   # Results::multi
+recommends 'JSON::MaybeXS', '1.004';     # Results::expand
+
 on 'test' => sub {
     requires 'Test2::V0', '0.000159';
+
+    # The optional runtime pair above. The suite skips their tests when they
+    # are absent, so this makes the coverage happen rather than enabling it.
+    requires 'Hash::MultiValue', '0.15';
+    requires 'JSON::MaybeXS', '1.004';
 
     # Any Future::IO implementation will do; this one is what the suite
     # loads by default. The tests also pass under Future::IO::Impl::IOAsync,

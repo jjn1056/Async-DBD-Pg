@@ -233,6 +233,298 @@ subtest 'get_column never guesses' => sub {
     is duplicated()->get_column(1)->first, 2, 'by index on a duplicate name';
 };
 
+subtest 'as renames every column from a list' => sub {
+    my $r = duplicated();
+    my $v = $r->as(['a_id', 'b_id', 'a_name', 'b_name']);
+
+    is $v->columns, ['a_id', 'b_id', 'a_name', 'b_name'], 'the view reports the new names';
+    is $r->columns, ['id', 'id', 'name', 'name'],
+        'the original still reports the raw ones, duplicates intact';
+
+    # Renaming is the way out of the croak, so the hash views must now work.
+    is $v->rows->[0], { a_id => 1, b_id => 2, a_name => 'Alice', b_name => 'Bob' },
+        'rows under the new names, with nothing lost';
+    is $v->first->{b_name}, 'Bob', 'first';
+    is $v->get_column('b_id')->first, 2, 'get_column by new name';
+    is $v->types, ['int4', 'int4', 'text', 'text'], 'types stay aligned by position';
+    is $v->count, 1, 'count';
+};
+
+subtest 'as renames selected columns by index' => sub {
+    my $r = duplicated();
+    my $v = $r->as({ 0 => 'a_id', 2 => 'a_name' });
+
+    is $v->columns, ['a_id', 'id', 'a_name', 'name'],
+        'only the named indexes change; the rest keep their raw names';
+    is $v->rows->[0], { a_id => 1, id => 2, a_name => 'Alice', name => 'Bob' },
+        'and the result is addressable by name again';
+};
+
+subtest 'as refuses a rename it cannot honour' => sub {
+    my $r = duplicated();
+
+    like dies { $r->as(['only', 'three', 'names']) },
+        qr/as expects 4 names for 4 columns, got 3/,
+        'a short list is an error rather than a partial rename';
+
+    like dies { $r->as({ 9 => 'nope' }) },
+        qr/Column index 9 out of range; result has 4 columns/,
+        'an index that names no column is an error';
+
+    # Renaming that leaves a collision has not solved anything, and finding
+    # out at the next ->rows would point at the wrong line.
+    like dies { $r->as({ 0 => 'name' }) },
+        qr/leaves 'name' at positions 0, 2, 3/,
+        'a rename that still collides is refused here, not later';
+};
+
+subtest 'a view iterates independently of the result it came from' => sub {
+    my $r = people();
+    my $v = $r->as(['n', 'who']);
+
+    # Sharing the rows but not the position is what makes as safe to call on
+    # a half-read result.
+    is $v->next, { n => 1, who => 'Alice' }, 'the view starts at the beginning';
+    is $v->next, { n => 2, who => 'Bob' }, 'and advances';
+    is $r->next, { id => 1, name => 'Alice' },
+        'the original has not moved';
+
+    $r->next;
+    is $v->next, { n => 3, who => 'Charlie' },
+        'and moving the original does not move the view';
+
+    my $half = people();
+    $half->next;
+    is $half->as(['n', 'who'])->next, { n => 1, who => 'Alice' },
+        'a view of a half-read result starts from the top';
+};
+
+subtest 'multi addresses a duplicate-column result by name, losslessly' => sub {
+    skip_all 'Hash::MultiValue is not installed'
+        unless eval { require Hash::MultiValue; 1 };
+
+    my $r = duplicated();
+    my $multi = $r->multi;
+
+    isa_ok $multi, 'Async::DBD::Pg::Collection';
+    is $multi->size, 1, 'one row';
+
+    my $row = $multi->first;
+    isa_ok $row, 'Hash::MultiValue';
+
+    # This is the point of it: a repeated name keeps every value, so unlike
+    # rows it has nothing to refuse and does not croak.
+    is [ $row->get_all('id') ], [1, 2], 'both values of the repeated name';
+    is [ $row->get_all('name') ], ['Alice', 'Bob'], 'and of the other one';
+    # Scalar access keeps the last, which is what assigning a repeated key
+    # into a plain Perl hash would have done as well.
+    is $row->{id}, 2, 'hash access gives the last value';
+    is $row->get('id'), 2, 'and so does get';
+
+    my $renamed = $r->as(['a_id', 'b_id', 'a_name', 'b_name'])->multi;
+    is $renamed->first->{b_id}, 2, 'a view multi uses the renamed columns';
+};
+
+sub staff {
+    results(
+        columns => ['id', 'name', 'dept'],
+        types   => ['int4', 'text', 'text'],
+        rows    => [
+            [1, 'Alice', 'eng'],
+            [2, 'Bob',   'eng'],
+            [3, 'Carol', 'sales'],
+        ],
+    );
+}
+
+subtest 'by builds a lookup and refuses to lose a row' => sub {
+    my $lookup = staff()->by('id');
+
+    is [ sort keys %$lookup ], [1, 2, 3], 'keyed by the column value';
+    is $lookup->{2}, { id => 2, name => 'Bob', dept => 'eng' }, 'values are rows';
+
+    # The hand-rolled map version keeps the last row silently. This is the
+    # same data loss as a collapsed column, so it gets the same treatment.
+    my $err = dies { staff()->by('dept') };
+    like $err, qr/Value 'eng' in column 'dept' appears 2 times/,
+        'names the value, the column and the count';
+    like $err, qr/use ->groups/, 'and points at the lossless one';
+
+    like dies { staff()->by('nope') },
+        qr/No column 'nope'; columns are: id, name, dept/,
+        'a missing column lists what is available';
+
+    # The advice has to be one by can take. get_column says "ask for one by
+    # index", which is no use to a method that keys on a name.
+    my $dup = dies { duplicated()->by('id') };
+    like $dup, qr/Column 'id' appears 2 times at positions 0, 1/,
+        'a repeated column name croaks before the lookup is built';
+    like $dup, qr/->arrays or ->as/, 'and points at a fix by can actually use';
+
+    # A hash key is a string, so a NULL would silently become the empty
+    # string and merge with a row that genuinely holds one.
+    my $nullable = results(
+        columns => ['id', 'tag'],
+        types   => ['int4', 'text'],
+        rows    => [ [1, 'a'], [2, undef] ],
+    );
+    like dies { $nullable->by('tag') },
+        qr/Column 'tag' holds NULL, which cannot key a lookup/,
+        'a NULL key is refused rather than folded into the empty string';
+    like dies { $nullable->groups('tag') },
+        qr/holds NULL/, 'groups refuses it too';
+};
+
+subtest 'groups keeps every row' => sub {
+    my $groups = staff()->groups('dept');
+
+    is [ sort keys %$groups ], ['eng', 'sales'], 'one key per distinct value';
+    isa_ok $groups->{eng}, 'Async::DBD::Pg::Collection';
+    is $groups->{eng}->size, 2, 'both rows in the group';
+    is [ map { $_->{name} } @{ $groups->{eng} } ], ['Alice', 'Bob'],
+        'in the order they arrived';
+    is $groups->{sales}->size, 1, 'and the single-row group';
+
+    like dies { staff()->groups('nope') },
+        qr/No column 'nope'; columns are: id, name, dept/,
+        'a missing column lists what is available';
+};
+
+subtest 'lookups follow a renamed view' => sub {
+    my $v = duplicated()->as(['a_id', 'b_id', 'a_name', 'b_name']);
+
+    my $lookup = $v->by('b_id');
+    is [ keys %$lookup ], [2], 'keyed by the renamed column';
+    is $lookup->{2}{a_name}, 'Alice', 'and the rows carry the renamed keys';
+};
+
+subtest 'expand decodes the json columns and leaves the rest alone' => sub {
+    skip_all 'JSON::MaybeXS is not installed'
+        unless eval { require JSON::MaybeXS; 1 };
+
+    my $r = results(
+        columns => ['id', 'payload', 'doc', 'note'],
+        types   => ['int4', 'jsonb', 'json', 'text'],
+        rows    => [
+            [1, '{"user":{"name":"Alice"}}', '[1,2,3]', '{"not":"json"}'],
+        ],
+    );
+
+    my $e = $r->expand;
+    my $row = $e->rows->[0];
+
+    is $row->{payload}{user}{name}, 'Alice', 'jsonb decoded to a structure';
+    is $row->{doc}, [1, 2, 3], 'json decoded too';
+
+    # A text column that happens to hold JSON is text. Choosing by pg_type
+    # rather than by looking at the value is what makes that reliable.
+    is $row->{note}, '{"not":"json"}', 'a text column is left byte-identical';
+    is $row->{id}, 1, 'and so is everything else';
+
+    is $r->rows->[0]{payload}, '{"user":{"name":"Alice"}}',
+        'the original is not mutated';
+    is $e->types, ['int4', 'jsonb', 'json', 'text'], 'the view keeps the types';
+
+    # Views compose, which is what makes them worth being views.
+    my $composed = $r->as({ 1 => 'body' })->expand;
+    is $composed->rows->[0]{body}{user}{name}, 'Alice',
+        'as then expand: renamed keys, decoded values';
+
+    my $lookup = $r->as({ 1 => 'body' })->expand->by('id');
+    is $lookup->{1}{body}{user}{name}, 'Alice', 'and on through by';
+
+    my $none = people()->expand;
+    is $none->rows->[0], { id => 1, name => 'Alice' },
+        'a result with no json columns passes straight through';
+};
+
+subtest 'expand reports a column it cannot decode' => sub {
+    skip_all 'JSON::MaybeXS is not installed'
+        unless eval { require JSON::MaybeXS; 1 };
+
+    my $r = results(
+        columns => ['id', 'payload'],
+        types   => ['int4', 'jsonb'],
+        rows    => [ [1, '{"ok":1}'], [2, 'not json at all'] ],
+    );
+
+    # PostgreSQL cannot return malformed jsonb, so this means something is
+    # badly wrong and it is treated as the serious error it is.
+    like dies { $r->expand },
+        qr/Could not decode column 'payload' of row 1 as jsonb/,
+        'names the column and which row';
+
+    my $nullable = results(
+        columns => ['id', 'payload'],
+        types   => ['int4', 'jsonb'],
+        rows    => [ [1, undef] ],
+    );
+    is $nullable->expand->rows->[0]{payload}, undef, 'a NULL json column stays undef';
+};
+
+subtest 'preview renders shape and a sample, bounded' => sub {
+    my $out = people()->preview;
+
+    like $out, qr/\bid\b/, 'names the columns';
+    like $out, qr/\bint4\b/, 'with their types';
+    like $out, qr/\btext\b/, 'all of them';
+    like $out, qr/\b3 rows\b/, 'and the total row count';
+    like $out, qr/Alice/, 'shows the data';
+    unlike $out, qr/\n\n/, 'no blank lines to scroll past';
+};
+
+subtest 'preview never floods' => sub {
+    my $many = results(
+        columns => ['n'],
+        types   => ['int4'],
+        rows    => [ map { [$_] } 1 .. 100 ],
+    );
+
+    my $default = $many->preview;
+    like $default, qr/100 rows/, 'reports the true total';
+    is scalar(grep { /^\s*\d+\s*$/ } split /\n/, $default), 5,
+        'but renders only the default five';
+    like $default, qr/95 more/, 'and says how many it held back';
+
+    is scalar(grep { /^\s*\d+\s*$/ } split /\n/, $many->preview(2)), 2,
+        'the count is adjustable';
+
+    # A single wide value must not blow the line out either.
+    my $wide = results(
+        columns => ['blob'],
+        types   => ['text'],
+        rows    => [ ['x' x 500] ],
+    );
+    my $capped = $wide->preview;
+    ok length($_) < 200, 'every line is bounded'
+        for grep { length } split /\n/, $capped;
+    like $capped, qr/\.\.\./, 'a truncated value is marked as truncated';
+};
+
+subtest 'preview works where the hash views cannot' => sub {
+    # Positional, so this is usable on exactly the result that most needs
+    # inspecting: the one whose column names collide.
+    my $out = duplicated()->preview;
+
+    like $out, qr/Alice/, 'shows values';
+    like $out, qr/Bob/, 'including the ones a hash would have dropped';
+    like $out, qr/1 row\b/, 'row count';
+
+    like people()->as(['n', 'who'])->preview, qr/\bwho\b/,
+        'a view previews under its own names';
+};
+
+subtest 'preview on results with nothing to show' => sub {
+    my $no_rows = results(columns => ['id', 'name'], types => ['int4', 'text']);
+    my $out = $no_rows->preview;
+    like $out, qr/0 rows/, 'says there are none';
+    like $out, qr/\bid\b.*\bint4\b/, 'and still describes the shape';
+
+    my $no_columns = results(rows_affected => 7);
+    like $no_columns->preview, qr/no columns/, 'a non-row statement says so';
+    like $no_columns->preview, qr/rows_affected: 7/, 'and reports its payload';
+};
+
 subtest 'rows_affected is the payload for a statement returning none' => sub {
     my $r = results(rows_affected => 5);
 
