@@ -13,6 +13,7 @@ use Future::IO;
 
 BEGIN { Future::IO->load_best_impl; }
 
+use Async::DBD::Pg;
 use Async::DBD::Pg::Connection;
 use Async::DBD::Pg::Util qw(parse_dsn);
 use DBI;
@@ -149,15 +150,58 @@ subtest 'transaction with isolation level' => sub {
 
     $conn->query('CREATE TEMP TABLE test_tx5 (id serial PRIMARY KEY, value int)')->get;
 
-    my $result = $conn->transaction(async sub {
+    my $result = $conn->transaction({ isolation => 'serializable' }, async sub {
         my ($c) = @_;
         await $c->query("INSERT INTO test_tx5 (value) VALUES (42)");
         return 'done';
-    }, isolation => 'serializable')->get;
+    })->get;
 
     is $result, 'done', 'transaction with isolation level completed';
 
     $conn->_close_dbh;
+};
+
+subtest 'transaction forwards trailing arguments to its callback' => sub {
+    my $pg   = Async::DBD::Pg->new(dsn => test_dsn(), min_connections => 0, max_connections => 3);
+    my $conn = $pg->connection->get;
+    $conn->query('CREATE TEMP TABLE argtest (n int, tag text)')->get;
+
+    # Passed in rather than closed over, so a caller looping over work does
+    # not have to reason about what each closure captured.
+    $conn->transaction(async sub {
+        my ($tx, $n, $tag) = @_;
+        await $tx->query('INSERT INTO argtest VALUES ($1, $2)', $n, $tag);
+    }, 42, 'from-args')->get;
+
+    my $r = $conn->query('SELECT n, tag FROM argtest')->get->first;
+    is $r->{n}, 42, 'a trailing argument reached the callback';
+    is $r->{tag}, 'from-args', 'and so did the second';
+
+    $conn->release;
+    $pg->shutdown->get;
+};
+
+subtest 'transaction takes its options first, where they are visible' => sub {
+    my $pg   = Async::DBD::Pg->new(dsn => test_dsn(), min_connections => 0, max_connections => 3);
+    my $conn = $pg->connection->get;
+
+    my $level = $conn->transaction({ isolation => 'serializable' }, async sub {
+        my ($tx) = @_;
+        return await $tx->query('SHOW transaction_isolation');
+    })->get;
+    is $level->first->{transaction_isolation}, 'serializable',
+        'a leading options hashref is read as options';
+
+    # And options plus arguments together, which is the shape that has to work
+    # for the convention to be worth having.
+    my $got = $conn->transaction({ isolation => 'serializable' }, async sub {
+        my ($tx, $value) = @_;
+        return $value;
+    }, 'passed-through')->get;
+    is $got, 'passed-through', 'options and arguments coexist';
+
+    $conn->release;
+    $pg->shutdown->get;
 };
 
 done_testing;

@@ -94,12 +94,12 @@ async sub next {
 
 # Iterate over all rows, calling callback for each
 async sub each {
-    my ($self, $callback) = @_;
+    my ($self, $callback, @args) = @_;
 
     my $count = 0;
     while (my $batch = await $self->next) {
         for my $row (@$batch) {
-            $callback->($row);
+            $callback->($row, @args);
             $count++;
         }
     }
@@ -208,10 +208,16 @@ calling L</close> explicitly.
         ...
     });
 
+    await $cursor->each($callback, @args);
+
 Walks every remaining row, calling the callback once per row, fetching a batch
 at a time. This keeps only one batch in memory however large the result is.
 Returns the number of rows visited. A callback that runs to completion drains
 the cursor and, by way of L</next>, closes it.
+
+Any arguments after the callback are forwarded to it as
+C<< $callback->($row, @args) >>, letting a caller pass values in rather than
+close over them.
 
 =head2 all
 

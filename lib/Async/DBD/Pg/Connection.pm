@@ -430,7 +430,13 @@ sub cancel {
 
 # Execute code within a transaction
 async sub transaction {
-    my ($self, $code, %opts) = @_;
+    my ($self, @rest) = @_;
+
+    # Options lead so a reader sees them before the block, and so the trailing
+    # slot is free for arguments the caller wants forwarded rather than closed
+    # over. A code ref is never a hashref, so the two forms cannot be confused.
+    my %opts = ref $rest[0] eq 'HASH' ? %{ shift @rest } : ();
+    my ($code, @args) = @rest;
 
     my $isolation = $opts{isolation};
     my $savepoint_depth = $self->{_savepoint_depth} // 0;
@@ -441,7 +447,7 @@ async sub transaction {
 
         $self->{_savepoint_depth} = $savepoint_depth + 1;
 
-        my $result = eval { await $code->($self) };
+        my $result = eval { await $code->($self, @args) };
         my $err = $@;
 
         $self->{_savepoint_depth} = $savepoint_depth;
@@ -466,7 +472,7 @@ async sub transaction {
 
         $self->{_savepoint_depth} = 1;
 
-        my $result = eval { await $code->($self) };
+        my $result = eval { await $code->($self, @args) };
         my $err = $@;
 
         $self->{_savepoint_depth} = 0;
@@ -792,10 +798,18 @@ the SQLSTATE and the diagnostics the server returned.
         return $value;
     });
 
-    await $conn->transaction($code, isolation => 'serializable');
+    await $conn->transaction($code, @args);
+    await $conn->transaction({ isolation => 'serializable' }, $code, @args);
 
 Runs C<$code> inside a transaction, committing when it returns and rolling
 back if it dies, then rethrowing. Whatever C<$code> returns is returned.
+
+A leading hashref is read as options, so a reader sees them before the block
+rather than having to scroll past it. Any arguments after C<$code> are
+forwarded to it as C<< $code->($conn, @args) >>, letting a caller pass values
+in rather than close over them. Options moved from a trailing list to a
+leading hashref in 0.001001; the old C<< transaction($code, isolation => ...)
+>> form is no longer accepted.
 
 Nested calls use savepoints: an inner block that dies rolls back to its
 savepoint and leaves the outer transaction to continue, so failure can be

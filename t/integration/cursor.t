@@ -232,4 +232,23 @@ subtest 'a cursor abandoned before exhaustion still warns' => sub {
     $pg->shutdown->get;
 };
 
+subtest 'each forwards trailing arguments to its callback' => sub {
+    my $pg   = Async::DBD::Pg->new(dsn => test_dsn(), min_connections => 0, max_connections => 3);
+    my $conn = $pg->connection->get;
+    $conn->query('CREATE TEMP TABLE eachargs AS SELECT g AS id FROM generate_series(1,5) g')->get;
+
+    my $cursor = $conn->cursor('SELECT id FROM eachargs', { batch_size => 2 })->get;
+    my @seen;
+    $cursor->each(async sub {
+        my ($row, $prefix) = @_;
+        push @seen, "$prefix$row->{id}";
+    }, 'row-')->get;
+
+    is scalar(@seen), 5, 'every row was delivered';
+    is $seen[0], 'row-1', 'and the trailing argument came with it';
+
+    $conn->release;
+    $pg->shutdown->get;
+};
+
 done_testing;
