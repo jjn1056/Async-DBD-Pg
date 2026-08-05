@@ -98,15 +98,23 @@ one, tell me if I was wrong*. It applies to rows and to values alike, which is
 why the value getter is `single_value` and not `scalar`. `scalar` named a Perl
 context rather than the thing being returned.
 
-**Every hash-producing path croaks on duplicate column names** -- `rows`,
-`first`, `single`, `next`, `each`, `all`, and the lookups below:
+**Every path that builds a plain hashref croaks on duplicate column names.**
+On `Results` that is `rows`, `first`, `single`, `next`, `all`, `by` and
+`groups`; on `Cursor` it is `next`, `each` and `all`, which build their batches
+through `Results`. `Collection::each` needs no rule of its own -- by the time a
+Collection exists the hashrefs are already built, so the croak has fired.
 
     Column 'id' appears 2 times at positions 0, 1;
     alias the columns in your SQL, or use ->arrays or ->as
 
-The positional and metadata views keep working on that same result:
-`arrays`, `columns`, `types`, `count`, `rows_affected`, `is_empty`,
-`row_array`, `elapsed`.
+Three groups of methods keep working on that same result. The positional and
+metadata views -- `arrays`, `columns`, `types`, `count`, `rows_affected`,
+`is_empty`, `row_array`, `elapsed`, `preview`. The renaming view `as`, which is
+the fix. And **`multi`, which is explicitly exempt**: a `Hash::MultiValue` row
+holds every value of a repeated name, so it represents the result losslessly
+and has nothing to refuse. `multi` is the one name-addressable path that a
+duplicate-column result supports without renaming, which is its reason to
+exist.
 
 ### Views
 
@@ -397,6 +405,19 @@ right.
 
 **Query building, relationships, `update`/`delete`, schema classes.** ORM
 territory. DBIC should sit on top of this, not be replaced by it.
+
+**Removing named placeholders** was weighed here and rejected; `:name` stays.
+The case for removing it is real -- it means our own SQL parser, and it forces
+`Connection::query` to decide from the statement text whether a hashref bind is
+a name-to-value map or a single positional value such as a JSONB document.
+Against that: it works, `t/unit/placeholders.t` covers the collisions that
+motivate the concern (`::` casts, `arr[1:3]` and `arr[:2]` slices, `:id` inside
+a quoted literal, a repeated name binding once), and the only known casualty is
+an array slice with identifier bounds, which the POD already documents. DBD::Pg
+does support a native `:foo` form, but binds it through `bind_param`, which
+this library's async path does not expose -- so a pass-through would not be a
+drop-in replacement. Revisiting this needs a fresh decision, not an assumption
+that removal was always intended.
 
 ## Compatibility
 
