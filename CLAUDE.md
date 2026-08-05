@@ -82,7 +82,7 @@ DATABASE_URL="postgresql://postgres:test@localhost:5432/test" perl -Ilib example
 - **DBD::Pg-backed, not raw libpq**: Reuses the DBI ecosystem rather than binding libpq directly.
 - **Future::IO abstraction**: Works with any event loop (UV, IO::Async, etc.) - the test suite uses `Future::IO::Impl::UV`.
 - **Socket fd duplication**: Uses `POSIX::dup()` to wrap the Pg socket in an `IO::Socket` without ownership conflicts.
-- **Async connect detection**: Checks for DBD::Pg >= 3.19.0 at runtime to enable `pg_async_connect`; falls back to synchronous connect on older versions.
+- **Async connect**: `pg_async_connect` arrived in DBD::Pg 3.19.0 and the required version is 3.20.0, so async connect is always available. A runtime check and a synchronous fallback remain for older versions, which no supported install can have.
 - **Named placeholders**: `:name` syntax is converted to PostgreSQL `$N` positional params, handling string literals and `::` type casts to avoid false matches.
 
 ### Test Structure
@@ -94,5 +94,5 @@ DATABASE_URL="postgresql://postgres:test@localhost:5432/test" perl -Ilib example
 
 ### Dependencies
 
-Runtime: `Future::IO` (>= 0.23), `Future::AsyncAwait` (>= 0.66), `Future` (>= 0.49), `DBD::Pg` (>= 3.18), `DBI` (>= 1.643).
+Runtime: `Future::IO` (>= 0.23), `Future::AsyncAwait` (>= 0.66), `Future` (>= 0.49), `DBD::Pg` (>= 3.20.0), `DBI` (>= 1.643).
 Test: `Test2::V0`, `Future::IO::Impl::UV` (>= 0.07).

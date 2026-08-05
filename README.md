@@ -29,7 +29,7 @@ my $pg = Async::DBD::Pg->new(
 - **DBD::Pg-backed** - Uses DBI + DBD::Pg as the only database substrate
 - **Connection pooling** - Automatic pool management with min/max connections
 - **Async queries** - Non-blocking query execution using DBD::Pg's async support
-- **Async connect when supported** - Non-blocking connect with DBD::Pg >= 3.19.0 using Future::IO's official `poll` API
+- **Async connect** - Non-blocking connect using `pg_async_connect` and Future::IO's official `poll` API
 - **Pub/sub** - `LISTEN`, `UNLISTEN`, and `NOTIFY` over a dedicated listener connection
 - **Named placeholders** - `:name` style in addition to `$1` positional
 - **Transactions** - With savepoint support for nesting
@@ -40,7 +40,7 @@ my $pg = Async::DBD::Pg->new(
 - Perl 5.24+
 - Future::IO 0.23
 - Future::AsyncAwait 0.66+
-- DBD::Pg 3.18+ (3.19.0+ for async connect)
+- DBD::Pg 3.20.0+
 
 ### Why Perl 5.24
 
@@ -75,12 +75,9 @@ binding libpq directly.
 For queries, it uses DBD::Pg's async support and waits for PostgreSQL socket
 readiness without blocking the event loop via `Future::IO->poll`.
 
-For connection establishment, fully async connect is enabled when:
-
-- `DBD::Pg >= 3.19.0`
-
-Otherwise connect falls back to ordinary synchronous `DBI->connect`, while
-query execution remains asynchronous after the connection is established.
+Connection establishment is asynchronous too, using `pg_async_connect` and
+`pg_continue_connect`. Those arrived in DBD::Pg 3.19.0, which is part of why
+the required version is 3.20.0.
 
 ## Examples
 

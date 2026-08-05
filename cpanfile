@@ -18,10 +18,13 @@
 requires 'perl', '5.024';
 
 # Three components, deliberately. DBD::Pg declares its version with qv(),
-# so a single-decimal '3.18' is read as v3.180.0 — a release that will never
-# exist — and every install fails the prerequisite. CI caught this; nothing
+# so a single-decimal '3.20' is read as v3.200.0 -- a release that will never
+# exist -- and every install fails the prerequisite. CI caught this; nothing
 # local would have, because the tests never check the prereq.
-requires 'DBD::Pg', '3.18.0';
+#
+# 3.20.0 rather than the 3.19.0 that first shipped pg_async_connect: 3.20
+# carries async fixes this distribution depends on.
+requires 'DBD::Pg', '3.20.0';
 requires 'DBI', '1.643';
 requires 'Future', '0.49';
 requires 'Future::AsyncAwait', '0.66';

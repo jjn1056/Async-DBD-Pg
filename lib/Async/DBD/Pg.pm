@@ -1067,22 +1067,14 @@ compatible with any event loop that has a Future::IO implementation:
 Queries are asynchronous everywhere this module runs, using DBD::Pg's async
 query support combined with L<Future::IO>'s socket readiness detection.
 
-Connection establishment is capability-dependent:
+Connection establishment is asynchronous as well, using C<pg_async_connect>,
+C<pg_continue_connect>, and L<Future::IO>'s official C<poll> API. Those
+entry points arrived in DBD::Pg 3.19.0, which is part of why this
+distribution requires 3.20.0.
 
-=over 4
-
-=item *
-
-With DBD::Pg 3.19.0+, connect is performed asynchronously using
-C<pg_async_connect>, C<pg_continue_connect>, and L<Future::IO>'s official
-C<poll> API.
-
-=item *
-
-Otherwise, the module falls back to ordinary synchronous C<DBI-E<gt>connect>
-and still provides asynchronous query execution once connected.
-
-=back
+A synchronous C<DBI-E<gt>connect> fallback remains in place for a DBD::Pg
+older than 3.19.0, but no such version satisfies this distribution's
+prerequisites.
 
 =head2 Advanced DBI Access
 
