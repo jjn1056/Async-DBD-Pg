@@ -33,9 +33,12 @@ my $pg = Async::DBD::Pg->new(
 })->()->get;
 ```
 
-Several statements that must share a connection go through `with_connection`
-or `transaction`, which hold the checkout across every `await` and give it
-back however the block ends:
+`$pg->query` runs one statement on any free connection and gives it straight
+back. Statements that must see each other -- a transaction, a cursor, a
+temporary table, `SET LOCAL`, an advisory lock -- have to share one
+connection, which is what `with_connection` and `transaction` are for: they
+hold the checkout across every `await` and give it back however the block
+ends.
 
 ```perl
 await $pg->transaction(async sub {

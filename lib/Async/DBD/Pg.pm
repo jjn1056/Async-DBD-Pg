@@ -1145,6 +1145,32 @@ connection objects still expose the underlying DBI handle via C<dbh>. Direct
 handle usage is an escape hatch and is not coordinated with the wrapper's
 query scheduling or pool lifecycle.
 
+=head2 The pool and a connection
+
+Both objects answer C<query>, C<query_row>, C<query_value> and C<query_list>,
+and the difference is which connection runs them.
+
+Asking the B<pool> checks a connection out, runs the one statement, and gives
+it straight back. Each call may land on a different connection, which is what
+you want for statements that stand alone.
+
+Asking a B<connection> runs on that connection every time. That matters
+whenever two statements have to see each other: a transaction, a cursor, a
+temporary table, C<SET LOCAL>, an advisory lock, C<LISTEN>. Sending those
+through the pool would scatter them across connections and they would not
+work.
+
+So: reach for the pool by default, and get a connection when statements must
+share one -- through L</with_connection> or L</transaction>, which give it
+back for you.
+
+This is also why C<with_connection> can promise something C<connection>
+cannot. Dying inside the block unwinds the scope in the ordinary way, and the
+guard holding the checkout is released as part of that unwind -- immediately,
+not whenever the enclosing C<async sub> is eventually collected. A connection
+you took by hand has no such guard: nothing is watching the scope on your
+behalf, so nothing gives it back.
+
 =head2 Handling failures
 
 Every failure is thrown, not returned, so an ordinary C<eval> around the

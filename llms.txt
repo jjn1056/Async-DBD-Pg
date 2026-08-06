@@ -70,6 +70,10 @@ it untyped or cast in SQL. Note 'char' is PG_CHAR (1 byte); SQL CHAR(n) is
     $pg->stats;  $pg->idle_count;  $pg->active_count;  $pg->waiting_count;
     $pg->total_count;  $pg->is_healthy;  $pg->is_shut_down;  $pg->safe_dsn;
 
+Pool methods run one statement on any free connection. Use a Connection when
+statements must see each other (transaction, cursor, temp table, SET LOCAL,
+advisory lock) -- via with_connection or transaction, which release for you.
+
 Constructor options: `dsn`, `min_connections`, `max_connections`,
 `connect_timeout`, `statement_timeout`, `max_queries`, `statement_cache_size`,
 `on_connect`, `on_release`, `on_log`, `on_query`, `reconnect`.
