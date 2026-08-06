@@ -191,7 +191,7 @@ guarantee.
 LISTEN/NOTIFY on a dedicated connection. Channels are a per-database
 broadcast namespace, not a work queue.
 
-    await $pg->listen('channel', sub { my ($payload, $channel) = @_ });
+    await $pg->listen('channel', sub { my ($channel, $payload, $pid) = @_ });
     await $pg->notify('channel', $payload);
     await $pg->unlisten('channel');
     await $pg->unlisten_all;
