@@ -1031,7 +1031,13 @@ Async::DBD::Pg - Event-loop agnostic async PostgreSQL client
 =head1 SYNOPSIS
 
     use Future::AsyncAwait;
+    use Future::IO;
     use Async::DBD::Pg;
+
+    # Required. Without a real implementation loaded, Future::IO drives one
+    # filehandle at a time and puts handles into blocking mode, so a pool
+    # runs its queries one after another -- with no error and no warning.
+    BEGIN { Future::IO->load_best_impl }
 
     my $pg = Async::DBD::Pg->new(
         dsn             => 'postgresql://user:pass@host/db',
@@ -1040,13 +1046,21 @@ Async::DBD::Pg - Event-loop agnostic async PostgreSQL client
     );
 
     (async sub {
-        my $conn = await $pg->connection;
-        my $result = await $conn->query(
-            'SELECT * FROM users WHERE id = :id', { id => 1 }
-        );
-        print $result->first->{name}, "\n";
-        $conn->release;
+        # The pool checks a connection out and gives it back for each of
+        # these, so nothing can be left checked out by accident.
+        my $user  = await $pg->query_row('SELECT * FROM users WHERE id = $1', 1);
+        my $count = await $pg->query_value('SELECT count(*) FROM users');
+
+        # Statements that must share one connection go in a block, which
+        # returns the connection however the block ends -- including on death.
+        await $pg->with_connection(async sub {
+            my ($conn) = @_;
+            await $conn->query('SET LOCAL statement_timeout = 5000');
+            await $conn->query('SELECT * FROM big_report');
+        });
     })->()->get;
+
+    await $pg->shutdown(timeout => 5);
 
 =head1 DESCRIPTION
 

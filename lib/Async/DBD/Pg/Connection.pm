@@ -1229,6 +1229,8 @@ Async::DBD::Pg::Connection - Async PostgreSQL connection using Future::IO
 
 =head1 SYNOPSIS
 
+    # Setup as in Async::DBD::Pg/SYNOPSIS -- Future::IO->load_best_impl is
+    # required, or the pool runs serially.
     my $conn = await $pg->connection;
 
     # Positional placeholders

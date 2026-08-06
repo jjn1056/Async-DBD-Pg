@@ -145,6 +145,8 @@ Async::DBD::Pg::Error - Error classes for Async::DBD::Pg
 
 =head1 SYNOPSIS
 
+    # Setup as in Async::DBD::Pg/SYNOPSIS -- Future::IO->load_best_impl is
+    # required, or the pool runs serially.
     use Async::DBD::Pg::Error;
 
     eval { await $conn->query('BAD SQL') };

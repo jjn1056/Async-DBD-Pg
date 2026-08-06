@@ -190,6 +190,8 @@ Async::DBD::Pg::Cursor - Streaming cursor for large result sets
 
 =head1 SYNOPSIS
 
+    # Setup as in Async::DBD::Pg/SYNOPSIS -- Future::IO->load_best_impl is
+    # required, or the pool runs serially.
     my $cursor = await $conn->cursor(
         'SELECT * FROM large_table WHERE status = $1',
         'active',

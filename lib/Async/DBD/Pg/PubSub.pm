@@ -941,6 +941,8 @@ Async::DBD::Pg::PubSub - LISTEN/NOTIFY support for Async::DBD::Pg
 
 =head1 SYNOPSIS
 
+    # Setup as in Async::DBD::Pg/SYNOPSIS -- Future::IO->load_best_impl is
+    # required, or the pool runs serially.
     my $pubsub = $pg->pubsub;
 
     await $pubsub->listen(my_channel => sub {
