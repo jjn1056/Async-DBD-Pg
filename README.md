@@ -45,6 +45,24 @@ await $pg->transaction(async sub {
 });
 ```
 
+Failures are thrown as objects that stringify to the server's message and
+carry its diagnostics:
+
+```perl
+my $ok = eval {
+    await $pg->query('INSERT INTO users (email) VALUES ($1)', $email);
+    1;
+};
+
+if (!$ok && $@->is_unique_violation) {
+    warn "already taken: ", $@->constraint;   # users_email_key
+}
+```
+
+`is_retryable`, `is_unique_violation`, `is_foreign_key_violation` and
+`is_not_null_violation` answer on every error class, so they never need
+guarding with `can`.
+
 ## Features
 
 - **Event-loop agnostic** - Works with any Future::IO implementation (IO::Async, UV, GLib, etc.)

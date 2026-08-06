@@ -195,6 +195,9 @@ broadcast namespace, not a work queue.
 
 Failures are objects that stringify, thrown as exceptions:
 
+Thrown, not returned, so `eval { await ... ; 1 } or do { $@ }` catches them.
+Predicates answer on every class, so they need no `can` guard.
+
     Async::DBD::Pg::Error::Query          # ->state, ->state_name, ->constraint,
                                           # ->detail, ->hint, ->table, ->column,
                                           # ->is_retryable, ->is_unique_violation,

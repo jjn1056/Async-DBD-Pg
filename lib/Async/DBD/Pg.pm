@@ -1145,6 +1145,43 @@ connection objects still expose the underlying DBI handle via C<dbh>. Direct
 handle usage is an escape hatch and is not coordinated with the wrapper's
 query scheduling or pool lifecycle.
 
+=head2 Handling failures
+
+Every failure is thrown, not returned, so an ordinary C<eval> around the
+C<await> catches it. What you catch is an object that stringifies to the
+server's message and carries the detail with it:
+
+    (async sub {
+        my $ok = eval {
+            await $pg->query('INSERT INTO users (email) VALUES ($1)', $email);
+            1;
+        };
+
+        if (!$ok) {
+            my $err = $@;
+
+            if ($err->is_unique_violation) {
+                warn "already taken: ", $err->constraint;   # users_email_key
+            }
+            elsif ($err->is_retryable) {
+                # 40001 or 40P01: this transaction lost a race it may win
+                # next time. See the retry option to transaction.
+            }
+            else {
+                die $err;
+            }
+        }
+    })->()->get;
+
+The predicates answer on every error this distribution raises, not only on
+query errors, so C<< $err->is_unique_violation >> on a lost connection is
+false rather than fatal and needs no guarding.
+
+PostgreSQL reports C<constraint> for a unique violation but leaves C<column>
+undef -- it names the index that was violated, not the columns in it -- so
+mapping one back to a field is done through the constraint name. See
+L<Async::DBD::Pg::Error>.
+
 =head1 METHODS
 
 =head2 new(%args)
