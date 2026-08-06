@@ -83,6 +83,24 @@ subtest 'is_retryable names the two states PostgreSQL says to retry' => sub {
     ok !$pool_err->is_retryable, 'nor pool exhaustion';
 };
 
+subtest 'the three violation predicates answer false on a non-query error' => sub {
+    # is_unique_violation, is_foreign_key_violation and is_not_null_violation
+    # exist on Error::Query, keyed off SQLSTATE. A caller that writes
+    # `if ($err->is_unique_violation)` around an INSERT must not get "method
+    # not found" the first time the error is a dropped connection instead --
+    # same contract is_retryable already gives, answerable on any of our
+    # errors with no can() guard needed.
+    my $conn_err = Async::DBD::Pg::Error::Connection->new(message => 'x');
+    my $timeout  = Async::DBD::Pg::Error::Timeout->new(message => 'x');
+    my $pool_err = Async::DBD::Pg::Error::PoolExhausted->new(message => 'x');
+
+    for my $method (qw(is_unique_violation is_foreign_key_violation is_not_null_violation)) {
+        ok !$conn_err->$method, "connection error: $method is false";
+        ok !$timeout->$method, "timeout: $method is false";
+        ok !$pool_err->$method, "pool exhausted: $method is false";
+    }
+};
+
 subtest 'connection error' => sub {
     my $err = Async::DBD::Pg::Error::Connection->new(
         message => 'Connection refused',

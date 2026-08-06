@@ -19,6 +19,14 @@ sub message { shift->{message} }
 # query error can be retryable, and only for the two states below.
 sub is_retryable { 0 }
 
+# Answerable on every error, matching is_retryable above. Only a query error
+# carries a SQLSTATE to test; a caller branching on one of these around a
+# statement must not get "method not found" the first time the failure is a
+# dropped connection or an exhausted pool instead.
+sub is_unique_violation      { 0 }
+sub is_foreign_key_violation { 0 }
+sub is_not_null_violation    { 0 }
+
 sub throw {
     my $self = shift;
     die ref $self ? $self : $self->new(@_);
@@ -234,6 +242,11 @@ single column is at fault.
 
 These are the three worth naming. Every other code is available through
 C<state> and C<state_name>.
+
+Answerable on every error this distribution raises, not only on a query
+error, so they never need guarding with C<can>. False on anything that is
+not C<Async::DBD::Pg::Error::Query>, since only a query error carries a
+SQLSTATE to test.
 
 =head2 is_retryable
 
