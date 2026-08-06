@@ -31,11 +31,19 @@ my $pg = Async::DBD::Pg->new(
     my $rs = await $pg->query('SELECT id, name FROM users WHERE active');
     print $_->{name}, "\n" for @{ $rs->rows };
 })->()->get;
+
+await $pg->shutdown(timeout => 5);
 ```
 
-Several statements that must share a connection go through `with_connection`
-or `transaction`, which hold the checkout across every `await` and give it
-back however the block ends:
+A long-running program should shut the pool down when it is done, so
+in-flight work finishes rather than being cut off.
+
+`$pg->query` runs one statement on any free connection and gives it straight
+back. Statements that must see each other -- a transaction, a cursor, a
+temporary table, `SET LOCAL`, an advisory lock -- have to share one
+connection, which is what `with_connection` and `transaction` are for: they
+hold the checkout across every `await` and give it back however the block
+ends.
 
 ```perl
 await $pg->transaction(async sub {
@@ -44,6 +52,24 @@ await $pg->transaction(async sub {
     await $conn->query('UPDATE users SET orders = orders + 1 WHERE id = $1', $id);
 });
 ```
+
+Failures are thrown as objects that stringify to the server's message and
+carry its diagnostics:
+
+```perl
+my $ok = eval {
+    await $pg->query('INSERT INTO users (email) VALUES ($1)', $email);
+    1;
+};
+
+if (!$ok && $@->is_unique_violation) {
+    warn "already taken: ", $@->constraint;   # users_email_key
+}
+```
+
+`is_retryable`, `is_unique_violation`, `is_foreign_key_violation` and
+`is_not_null_violation` answer on every error class, so they never need
+guarding with `can`.
 
 ## Features
 
@@ -83,7 +109,8 @@ and so does `multi`, which is lossless.
 The rest of the surface:
 
 ```perl
-$rs->columns  $rs->types  $rs->count  $rs->elapsed
+$rs->columns  $rs->types  $rs->count
+$rs->elapsed        # query duration, fractional seconds
 $rs->first  $rs->single  $rs->first_value  $rs->first_list
 $rs->get_column('name')->all
 $rs->by('id')  $rs->groups('dept')  $rs->expand
@@ -99,6 +126,43 @@ my $users = $rs->map_rows(sub {
     My::User->new(id => $row->[0], name => $row->[1]);
 });
 ```
+
+## Placeholders
+
+Placeholders come in two forms, not mixable in one statement:
+
+```perl
+await $pg->query('SELECT * FROM t WHERE id = $1 AND x = $2', 1, 'a');
+await $pg->query('SELECT * FROM t WHERE id = :id', { id => 1 });
+```
+
+`?` is not a placeholder here, which leaves PostgreSQL's own operators alone:
+
+```perl
+await $pg->query(q{SELECT data ? 'key' FROM docs});   # jsonb exists
+```
+
+## Typed binds
+
+A value may state its PostgreSQL type. This is required for `bytea`: sent as
+text, a value is truncated at its first NUL byte and the write reports
+success.
+
+```perl
+use DBD::Pg qw(:pg_types);
+
+await $pg->query('INSERT INTO files (name, body) VALUES ($1, $2)',
+    $name, { type => PG_BYTEA, value => $bytes });
+
+# Or by name, which is what ->types reports and what a schema introspection
+# already holds. Matching is case-insensitive.
+await $pg->query('INSERT INTO files (name, body) VALUES ($1, $2)',
+    $name, { type => 'bytea', value => $bytes });
+```
+
+Names are DBD::Pg's `PG_*` constants lowercased. A type DBD::Pg does not know
+-- a user-defined enum, an extension type -- croaks naming the type; such a
+type needs no typed bind anyway, being text on the wire.
 
 ## Requirements
 

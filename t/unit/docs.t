@@ -90,8 +90,10 @@ my @MODULES = qw(
     lib/Async/DBD/Pg/Column.pm
     lib/Async/DBD/Pg/Connection.pm
     lib/Async/DBD/Pg/Cursor.pm
+    lib/Async/DBD/Pg/Error.pm
     lib/Async/DBD/Pg/PubSub.pm
     lib/Async/DBD/Pg/Results.pm
+    lib/Async/DBD/Pg/Util.pm
 );
 
 subtest 'every method shown in a POD example exists' => sub {
@@ -240,6 +242,69 @@ subtest 'the public API is covered by the machine reference' => sub {
 
     my @missing_pool = grep { $text !~ /\b\Q$_\E\b/ } @pool_api;
     is \@missing_pool, [], 'and every pool entry point';
+};
+
+subtest 'the machine reference shows code that compiles' => sub {
+    # This file exists to be read by code generators, so a snippet that
+    # cannot compile becomes generated code that cannot run. This check
+    # guards syntax only: each block below is wrapped in an async sub and
+    # parsed. It cannot catch a block that parses but does the wrong thing
+    # -- only running the examples against a real database would catch
+    # that.
+    open my $fh, '<', 'llms.txt' or die "cannot read llms.txt: $!";
+    my @lines = <$fh>;
+    close $fh;
+
+    # A code block is a maximal run of indented or blank lines. Two details
+    # matter and both were wrong before: a nested line indented deeper than
+    # four spaces is still part of the block, and a blank line inside a block
+    # must not split it. A block torn into fragments gets each fragment
+    # compiled alone, which can pass for reasons that have nothing to do with
+    # whether the example works.
+    my (@blocks, @current);
+    for my $line (@lines, "end-of-file sentinel\n") {
+        if ($line =~ /^(?:\s*$|\s{4})/) { push @current, $line; next }
+        push @blocks, join('', @current) if grep { /\S/ } @current;
+        @current = ();
+    }
+
+    my $checked = 0;
+    for my $code (@blocks) {
+        next unless $code =~ /\$\w+\s*->\s*\w|\bawait\b|\bAsync::DBD::Pg\b/;
+
+        # Wrapped exactly as the SYNOPSIS check wraps: an async sub gives
+        # every await a scheduling context to run in, and a reference names
+        # variables it never declares.
+        my $ok = eval "use feature 'say'; no strict; no warnings; "
+                    . "my \$unused = async sub {\n$code\n}; 1";
+        my $err = $@; $err =~ s/\s+at\s\(eval.*//s; $err =~ s/\n.*//s;
+
+        ok $ok, 'llms.txt block compiles' or diag "$err\n$code";
+        $checked++;
+    }
+
+    ok $checked >= 5, "checked a real number of blocks ($checked)";
+};
+
+subtest 'the shipped modules are ASCII' => sub {
+    # An em-dash or a smart quote reads fine in a terminal and breaks
+    # downstream consumers that assume Latin-1, and nothing else in this
+    # suite would notice. The rule is stated in every plan; this is what
+    # makes it true.
+    for my $file (@MODULES) {
+        open my $fh, '<:raw', $file or die "cannot read $file: $!";
+        my $src = do { local $/; <$fh> };
+        close $fh;
+
+        my @bad;
+        my $line = 1;
+        for my $chunk (split /(\n)/, $src) {
+            if ($chunk eq "\n") { $line++; next }
+            push @bad, "$file:$line" if $chunk =~ /([^\x00-\x7F])/;
+        }
+
+        is \@bad, [], "$file is ASCII" or diag "non-ASCII at: @bad";
+    }
 };
 
 done_testing;

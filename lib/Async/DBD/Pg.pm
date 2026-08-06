@@ -1031,7 +1031,13 @@ Async::DBD::Pg - Event-loop agnostic async PostgreSQL client
 =head1 SYNOPSIS
 
     use Future::AsyncAwait;
+    use Future::IO;
     use Async::DBD::Pg;
+
+    # Required. Without a real implementation loaded, Future::IO drives one
+    # filehandle at a time and puts handles into blocking mode, so a pool
+    # runs its queries one after another -- with no error and no warning.
+    BEGIN { Future::IO->load_best_impl }
 
     my $pg = Async::DBD::Pg->new(
         dsn             => 'postgresql://user:pass@host/db',
@@ -1040,13 +1046,24 @@ Async::DBD::Pg - Event-loop agnostic async PostgreSQL client
     );
 
     (async sub {
-        my $conn = await $pg->connection;
-        my $result = await $conn->query(
-            'SELECT * FROM users WHERE id = :id', { id => 1 }
-        );
-        print $result->first->{name}, "\n";
-        $conn->release;
+        # The pool checks a connection out and gives it back for each of
+        # these, so nothing can be left checked out by accident.
+        my $user  = await $pg->query_row('SELECT * FROM users WHERE id = $1', 1);
+        my $count = await $pg->query_value('SELECT count(*) FROM users');
+
+        # Statements that must share one connection go in a block, which
+        # returns the connection however the block ends -- including on death.
+        # A temporary table lives only for the connection that created it, so
+        # the INSERT and SELECT below can only see it because both run here.
+        await $pg->with_connection(async sub {
+            my ($conn) = @_;
+            await $conn->query('CREATE TEMPORARY TABLE ids (id int)');
+            await $conn->query('INSERT INTO ids VALUES (1), (2), (3)');
+            await $conn->query('SELECT * FROM ids');
+        });
     })->()->get;
+
+    await $pg->shutdown(timeout => 5);
 
 =head1 DESCRIPTION
 
@@ -1073,6 +1090,72 @@ own operators
 =item * LISTEN/NOTIFY pub/sub support
 
 =back
+
+=head2 The pool and a connection
+
+Both objects answer C<query>, C<query_row>, C<query_value> and C<query_list>,
+and the difference is which connection runs them.
+
+Asking the B<pool> checks a connection out, runs the one statement, and gives
+it straight back. Each call may land on a different connection, which is what
+you want for statements that stand alone.
+
+Asking a B<connection> runs on that connection every time. That matters
+whenever two statements have to see each other: a transaction, a cursor, a
+temporary table, C<SET LOCAL>, an advisory lock. Sending those through the
+pool would scatter them across connections and they would not work.
+
+C<LISTEN> is not on that list: it needs a connection dedicated to it for the
+life of the subscription, not one borrowed from the pool and given back. See
+L<Async::DBD::Pg::PubSub>.
+
+So: reach for the pool by default, and get a connection when statements must
+share one -- through L</with_connection> or L</transaction>, which give it
+back for you.
+
+This is also why C<with_connection> can promise something C<connection>
+cannot. Dying inside the block unwinds the scope in the ordinary way, and the
+guard holding the checkout is released as part of that unwind -- immediately,
+not whenever the enclosing C<async sub> is eventually collected. A connection
+you took by hand has no such guard: nothing is watching the scope on your
+behalf, so nothing gives it back.
+
+=head2 Handling failures
+
+Every failure is thrown, not returned, so an ordinary C<eval> around the
+C<await> catches it. What you catch is an object that stringifies to the
+server's message and carries the detail with it:
+
+    (async sub {
+        my $ok = eval {
+            await $pg->query('INSERT INTO users (email) VALUES ($1)', $email);
+            1;
+        };
+
+        if (!$ok) {
+            my $err = $@;
+
+            if ($err->is_unique_violation) {
+                warn "already taken: ", $err->constraint;   # users_email_key
+            }
+            elsif ($err->is_retryable) {
+                # 40001 or 40P01: this transaction lost a race it may win
+                # next time. See the retry option to transaction.
+            }
+            else {
+                die $err;
+            }
+        }
+    })->()->get;
+
+The predicates answer on every error this distribution raises, not only on
+query errors, so C<< $err->is_unique_violation >> on a lost connection is
+false rather than fatal and needs no guarding.
+
+PostgreSQL reports C<constraint> for a unique violation but leaves C<column>
+undef -- it names the index that was violated, not the columns in it -- so
+mapping one back to a field is done through the constraint name. See
+L<Async::DBD::Pg::Error>.
 
 =head2 Why Perl 5.24 Is Required
 
@@ -1425,8 +1508,27 @@ flapping is visible rather than silently absorbed.
 =head2 connection
 
     my $conn = await $pg->connection;
+    ...
+    $conn->release;
 
-Get a connection from the pool. Returns a L<Async::DBD::Pg::Connection>.
+Check a connection out of the pool. Returns a
+L<Async::DBD::Pg::Connection>.
+
+B<You must release it, and a connection that is not released is gone for the
+life of the pool.> Destruction would return it, but an C<async sub> holds its
+lexicals until the sub itself is collected, so in practice the destructor does
+not run and the slot is never recovered. A pool that loses every slot this way
+stops answering: callers queue on C<connection> until C<queue_timeout> and then
+fail with L<Async::DBD::Pg::Error::PoolExhausted>.
+
+Releasing at the end of the block is not enough either, because anything that
+dies in between skips it -- including a query that fails, which is not an
+unusual event.
+
+Prefer L</with_connection> or L</transaction>, which hold the checkout across
+every C<await> and give it back however the block ends, death included. Reach
+for C<connection> only when the checkout has to outlive a single block, and
+then release it in the same place you would close a filehandle.
 
 =head2 query
 

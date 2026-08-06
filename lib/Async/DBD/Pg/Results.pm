@@ -591,6 +591,8 @@ Async::DBD::Pg::Results - Query result wrapper
 
 =head1 SYNOPSIS
 
+    # Setup as in Async::DBD::Pg/SYNOPSIS -- Future::IO->load_best_impl is
+    # required, or the pool runs serially.
     my $result = await $conn->query('SELECT id, name FROM users');
 
     say $result->count, ' rows';

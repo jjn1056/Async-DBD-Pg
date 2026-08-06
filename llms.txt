@@ -11,13 +11,22 @@ Requires Perl 5.24+, DBD::Pg 3.20.0+.
     use Future::AsyncAwait;
     use Future::IO;
     use Async::DBD::Pg;
+
+    # Required: without it Future::IO drives one filehandle at a time and
+    # the pool runs serially, with no error and no warning.
     BEGIN { Future::IO->load_best_impl }
 
     my $pg = Async::DBD::Pg->new(dsn => 'postgresql://user:pass@host/db');
 
-    my $row   = await $pg->query_row('SELECT * FROM users WHERE id = $1', 42);
-    my $count = await $pg->query_value('SELECT count(*) FROM users');
-    my $rs    = await $pg->query('SELECT id, name FROM users');
+    # Grouped in an async sub so these awaits run as one scheduled unit,
+    # instead of each one blocking the script in turn at file scope.
+    (async sub {
+        my $row   = await $pg->query_row('SELECT * FROM users WHERE id = $1', 42);
+        my $count = await $pg->query_value('SELECT count(*) FROM users');
+        my $rs    = await $pg->query('SELECT id, name FROM users');
+    })->()->get;
+
+    await $pg->shutdown(timeout => 5);
 
 ## Placeholders
 
@@ -48,22 +57,28 @@ it untyped or cast in SQL. Note 'char' is PG_CHAR (1 byte); SQL CHAR(n) is
 
 ## Pool: Async::DBD::Pg
 
-    Async::DBD::Pg->new(dsn => $dsn, min_connections => 2, max_connections => 10)
-    await $pg->query($sql, @bind)        # Results
-    await $pg->query_row($sql, @bind)    # one hashref, or undef
-    await $pg->query_value($sql, @bind)  # one value, or undef
-    await $pg->query_list($sql, @bind)   # one row as a list: my ($id, $name) = ...
-    await $pg->connection                # check out a Connection yourself
-    await $pg->with_connection($code, @args)  # scoped checkout, always released
-    await $pg->transaction($code, @args)      # commit, or rollback and rethrow
-    await $pg->shutdown(timeout => 5)
-    $pg->on_query(sub { my ($e) = @_ })  # {sql, binds, elapsed, rows, error, cached, connection}
-    $pg->server_version                  # 160014, integer, for feature gating
-    $pg->stats  $pg->idle_count  $pg->active_count  $pg->waiting_count
-    $pg->total_count  $pg->is_healthy  $pg->is_shut_down  $pg->safe_dsn
+    Async::DBD::Pg->new(dsn => $dsn, min_connections => 2, max_connections => 10);
+    await $pg->query($sql, @bind);        # Results
+    await $pg->query_row($sql, @bind);    # one hashref, or undef
+    await $pg->query_value($sql, @bind);  # one value, or undef
+    await $pg->query_list($sql, @bind);   # one row as a list: my ($id, $name) = ...
+                                          # in scalar context: the first value only
+    await $pg->connection;                # check out a Connection yourself
+    await $pg->with_connection($code, @args);  # scoped checkout, always released
+    await $pg->transaction($code, @args);      # commit, or rollback and rethrow
+    await $pg->shutdown(timeout => 5);
+    $pg->on_query(sub { my ($e) = @_ });  # {sql, binds, elapsed, rows, error, cached, connection}
+    $pg->server_version;                  # 160014, integer, for feature gating
+    $pg->stats;  $pg->idle_count;  $pg->active_count;  $pg->waiting_count;
+    $pg->total_count;  $pg->is_healthy;  $pg->is_shut_down;  $pg->safe_dsn;
+
+Pool methods run one statement on any free connection. Use a Connection when
+statements must see each other (transaction, cursor, temp table, SET LOCAL,
+advisory lock) -- via with_connection or transaction, which release for you.
 
 Constructor options: `dsn`, `min_connections`, `max_connections`,
-`connect_timeout`, `statement_timeout`, `max_queries`, `statement_cache_size`,
+`idle_timeout`, `queue_timeout`, `connect_timeout`, `statement_timeout`,
+`max_queries`, `statement_cache_size`, `heal_dead_connections` (default on),
 `on_connect`, `on_release`, `on_log`, `on_query`, `reconnect`.
 
 `statement_cache_size` defaults to 0 (off) and caches only statements carrying
@@ -77,49 +92,49 @@ over. A transaction holds its connection across every await inside the body.
 
 ## Connection: Async::DBD::Pg::Connection
 
-    await $conn->query($sql, @bind)
-    await $conn->query($sql, @bind, { timeout => 5 })
-    await $conn->query_row($sql, @bind)
-    await $conn->query_value($sql, @bind)
-    await $conn->transaction($code, @args)   # nests via savepoints
-    await $conn->transaction({ retry => 3 }, $code)  # retries 40001/40P01 only
-    await $conn->advisory_lock($key)         # xact-scoped; inside a transaction
-    await $conn->try_advisory_lock($key)     # false rather than waiting
-    await $conn->cursor($sql, @bind, { batch_size => 100 })
-    $conn->cancel  $conn->release  $conn->dbh
-    $conn->in_transaction  $conn->is_released  $conn->query_count
-    $conn->id  $conn->server_version
+    await $conn->query($sql, @bind);
+    await $conn->query($sql, @bind, { timeout => 5 });
+    await $conn->query_row($sql, @bind);
+    await $conn->query_value($sql, @bind);
+    await $conn->transaction($code, @args);   # nests via savepoints
+    await $conn->transaction({ retry => 3 }, $code);  # retries 40001/40P01 only
+    await $conn->advisory_lock($key);         # xact-scoped; inside a transaction
+    await $conn->try_advisory_lock($key);     # false rather than waiting
+    await $conn->cursor($sql, @bind, { batch_size => 100 });
+    $conn->cancel;  $conn->release;  $conn->dbh;
+    $conn->in_transaction;  $conn->is_released;  $conn->query_count;
+    $conn->id;  $conn->server_version;
 
 ## Results: Async::DBD::Pg::Results
 
 Rows are stored positionally; hashes are derived on demand.
 
-    $r->rows          # Collection of hashrefs   (croaks if names repeat)
-    $r->arrays        # Collection of arrayrefs  (always works)
-    $r->columns       # ['id', 'name']
-    $r->types         # ['int4', 'text']
-    $r->count  $r->rows_affected  $r->is_empty  $r->elapsed
+    $r->rows;         # Collection of hashrefs   (croaks if names repeat)
+    $r->arrays;       # Collection of arrayrefs  (always works)
+    $r->columns;      # ['id', 'name']
+    $r->types;        # ['int4', 'text']
+    $r->count;  $r->rows_affected;  $r->is_empty;  $r->elapsed;
 
-    $r->first         # first row, or undef  (croaks if names repeat)
-    $r->single        # first row, warns if more than one matched
-    $r->first_value   # first column of first row, no complaint
-    $r->single_value  # same, but warns if more than one row matched
-    $r->first_list    # my ($id, $name) = $r->first_list  (arrayref in scalar ctx)
-    $r->single_list   # same, but warns if more than one row matched
-    $r->row_array($i) # one row, positional
-    $r->next  $r->reset  $r->all
-    $r->get_column($name_or_index)   # a Column
-    $r->preview       # short typed table for logs and debugging
-    $r->map_rows(sub { my ($row, $names) = @_; ... })  # Collection, positional
+    $r->first;        # first row, or undef  (croaks if names repeat)
+    $r->single;       # first row, warns if more than one matched
+    $r->first_value;  # first column of first row, no complaint
+    $r->single_value; # same, but warns if more than one row matched
+    $r->first_list;   # my ($id, $name) = $r->first_list  (arrayref in scalar ctx)
+    $r->single_list;  # same, but warns if more than one row matched
+    $r->row_array($i); # one row, positional
+    $r->next;  $r->reset;  $r->all;
+    $r->get_column($name_or_index);  # a Column
+    $r->preview;      # short typed table for logs and debugging
+    $r->map_rows(sub { my ($row, $names) = @_; ... }); # Collection, positional
 
 Views (new object, shared rows, own iterator position):
 
-    $r->as(['a_id', 'b_id'])         # rename all, by position
-    $r->as({ 0 => 'a_id' })          # rename some, by index
-    $r->multi                        # Hash::MultiValue rows, lossless
-    $r->expand                       # decode json/jsonb columns
-    $r->by('id')                     # { 42 => $row }, croaks if keys repeat
-    $r->groups('dept')               # { eng => Collection }, lossless
+    $r->as(['a_id', 'b_id']);        # rename all, by position
+    $r->as({ 0 => 'a_id' });         # rename some, by index
+    $r->multi;                       # Hash::MultiValue rows, lossless
+    $r->expand;                      # decode json/jsonb columns
+    $r->by('id');                    # { 42 => $row }, croaks if keys repeat
+    $r->groups('dept');              # { eng => Collection }, lossless
 
 ### Repeated column names
 
@@ -136,22 +151,22 @@ Positional access still works on that result: `arrays`, `row_array`,
 
 ## Collection: Async::DBD::Pg::Collection
 
-A blessed arrayref, so `@$collection`, `$collection->[0]`, `map`, `grep`,
-`sort` all work.
+A blessed arrayref, so the builtins apply directly: `@$collection`,
+`$collection->[0]`, `map { ... } @$collection`.
 
-    $collection->size  $collection->first  $collection->last
-    $collection->each($cb, @args)
-    $collection->compact    # drops undef only, not '' or 0
-    $collection->join($sep)  $collection->to_array
+    $collection->size;  $collection->first;  $collection->last;
+    $collection->each($cb, @args);
+    $collection->compact;   # drops undef only, not '' or 0
+    $collection->join($sep);  $collection->to_array;
 
 No `map`/`grep`/`sort`/`reduce` methods: the builtins are shorter and it is
 already an arrayref.
 
 ## Column: Async::DBD::Pg::Column
 
-    $col->name  $col->index
-    $col->all         # Collection of values
-    $col->first  $col->next  $col->reset
+    $col->name;  $col->index;
+    $col->all;        # Collection of values
+    $col->first;  $col->next;  $col->reset;
 
 `next` yields values, so a NULL, `''` or `0` ends a `while (my $v = ...)`
 loop early. Test with `defined`, or use `all`.
@@ -165,7 +180,7 @@ Streams a large result without holding it in memory.
     await $cur->each(sub { my ($row) = @_ }, @args);
     await $cur->all;                             # Collection of rows
     await $cur->close;
-    $cur->name  $cur->batch_size  $cur->is_exhausted  $cur->is_closed
+    $cur->name;  $cur->batch_size;  $cur->is_exhausted;  $cur->is_closed;
 
 `batch_size` is rows per round trip, not what `next` returns. No `reset`: a
 server-side cursor is consumed, and re-running the query is a different
@@ -181,11 +196,13 @@ broadcast namespace, not a work queue.
     await $pg->unlisten('channel');
     await $pg->unlisten_all;
     my $ps = $pg->pubsub;
-    $ps->is_connected  $ps->subscribed_channels
+    $ps->is_connected;  $ps->subscribed_channels;
 
 ## Errors
 
-Failures are objects that stringify, thrown as exceptions:
+Failures are objects that stringify. Thrown, not returned, so `eval { await
+... ; 1 } or do { $@ }` catches them. Predicates answer on every class, so
+they need no `can` guard:
 
     Async::DBD::Pg::Error::Query          # ->state, ->state_name, ->constraint,
                                           # ->detail, ->hint, ->table, ->column,
