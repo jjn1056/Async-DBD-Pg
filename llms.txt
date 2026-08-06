@@ -109,32 +109,32 @@ over. A transaction holds its connection across every await inside the body.
 
 Rows are stored positionally; hashes are derived on demand.
 
-    $r->rows          # Collection of hashrefs   (croaks if names repeat)
-    $r->arrays        # Collection of arrayrefs  (always works)
-    $r->columns       # ['id', 'name']
-    $r->types         # ['int4', 'text']
-    $r->count  $r->rows_affected  $r->is_empty  $r->elapsed
+    $r->rows;         # Collection of hashrefs   (croaks if names repeat)
+    $r->arrays;       # Collection of arrayrefs  (always works)
+    $r->columns;      # ['id', 'name']
+    $r->types;        # ['int4', 'text']
+    $r->count;  $r->rows_affected;  $r->is_empty;  $r->elapsed;
 
-    $r->first         # first row, or undef  (croaks if names repeat)
-    $r->single        # first row, warns if more than one matched
-    $r->first_value   # first column of first row, no complaint
-    $r->single_value  # same, but warns if more than one row matched
-    $r->first_list    # my ($id, $name) = $r->first_list  (arrayref in scalar ctx)
-    $r->single_list   # same, but warns if more than one row matched
-    $r->row_array($i) # one row, positional
-    $r->next  $r->reset  $r->all
-    $r->get_column($name_or_index)   # a Column
-    $r->preview       # short typed table for logs and debugging
-    $r->map_rows(sub { my ($row, $names) = @_; ... })  # Collection, positional
+    $r->first;        # first row, or undef  (croaks if names repeat)
+    $r->single;       # first row, warns if more than one matched
+    $r->first_value;  # first column of first row, no complaint
+    $r->single_value; # same, but warns if more than one row matched
+    $r->first_list;   # my ($id, $name) = $r->first_list  (arrayref in scalar ctx)
+    $r->single_list;  # same, but warns if more than one row matched
+    $r->row_array($i); # one row, positional
+    $r->next;  $r->reset;  $r->all;
+    $r->get_column($name_or_index);  # a Column
+    $r->preview;      # short typed table for logs and debugging
+    $r->map_rows(sub { my ($row, $names) = @_; ... }); # Collection, positional
 
 Views (new object, shared rows, own iterator position):
 
-    $r->as(['a_id', 'b_id'])         # rename all, by position
-    $r->as({ 0 => 'a_id' })          # rename some, by index
-    $r->multi                        # Hash::MultiValue rows, lossless
-    $r->expand                       # decode json/jsonb columns
-    $r->by('id')                     # { 42 => $row }, croaks if keys repeat
-    $r->groups('dept')               # { eng => Collection }, lossless
+    $r->as(['a_id', 'b_id']);        # rename all, by position
+    $r->as({ 0 => 'a_id' });         # rename some, by index
+    $r->multi;                       # Hash::MultiValue rows, lossless
+    $r->expand;                      # decode json/jsonb columns
+    $r->by('id');                    # { 42 => $row }, croaks if keys repeat
+    $r->groups('dept');              # { eng => Collection }, lossless
 
 ### Repeated column names
 
@@ -154,19 +154,19 @@ Positional access still works on that result: `arrays`, `row_array`,
 A blessed arrayref, so the builtins apply directly: `@$collection`,
 `$collection->[0]`, `map { ... } @$collection`.
 
-    $collection->size  $collection->first  $collection->last
-    $collection->each($cb, @args)
-    $collection->compact    # drops undef only, not '' or 0
-    $collection->join($sep)  $collection->to_array
+    $collection->size;  $collection->first;  $collection->last;
+    $collection->each($cb, @args);
+    $collection->compact;   # drops undef only, not '' or 0
+    $collection->join($sep);  $collection->to_array;
 
 No `map`/`grep`/`sort`/`reduce` methods: the builtins are shorter and it is
 already an arrayref.
 
 ## Column: Async::DBD::Pg::Column
 
-    $col->name  $col->index
-    $col->all         # Collection of values
-    $col->first  $col->next  $col->reset
+    $col->name;  $col->index;
+    $col->all;        # Collection of values
+    $col->first;  $col->next;  $col->reset;
 
 `next` yields values, so a NULL, `''` or `0` ends a `while (my $v = ...)`
 loop early. Test with `defined`, or use `all`.

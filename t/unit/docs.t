@@ -270,11 +270,11 @@ subtest 'the machine reference shows code that compiles' => sub {
 
     my $checked = 0;
     for my $code (@blocks) {
-        next unless $code =~ /\bawait\b|\bAsync::DBD::Pg\b/;
+        next unless $code =~ /\$\w+\s*->\s*\w|\bawait\b|\bAsync::DBD::Pg\b/;
 
-        # Wrapped exactly as the SYNOPSIS check wraps: await is legal only
-        # inside an async sub, and a reference names variables it never
-        # declares.
+        # Wrapped exactly as the SYNOPSIS check wraps: an async sub gives
+        # every await a scheduling context to run in, and a reference names
+        # variables it never declares.
         my $ok = eval "use feature 'say'; no strict; no warnings; "
                     . "my \$unused = async sub {\n$code\n}; 1";
         my $err = $@; $err =~ s/\s+at\s\(eval.*//s; $err =~ s/\n.*//s;
