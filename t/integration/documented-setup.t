@@ -106,15 +106,16 @@ subtest 'the README synopsis runs against a real database' => sub {
     # docs.t proves the examples parse and name real methods. It cannot
     # prove they work, which is the class of bug that put a serialized
     # example in front of every new reader for months.
+    # The guard DROP below always finds nothing to drop -- the last statement
+    # in this subtest is an unconditional DROP TABLE, so the table never
+    # survives between runs -- and the resulting NOTICE would otherwise reach
+    # this suite's default on_log, which warns to stderr. Captured and
+    # asserted rather than silently discarded, so a log line this subtest
+    # does not expect still fails it instead of vanishing.
+    my @logs;
     my $pg = Async::DBD::Pg->new(
         dsn => test_dsn(), min_connections => 2, max_connections => 10,
-        # The guard DROP below always finds nothing to drop -- the last
-        # statement in this subtest is an unconditional DROP TABLE, so the
-        # table never survives between runs -- and the resulting NOTICE
-        # otherwise reaches this suite's default on_log, which warns to
-        # stderr. Benign, and not pristine, so it is swallowed here the way
-        # on_log exists to let a caller do.
-        on_log => sub { },
+        on_log => sub { push @logs, "$_[0]: $_[1]" },
     );
 
     (async sub {
@@ -135,6 +136,9 @@ subtest 'the README synopsis runs against a real database' => sub {
 
         await $pg->query('DROP TABLE readme_users');
     })->()->get;
+
+    is [ grep { !/does not exist, skipping/ } @logs ], [],
+        'no unexpected log output';
 
     $pg->shutdown(timeout => 10)->get;
 };
