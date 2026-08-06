@@ -13,7 +13,7 @@
 - Never run Perl tooling under system perl. Prefix: `source ~/perl5/perlbrew/etc/bashrc && perlbrew use perl-5.42.2@default`
 - Database on **port 5433**: `TEST_PG_DSN="postgresql://postgres:test@localhost:5433/test"`
 - Baseline: **315 tests, 22 files, pristine**, via `prove -r -l t/`.
-- **POD must be ASCII.** Use `--`, never an em-dash. Markdown files may use them.
+- **POD must be ASCII.** Use `--`, never an em-dash. Markdown files may use them. Note this is currently a convention, not an enforced rule: there is no `xt/` in this checkout and no ASCII assertion in `t/`; `[PodSyntaxTests]` checks POD syntax via podchecker, not character set. Task 7 makes it enforced.
 - Test output MUST be pristine.
 - `llms.txt` has a token budget enforced by `t/unit/docs.t`. Check it still passes after every edit there; prefer replacing words over adding them.
 - Documentation claims must be true of the installed stack. Where this plan states a measurement, it was taken; do not restate it differently.
@@ -710,15 +710,53 @@ Keep it in step with the README: if the synopsis changes, this changes.
 
 Expected: 22 files, pristine, with the new counts.
 
-- [ ] **Step 3: Verify the docs still hold together**
+- [ ] **Step 3: Make the ASCII rule enforced rather than merely observed**
+
+Every plan in this repository states that POD must be ASCII, but nothing
+checks it: there is no `xt/` directory, and `[PodSyntaxTests]` generates a
+podchecker test, which validates POD syntax and says nothing about character
+set. The rule has held by discipline. A single smart quote pasted into a POD
+example would pass every test in the suite.
+
+Add to `t/unit/docs.t`, before `done_testing`:
+
+```perl
+subtest 'the shipped modules are ASCII' => sub {
+    # An em-dash or a smart quote reads fine in a terminal and breaks
+    # downstream consumers that assume Latin-1, and nothing else in this
+    # suite would notice. The rule is stated in every plan; this is what
+    # makes it true.
+    for my $file (@MODULES) {
+        open my $fh, '<:raw', $file or die "cannot read $file: $!";
+        my $src = do { local $/; <$fh> };
+        close $fh;
+
+        my @bad;
+        my $line = 1;
+        for my $chunk (split /(\n)/, $src) {
+            if ($chunk eq "\n") { $line++; next }
+            push @bad, "$file:$line" if $chunk =~ /([^\x00-\x7F])/;
+        }
+
+        is \@bad, [], "$file is ASCII" or diag "non-ASCII at: @bad";
+    }
+};
+```
+
+Then verify the generated release check still passes:
 
 ```bash
 source ~/perl5/perlbrew/etc/bashrc && perlbrew use perl-5.42.2@default && \
-podchecker lib/Async/DBD/Pg.pm lib/Async/DBD/Pg/*.pm && \
-LC_ALL=C grep -n '[^[:print:][:space:]]' lib/Async/DBD/Pg.pm lib/Async/DBD/Pg/*.pm
+podchecker lib/Async/DBD/Pg.pm lib/Async/DBD/Pg/*.pm
 ```
 
-Expected: `pod syntax OK` for each, no grep output (POD stays ASCII).
+Expected: `pod syntax OK` for each, and the new subtest green.
+
+- [ ] **Step 3a: Mutation check the ASCII test**
+
+Commit first. Put a single em-dash into a POD line in `lib/Async/DBD/Pg.pm`
+and confirm the new subtest fails naming that file and line. Restore with
+`git checkout`.
 
 - [ ] **Step 4: Commit**
 
