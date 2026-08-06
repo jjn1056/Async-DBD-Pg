@@ -117,17 +117,36 @@ it can bind. `types()` already reports names, so accepting them closes the
 loop and lets the mapper auto-type every bind it generates without importing
 `:pg_types` at all.
 
-**Resolved from `pg_type`, not a hardcoded table.** The constants are the
-catalog OIDs, so the catalog is both the authoritative and the complete
-source, covering the 600-plus types a hardcoded map would miss -- extension
-types, enums, and anything the application defined itself. The mapper is
-reading `pg_catalog` anyway.
+**Resolved by asking PostgreSQL, not from a hardcoded table.** The constants
+are the catalog OIDs, so the catalog is both authoritative and complete.
+Resolution goes through `to_regtype`, which is how PostgreSQL itself reads a
+type name: it honours `search_path` and returns NULL for a name it does not
+know rather than raising. Measured:
 
-**Loaded lazily, cached on the pool.** One `SELECT typname, oid FROM pg_type`
-the first time a bind names a type. Nothing is paid by anyone who never uses
-the feature, and a pool addresses one database, so one map serves every
-connection in it. Restricted to the `pg_catalog` namespace, since `typname` is
-not unique across schemas.
+    bytea       -> 17      int4range   -> 3904
+    jsonb       -> 3802    probe_mood  -> 64937   (a user-defined enum)
+    timestamptz -> 1184    text[]      -> 1009
+    no_such_type_at_all -> NULL
+
+An earlier draft of this spec said to load `SELECT typname, oid FROM pg_type`
+restricted to the `pg_catalog` namespace. That was self-contradictory and is
+recorded here rather than quietly dropped: a user-defined enum lives in
+`public`, so a `pg_catalog`-only map cannot see it, while the same paragraph
+claimed the design covered enums. Confirmed by measurement -- the catalog-only
+query returns nothing for `probe_mood`. `to_regtype` resolves it, needs no
+namespace rule, and handles array spellings like `text[]` at no extra cost.
+
+**Resolved lazily, cached on the pool, one name at a time.** The first bind
+naming a given type costs one round trip; every later bind of that type costs
+none. Nothing is paid by anyone who never names a type, and a pool addresses
+one database, so one cache serves every connection in it. An application uses
+a handful of distinct types, so this is a handful of round trips for the life
+of the process -- cheaper in practice than loading a 629-row map, and exactly
+correct where the map was ambiguous.
+
+**The lookup runs on the connection already in hand.** Checking out a second
+connection to resolve a type would deadlock a pool of size one, whose only
+connection is the one waiting on the resolution.
 
 **An implementation constraint that decides the shape.** The bind loop runs
 inside a synchronous closure passed to `_capture_pg_notices`, inside an
@@ -195,10 +214,11 @@ Not the order the mapper consumes them, because change 1 is nearly finished:
    constant. Round-tripped through `bytea` with an embedded NUL, since a
    silently truncated write is the failure being prevented.
 8. A named type resolves for a type absent from any hardcoded list -- an enum
-   created by the test -- which is what distinguishes the catalog from a
-   table.
-9. The catalog is read at most once per pool, asserted by counting queries
-   through `on_query`, and not at all when no bind names a type.
+   created by the test -- which is what distinguishes asking PostgreSQL from
+   consulting a table.
+9. Each distinct type name is resolved at most once per pool, asserted by
+   counting resolutions through `on_query`, and none is resolved when no bind
+   names a type.
 10. An unknown type name croaks and names the type.
 11. `server_version` is an integer and matches the server.
 12. `on_query` reports a stable connection identifier: two statements on one
@@ -218,8 +238,9 @@ this would be implicit on the way in, which only looks symmetric.
 
 **A hashref-passing `map_rows`** -- see change 2.
 
-**Schema-qualified type names.** The catalog map covers `pg_catalog`. A type
-in another namespace can still be bound by OID.
+**A bulk type map.** Resolution is per name. Loading all 629 catalog rows up
+front would still miss anything outside `pg_catalog` and would need a
+namespace rule that `to_regtype` does not.
 
 ## Risk
 
