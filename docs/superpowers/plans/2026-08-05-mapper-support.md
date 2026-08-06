@@ -1040,8 +1040,14 @@ requirement and what would break it.
 
 Restructuring `_execute_once` to capture before releasing would make the
 ordering structural rather than incidental, but it is three lines that no
-test can hold in place, which is why it is not in the plan. **This needs sign-off
-before Task 3 is marked done.**
+test can hold in place, which is why it is not in the plan.
+
+**RESOLVED.** John signed off on the comment-only approach: the test plus the
+comment, no restructure. The residual risk is accepted and recorded here --
+if a future edit moves the capture past the handle's destruction, the
+diagnostics come back empty rather than wrong, and empty reads as "this error
+carried no detail", which is a plausible thing for an error to be. The comment
+at both release sites is what a reader has to go on.
 
 ## Verification
 
