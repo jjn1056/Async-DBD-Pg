@@ -1019,7 +1019,11 @@ git commit -m "Expose the server version and give each connection an id"
 
 - [ ] **Step 10: Mutation check**
 
-Commit first (done above). Change `id => $self->{_next_connection_id}++,` to `id => 1,`. Expect the `isnt $a->id, $b->id` assertion and the event-attribution assertion to fail. Restore with `git checkout lib/Async/DBD/Pg.pm`.
+Commit first (done above). Change `id => $self->{_next_connection_id}++,` to `id => 1,`. Expect the `isnt $a->id, $b->id` assertion to fail, which fails the file.
+
+Note what does NOT fail, because it says something about the test: the event-attribution assertion builds its expected side out of `$a->id` and `$b->id`, so when the mutation makes both `1` the expected and actual sides are both `[1,1,1]` and it passes. That assertion is therefore not an independent check of per-connection attribution -- it verifies attribution only on the assumption that ids are already unique, which the neighbouring `isnt` is what establishes. It still catches a missing or misattributed `connection` key given distinct ids.
+
+Restore with `git checkout lib/Async/DBD/Pg.pm`.
 
 ---
 
