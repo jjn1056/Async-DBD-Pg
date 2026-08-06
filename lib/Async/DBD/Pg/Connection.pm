@@ -645,6 +645,14 @@ async sub _execute_once {
 
     if ($@ || !defined $rv) {
         my $err = $@ || $sth->errstr || $dbh->errstr;
+        # release evicts the cached entry, and dropping the last reference to
+        # a statement handle sends DEALLOCATE -- a statement on this
+        # connection, which is what pg_error_field documents as resetting
+        # every diagnostic field. _throw_query_error reads those fields on the
+        # next line and still gets them, because the $sth lexical above holds
+        # the handle until this frame unwinds. Anything that drops that
+        # reference earlier, or moves the capture later, silently empties
+        # every diagnostic on Error::Query.
         $statement->release;
         $self->_throw_query_error($err, $sql);
     }
@@ -655,6 +663,14 @@ async sub _execute_once {
     my $result = eval { $self->_capture_pg_notices(sub { $dbh->pg_result }) };
     if ($@ || !$result) {
         my $err = $@ || $dbh->errstr;
+        # release evicts the cached entry, and dropping the last reference to
+        # a statement handle sends DEALLOCATE -- a statement on this
+        # connection, which is what pg_error_field documents as resetting
+        # every diagnostic field. _throw_query_error reads those fields on the
+        # next line and still gets them, because the $sth lexical above holds
+        # the handle until this frame unwinds. Anything that drops that
+        # reference earlier, or moves the capture later, silently empties
+        # every diagnostic on Error::Query.
         $statement->release;
         $self->_throw_query_error($err, $sql);
     }
