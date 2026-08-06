@@ -34,24 +34,25 @@ use constant {
 # ---------------------------------------------------------------- schema
 
 async sub setup_schema {
-    my $conn = await $pg->connection;
+    await $pg->with_connection(async sub {
+        my ($conn) = @_;
 
-    await $conn->query('SET client_min_messages TO warning');
-    await $conn->query('DROP TABLE IF EXISTS jobs');
-    await $conn->query(q{
-        CREATE TABLE jobs (
-            id           SERIAL PRIMARY KEY,
-            type         TEXT NOT NULL,
-            payload      JSONB NOT NULL,
-            status       TEXT NOT NULL DEFAULT 'pending',
-            created_at   TIMESTAMPTZ DEFAULT NOW(),
-            completed_at TIMESTAMPTZ,
-            result       JSONB
-        )
+        await $conn->query('SET client_min_messages TO warning');
+        await $conn->query('DROP TABLE IF EXISTS jobs');
+        await $conn->query(q{
+            CREATE TABLE jobs (
+                id           SERIAL PRIMARY KEY,
+                type         TEXT NOT NULL,
+                payload      JSONB NOT NULL,
+                status       TEXT NOT NULL DEFAULT 'pending',
+                created_at   TIMESTAMPTZ DEFAULT NOW(),
+                completed_at TIMESTAMPTZ,
+                result       JSONB
+            )
+        });
+        await $conn->query('CREATE INDEX jobs_status_idx ON jobs(status)');
     });
-    await $conn->query('CREATE INDEX jobs_status_idx ON jobs(status)');
 
-    $conn->release;
     print "Schema created.\n\n";
 }
 
@@ -93,12 +94,10 @@ async sub produce_jobs {
     for my $job (@jobs) {
         my ($type, $payload) = @$job;
 
-        my $conn = await $pg->connection;
-        my $row = await $conn->query(
+        my $row = await $pg->query(
             'INSERT INTO jobs (type, payload) VALUES ($1, $2::jsonb) RETURNING id',
             $type, $json->encode($payload),
         );
-        $conn->release;
 
         my $id = $row->first->{id};
         print "  queued job #$id ($type)\n";
@@ -142,15 +141,38 @@ async sub claim_job {
     return $job;
 }
 
-sub do_the_work {
-    my ($job) = @_;
+async sub do_the_work {
+    my ($conn, $job) = @_;
 
     my $payload = ref $job->{payload} ? $job->{payload} : $json->decode($job->{payload});
 
     return { sent      => 1, to   => $payload->{to}   } if $job->{type} eq 'email';
     return { generated => 1, name => $payload->{name} } if $job->{type} eq 'report';
 
-    die "unknown job type '$job->{type}'\n";
+    die "unknown job type '$job->{type}'\n" unless $job->{type} eq 'broken';
+
+    # The 'broken' type simulates a handler bug: it re-inserts this job's own
+    # row instead of updating it. PostgreSQL rejects the duplicate primary
+    # key, which is what makes this job fail.
+    await $conn->query(
+        'INSERT INTO jobs (id, type, payload) VALUES ($1, $2, $3::jsonb)',
+        $job->{id}, $job->{type}, $json->encode($payload),
+    );
+}
+
+# A caught failure might be a real database error carrying diagnostics, or
+# just a plain die from application code -- do_the_work() can still throw
+# either. is_unique_violation and state_name are answerable on every
+# Async::DBD::Pg::Error, so no isa check beyond the base class is needed.
+sub failure_result {
+    my ($err) = @_;
+
+    return { error => "$err" } unless ref $err && $err->isa('Async::DBD::Pg::Error');
+
+    my $result = { error => $err->message, state => $err->state_name };
+    $result->{constraint} = $err->constraint if $err->is_unique_violation;
+
+    return $result;
 }
 
 my $completed = 0;
@@ -159,34 +181,50 @@ my $finished  = Future->new;
 async sub run_worker {
     my ($name) = @_;
 
-    my $conn = await $pg->connection;
+    return await $pg->with_connection(async sub {
+        my ($conn) = @_;
 
-    until ($finished->is_ready) {
-        my $job = await claim_job($conn);
+        until ($finished->is_ready) {
+            my $job = await claim_job($conn);
 
-        if (!$job) {
-            await sleep_until_woken();
-            next;
+            if (!$job) {
+                await sleep_until_woken();
+                next;
+            }
+
+            my ($status, $result) = eval { ('completed', await do_the_work($conn, $job)) };
+            ($status, $result) = ('failed', failure_result($@)) if $@;
+
+            await $conn->query(
+                q{UPDATE jobs SET status = $1, completed_at = NOW(), result = $2::jsonb
+                   WHERE id = $3},
+                $status, $json->encode($result), $job->{id},
+            );
+
+            printf "  %s %s job #%d (%s)\n",
+                $name, ($status eq 'completed' ? 'finished' : 'FAILED'),
+                $job->{id}, $job->{type};
+
+            # The raw error text (kept in $result->{error} for the stored
+            # row) is DBI/DBD::Pg boilerplate spread across several lines --
+            # the diagnostics are the readable part, so those are what get
+            # printed here.
+            if ($status eq 'failed') {
+                if ($result->{state}) {
+                    my $line = "      $result->{state}";
+                    $line .= ", constraint=$result->{constraint}" if $result->{constraint};
+                    print "$line\n";
+                }
+                else {
+                    print "      $result->{error}\n";
+                }
+            }
+
+            $finished->done if ++$completed >= TOTAL_JOBS && !$finished->is_ready;
         }
 
-        my ($status, $result) = eval { ('completed', do_the_work($job)) };
-        ($status, $result) = ('failed', { error => "$@" }) if $@;
-
-        await $conn->query(
-            q{UPDATE jobs SET status = $1, completed_at = NOW(), result = $2::jsonb
-               WHERE id = $3},
-            $status, $json->encode($result), $job->{id},
-        );
-
-        printf "  %s %s job #%d (%s)\n",
-            $name, ($status eq 'completed' ? 'finished' : 'FAILED'),
-            $job->{id}, $job->{type};
-
-        $finished->done if ++$completed >= TOTAL_JOBS && !$finished->is_ready;
-    }
-
-    $conn->release;
-    return $name;
+        return $name;
+    });
 }
 
 # -------------------------------------------------------------------- main
@@ -228,16 +266,14 @@ sub supervised {
 
     print "\n=== results ===\n\n";
 
-    my $conn = await $pg->connection;
-    my $rows = await $conn->query(
+    my $rows = await $pg->query(
         'SELECT id, type, status FROM jobs ORDER BY id'
     );
 
     printf "  #%-3d %-8s %s\n", $_->{id}, $_->{type}, $_->{status}
         for @{ $rows->rows };
 
-    await $conn->query('DROP TABLE jobs');
-    $conn->release;
+    await $pg->query('DROP TABLE jobs');
 
     await $pg->shutdown;
 })->()->get;
