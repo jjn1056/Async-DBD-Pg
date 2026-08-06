@@ -54,9 +54,13 @@ await $pg->transaction(async sub {
 - **Async connect** - Non-blocking connect using `pg_async_connect` and Future::IO's official `poll` API
 - **Pub/sub** - `LISTEN`, `UNLISTEN`, and `NOTIFY` over a dedicated listener connection
 - **Named placeholders** - `:name` style in addition to `$1` positional, leaving `?` free for PostgreSQL's own operators
-- **Transactions** - With savepoint support for nesting
+- **Typed binds** - a value may state its PostgreSQL type, by constant or by name. Required for `bytea`: sent as text, a value is truncated at its first NUL and the write reports success
+- **Transactions** - with savepoint support for nesting, optional retry on serialization failures and deadlocks, and transaction-scoped advisory locks
 - **Cursors** - Streaming large result sets, one row at a time
 - **Results that don't lose data** - a repeated column name is an error, not a silent collapse
+- **Errors that carry the server's diagnostics** - constraint, table, column, detail, plus predicates like `is_unique_violation` and `is_retryable` that answer on every error class
+- **Query observability** - one `on_query` hook reporting SQL, binds, duration, row count, error, cache hit, and which connection ran it
+- **Optional statement caching** - off by default; keeps server-side prepared statements alive for repeated parameterized queries
 
 ## Results
 
@@ -86,12 +90,32 @@ $rs->by('id')  $rs->groups('dept')  $rs->expand
 say $rs->preview;   # column names, types, row count, first few rows
 ```
 
+Hydrating objects goes through `map_rows`, which hands the callback each row
+positionally so N objects are built without N throwaway hashrefs:
+
+```perl
+my $users = $rs->map_rows(sub {
+    my ($row, $names) = @_;
+    My::User->new(id => $row->[0], name => $row->[1]);
+});
+```
+
 ## Requirements
 
 - Perl 5.24+
 - Future::IO 0.23
 - Future::AsyncAwait 0.66+
+- Future 0.49+
 - DBD::Pg 3.20.0+
+- DBI 1.643+
+
+Two more are optional, each loaded only by the one method that needs it, so
+an installer who never calls them never needs them:
+
+- `Hash::MultiValue` 0.15+ - for `multi`
+- `JSON::MaybeXS` 1.004+ - for `expand`
+
+A missing one is reported with an install hint by the method that wanted it.
 
 ### Why Perl 5.24
 
