@@ -397,13 +397,13 @@ git commit -m "Accept a PostgreSQL type name where a bind wanted a constant"
 
 - [ ] **Step 12: Mutation check**
 
-Commit first (done above), then verify each half is load-bearing.
+Commit first (done above), then verify each load-bearing piece.
 
-Mutation A -- make the resolver a no-op by changing the body of `_resolve_bind_types` to `return $bind;`. Expect: the enum and byte-identity subtests fail.
+Mutation A -- make the resolver a no-op by changing the body of `_resolve_bind_types` to `return $bind;`. Expect the byte-identity subtest and the croak subtest to fail: with no resolution, a name reaches `bind_param` and DBD::Pg refuses it.
 
-Mutation B -- drop the cache by changing `_type_oid_is_cached` to `return 0;`. Expect: the "resolved once" subtest fails with 3 resolutions instead of 1.
+Mutation B -- drop the case folding by changing `$TYPE_OID{ lc $value->{type} }` to `$TYPE_OID{ $value->{type} }`. Expect only the case-insensitivity assertion in "resolving a name costs no query of its own" to fail, since `%TYPE_OID` is keyed lowercase.
 
-Restore with `git checkout lib/Async/DBD/Pg.pm lib/Async/DBD/Pg/Connection.pm` after each -- safe now, because the work is committed.
+Restore with `git checkout lib/Async/DBD/Pg/Connection.pm` after each -- safe now, because the work is committed. `Async::DBD::Pg` is not touched by this task, so it needs no restore.
 
 ---
 
