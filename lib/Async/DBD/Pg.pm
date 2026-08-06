@@ -69,6 +69,7 @@ sub new {
         # idle nor the active list yet, so without counting them separately
         # concurrent callers all see room and all create one.
         _connecting => 0,
+        _type_oids  => {},
         pid     => $$,
 
         # Stats
@@ -134,6 +135,30 @@ async sub unlisten_all {
 async sub notify {
     my ($self, @args) = @_;
     return await $self->pubsub->notify(@args);
+}
+
+# name => OID for bind parameters that name their PostgreSQL type. Cached on
+# the pool because a pool addresses one database, so one answer serves every
+# connection in it.
+#
+# Resolution is PostgreSQL's own: to_regtype honours search_path and returns
+# NULL for a name it does not know rather than raising, which is why this
+# needs no namespace rule and reaches user-defined enums and extension types
+# that a pg_catalog query would miss.
+sub _cached_type_oid {
+    my ($self, $name) = @_;
+    return $self->{_type_oids}{$name};
+}
+
+sub _cache_type_oid {
+    my ($self, $name, $oid) = @_;
+    $self->{_type_oids}{$name} = $oid;
+    return $oid;
+}
+
+sub _type_oid_is_cached {
+    my ($self, $name) = @_;
+    return exists $self->{_type_oids}{$name};
 }
 
 # Check out, run, release -- including when the work fails or the caller

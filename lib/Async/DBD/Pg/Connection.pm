@@ -76,6 +76,11 @@ async sub query {
         }
     }
 
+    # Before the timer starts and outside any timeout: resolving a type name
+    # is setup for the caller's query, not part of it, and it happens at most
+    # once per name for the life of the pool.
+    $bind = await $self->_resolve_bind_types($bind);
+
     # Once per checkout, and only for a connection that was idle.
     if (delete $self->{_check_liveness}) {
         await $self->_heal_if_dead;
@@ -210,6 +215,74 @@ sub _warn_if_several {
     carp "$method expected one row but $n rows matched" if $n > 1;
 
     return;
+}
+
+# True if any bind names its type rather than giving the numeric OID. Cheap,
+# and it runs on every query, so it is a scan of binds already in hand and
+# never a second pass over anything.
+sub _binds_name_a_type {
+    my ($bind) = @_;
+
+    for my $value (@$bind) {
+        next unless ref $value eq 'HASH';
+        next unless exists $value->{type} && exists $value->{value};
+        return 1 if defined $value->{type} && $value->{type} !~ /\A[0-9]+\z/;
+    }
+
+    return 0;
+}
+
+# Rewrite { type => 'bytea' } to { type => 17 } before the bind loop sees it.
+#
+# Done here rather than inside the loop because that loop runs in a
+# synchronous closure inside _capture_pg_notices, with no await available --
+# and because a croak raised in there would be caught by the surrounding eval
+# and re-reported as a query error rather than as the caller's mistake.
+async sub _resolve_bind_types {
+    my ($self, $bind) = @_;
+
+    return $bind unless _binds_name_a_type($bind);
+
+    my @resolved = @$bind;
+
+    for my $i (0 .. $#resolved) {
+        my $value = $resolved[$i];
+
+        next unless ref $value eq 'HASH';
+        next unless exists $value->{type} && exists $value->{value};
+        next unless defined $value->{type} && $value->{type} !~ /\A[0-9]+\z/;
+
+        my $oid = await $self->_type_oid($value->{type});
+
+        croak "Unknown PostgreSQL type name '$value->{type}' for bind parameter "
+            . ($i + 1)
+            unless defined $oid;
+
+        $resolved[$i] = { type => $oid, value => $value->{value} };
+    }
+
+    return \@resolved;
+}
+
+# One round trip the first time a given name is seen on this pool, none
+# afterwards -- including for a name PostgreSQL does not know, whose undef is
+# cached too so a typo does not re-ask on every query.
+#
+# The lookup runs on this connection rather than checking out another: a pool
+# of size one has no second connection to give, and asking for one while
+# holding the only one is a deadlock.
+async sub _type_oid {
+    my ($self, $name) = @_;
+
+    my $key  = lc $name;
+    my $pool = $self->{pool};
+
+    return undef unless $pool;
+    return $pool->_cached_type_oid($key) if $pool->_type_oid_is_cached($key);
+
+    my $result = await $self->query('SELECT to_regtype($1)::oid AS oid', $key);
+
+    return $pool->_cache_type_oid($key, $result->first_value);
 }
 
 sub _parse_query_args {
