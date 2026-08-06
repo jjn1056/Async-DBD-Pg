@@ -90,8 +90,10 @@ my @MODULES = qw(
     lib/Async/DBD/Pg/Column.pm
     lib/Async/DBD/Pg/Connection.pm
     lib/Async/DBD/Pg/Cursor.pm
+    lib/Async/DBD/Pg/Error.pm
     lib/Async/DBD/Pg/PubSub.pm
     lib/Async/DBD/Pg/Results.pm
+    lib/Async/DBD/Pg/Util.pm
 );
 
 subtest 'every method shown in a POD example exists' => sub {
@@ -280,6 +282,27 @@ subtest 'the machine reference shows code that compiles' => sub {
     }
 
     ok $checked >= 5, "checked a real number of blocks ($checked)";
+};
+
+subtest 'the shipped modules are ASCII' => sub {
+    # An em-dash or a smart quote reads fine in a terminal and breaks
+    # downstream consumers that assume Latin-1, and nothing else in this
+    # suite would notice. The rule is stated in every plan; this is what
+    # makes it true.
+    for my $file (@MODULES) {
+        open my $fh, '<:raw', $file or die "cannot read $file: $!";
+        my $src = do { local $/; <$fh> };
+        close $fh;
+
+        my @bad;
+        my $line = 1;
+        for my $chunk (split /(\n)/, $src) {
+            if ($chunk eq "\n") { $line++; next }
+            push @bad, "$file:$line" if $chunk =~ /([^\x00-\x7F])/;
+        }
+
+        is \@bad, [], "$file is ASCII" or diag "non-ASCII at: @bad";
+    }
 };
 
 done_testing;

@@ -57,8 +57,19 @@ subtest 'every module SYNOPSIS names the setup it needs' => sub {
         # Either it shows the setup, or it says where the setup lives. A
         # synopsis that awaits and mentions neither is one a reader can copy
         # into a program that silently never runs concurrently.
-        like $synopsis, qr/load_best_impl|Async::DBD::Pg\/SYNOPSIS|SEE ALSO/,
-            "$file SYNOPSIS points at the async setup";
+        if ($file eq 'lib/Async/DBD/Pg.pm') {
+            # The canonical example must carry the setup as code, not as a
+            # mention of it. A commented-out BEGIN with the word still
+            # present nearby would otherwise satisfy a substring match.
+            my $live = join "\n",
+                grep { !/^\s*#/ } split /\n/, $synopsis;
+            like $live, qr/BEGIN\s*\{\s*Future::IO->load_best_impl/,
+                "$file SYNOPSIS loads an implementation in live code";
+        }
+        else {
+            like $synopsis, qr/load_best_impl|Async::DBD::Pg\/SYNOPSIS|SEE ALSO/,
+                "$file SYNOPSIS points at the async setup";
+        }
     }
 };
 
@@ -87,6 +98,43 @@ subtest 'a connection checked out by hand is lost if it is not released' => sub 
     };
     ok $err, 'the failure still reaches the caller';
     is $pg->idle_count, 1, 'and with_connection gave the connection back anyway';
+
+    $pg->shutdown(timeout => 10)->get;
+};
+
+subtest 'the README synopsis runs against a real database' => sub {
+    # docs.t proves the examples parse and name real methods. It cannot
+    # prove they work, which is the class of bug that put a serialized
+    # example in front of every new reader for months.
+    my $pg = Async::DBD::Pg->new(
+        dsn => test_dsn(), min_connections => 2, max_connections => 10,
+        # The guard DROP below always finds nothing to drop -- the last
+        # statement in this subtest is an unconditional DROP TABLE, so the
+        # table never survives between runs -- and the resulting NOTICE
+        # otherwise reaches this suite's default on_log, which warns to
+        # stderr. Benign, and not pristine, so it is swallowed here the way
+        # on_log exists to let a caller do.
+        on_log => sub { },
+    );
+
+    (async sub {
+        await $pg->query('DROP TABLE IF EXISTS readme_users');
+        await $pg->query('CREATE TABLE readme_users (id int, name text, active bool)');
+        await $pg->query("INSERT INTO readme_users VALUES (1, 'Ada', true)");
+
+        my $user  = await $pg->query_row('SELECT * FROM readme_users WHERE id = $1', 1);
+        my $total = await $pg->query_value('SELECT count(*) FROM readme_users');
+        my ($id, $name) = await $pg->query_list('SELECT id, name FROM readme_users LIMIT 1');
+
+        is $user->{name}, 'Ada',  'query_row returns the row';
+        is $total, 1,             'query_value returns the count';
+        is [$id, $name], [1, 'Ada'], 'query_list returns the row as a list';
+
+        my $rs = await $pg->query('SELECT id, name FROM readme_users WHERE active');
+        is scalar(@{ $rs->rows }), 1, 'the result iterates';
+
+        await $pg->query('DROP TABLE readme_users');
+    })->()->get;
 
     $pg->shutdown(timeout => 10)->get;
 };
