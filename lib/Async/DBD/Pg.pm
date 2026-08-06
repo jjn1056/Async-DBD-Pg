@@ -1091,63 +1091,6 @@ own operators
 
 =back
 
-=head2 Why Perl 5.24 Is Required
-
-The floor is set by a dependency rather than by preference, and it cannot be
-lowered without giving up correctness.
-
-L<Future::AsyncAwait> implements cancellation propagation only on Perl 5.24
-and later. On an older Perl an C<async sub> still stops running when it is
-cancelled, but the cancellation is not passed into the future it was waiting
-on.
-
-A connection pool is largely a story about work being abandoned: a caller
-gives up on a query, a listener is told to stop, an application shuts the pool
-down while a connection is still being established. Each of those paths has to
-release something: a connection slot, a statement handle, a paused
-listener. Each relies on the cancellation reaching the operation actually being
-awaited. Without that the resource is never released, and the pool degrades
-quietly rather than failing visibly.
-
-This was established by testing, not by reading. The suite passes on Perl 5.24
-through 5.40 and fails outright on 5.20 and 5.22, taking the cursor and
-transaction tests with it.
-
-Perl 5.18 is excluded twice over: L<DBI> 1.651 and later require Perl 5.20, so
-a fresh install cannot resolve a current DBI on it at all.
-
-=head2 Event Loop Independence
-
-This module is intentionally DBD::Pg-backed rather than backend-pluggable.
-L<Future::IO> provides the event-loop abstraction layer, making the wrapper
-compatible with any event loop that has a Future::IO implementation:
-
-    # UV (libuv)
-    use Future::IO::Impl::UV;
-
-    # IO::Async
-    use Future::IO::Impl::IOAsync;
-
-    # GLib
-    use Future::IO::Impl::Glib;
-
-=head2 Connect Behavior
-
-Queries are asynchronous everywhere this module runs, using DBD::Pg's async
-query support combined with L<Future::IO>'s socket readiness detection.
-
-Connection establishment is asynchronous as well, using C<pg_async_connect>,
-C<pg_continue_connect>, and L<Future::IO>'s official C<poll> API. Those
-entry points arrived in DBD::Pg 3.19.0, which is part of why this
-distribution requires 3.20.0. There is no synchronous connect path.
-
-=head2 Advanced DBI Access
-
-The wrapper API is the supported primary interface. For advanced cases,
-connection objects still expose the underlying DBI handle via C<dbh>. Direct
-handle usage is an escape hatch and is not coordinated with the wrapper's
-query scheduling or pool lifecycle.
-
 =head2 The pool and a connection
 
 Both objects answer C<query>, C<query_row>, C<query_value> and C<query_list>,
@@ -1213,6 +1156,63 @@ PostgreSQL reports C<constraint> for a unique violation but leaves C<column>
 undef -- it names the index that was violated, not the columns in it -- so
 mapping one back to a field is done through the constraint name. See
 L<Async::DBD::Pg::Error>.
+
+=head2 Why Perl 5.24 Is Required
+
+The floor is set by a dependency rather than by preference, and it cannot be
+lowered without giving up correctness.
+
+L<Future::AsyncAwait> implements cancellation propagation only on Perl 5.24
+and later. On an older Perl an C<async sub> still stops running when it is
+cancelled, but the cancellation is not passed into the future it was waiting
+on.
+
+A connection pool is largely a story about work being abandoned: a caller
+gives up on a query, a listener is told to stop, an application shuts the pool
+down while a connection is still being established. Each of those paths has to
+release something: a connection slot, a statement handle, a paused
+listener. Each relies on the cancellation reaching the operation actually being
+awaited. Without that the resource is never released, and the pool degrades
+quietly rather than failing visibly.
+
+This was established by testing, not by reading. The suite passes on Perl 5.24
+through 5.40 and fails outright on 5.20 and 5.22, taking the cursor and
+transaction tests with it.
+
+Perl 5.18 is excluded twice over: L<DBI> 1.651 and later require Perl 5.20, so
+a fresh install cannot resolve a current DBI on it at all.
+
+=head2 Event Loop Independence
+
+This module is intentionally DBD::Pg-backed rather than backend-pluggable.
+L<Future::IO> provides the event-loop abstraction layer, making the wrapper
+compatible with any event loop that has a Future::IO implementation:
+
+    # UV (libuv)
+    use Future::IO::Impl::UV;
+
+    # IO::Async
+    use Future::IO::Impl::IOAsync;
+
+    # GLib
+    use Future::IO::Impl::Glib;
+
+=head2 Connect Behavior
+
+Queries are asynchronous everywhere this module runs, using DBD::Pg's async
+query support combined with L<Future::IO>'s socket readiness detection.
+
+Connection establishment is asynchronous as well, using C<pg_async_connect>,
+C<pg_continue_connect>, and L<Future::IO>'s official C<poll> API. Those
+entry points arrived in DBD::Pg 3.19.0, which is part of why this
+distribution requires 3.20.0. There is no synchronous connect path.
+
+=head2 Advanced DBI Access
+
+The wrapper API is the supported primary interface. For advanced cases,
+connection objects still expose the underlying DBI handle via C<dbh>. Direct
+handle usage is an escape hatch and is not coordinated with the wrapper's
+query scheduling or pool lifecycle.
 
 =head1 METHODS
 
