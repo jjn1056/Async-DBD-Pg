@@ -22,6 +22,17 @@
 
 Measured before the plan was written. Do not re-derive; do flag anything that contradicts them.
 
+> **CORRECTION, added after the final review.** One research finding below is
+> false and is left in place rather than rewritten, because the work it drove
+> was still worth doing and the record should show why. The claim that `await`
+> at file scope "is a syntax error" is wrong: Future::AsyncAwait has allowed
+> toplevel await since 0.47, this distribution requires 0.66+, and 0.71 is
+> installed. Verified after the fact -- `perl -c` reports syntax OK and the
+> program runs. The compile check this finding motivated still earns its place:
+> it caught four genuinely broken listing blocks in `llms.txt` and a broken
+> snippet in Task 6's own instructions. What it guards is that every block is
+> syntactically valid Perl, which is what `t/unit/docs.t` now says.
+
 - **Every SYNOPSIS omits the line that makes the library asynchronous.** All 8 modules' SYNOPSIS use `await`; none loads a Future::IO implementation. All 8 `examples/` do. Measured, four 1-second queries on four connections:
 
       WITHOUT load_best_impl: 4.12s   (serialized)
