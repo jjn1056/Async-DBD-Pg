@@ -246,9 +246,11 @@ subtest 'the public API is covered by the machine reference' => sub {
 
 subtest 'the machine reference shows code that compiles' => sub {
     # This file exists to be read by code generators, so a snippet that
-    # cannot compile becomes generated code that cannot run. The method-name
-    # check above cannot see this: `await $pg->query(...)` at file scope
-    # names a real method and is still a syntax error.
+    # cannot compile becomes generated code that cannot run. This check
+    # guards syntax only: each block below is wrapped in an async sub and
+    # parsed. It cannot catch a block that parses but does the wrong thing
+    # -- only running the examples against a real database would catch
+    # that.
     open my $fh, '<', 'llms.txt' or die "cannot read llms.txt: $!";
     my @lines = <$fh>;
     close $fh;

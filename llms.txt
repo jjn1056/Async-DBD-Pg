@@ -18,7 +18,8 @@ Requires Perl 5.24+, DBD::Pg 3.20.0+.
 
     my $pg = Async::DBD::Pg->new(dsn => 'postgresql://user:pass@host/db');
 
-    # await is legal only inside an async sub.
+    # Grouped in an async sub so these awaits run as one scheduled unit,
+    # instead of each one blocking the script in turn at file scope.
     (async sub {
         my $row   = await $pg->query_row('SELECT * FROM users WHERE id = $1', 42);
         my $count = await $pg->query_value('SELECT count(*) FROM users');
