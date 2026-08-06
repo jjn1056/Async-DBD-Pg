@@ -27,11 +27,6 @@ sub is_unique_violation      { 0 }
 sub is_foreign_key_violation { 0 }
 sub is_not_null_violation    { 0 }
 
-sub throw {
-    my $self = shift;
-    die ref $self ? $self : $self->new(@_);
-}
-
 # SQLSTATE code to human-readable state name mapping
 my %STATE_MAP = (
     '23505' => 'unique_violation',
