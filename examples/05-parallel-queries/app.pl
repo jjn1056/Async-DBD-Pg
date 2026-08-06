@@ -24,34 +24,34 @@ sub slow_query {
 
 my $count = 5;
 
-print "Sequential:\n";
-my $start = time();
-my $conn = $pg->connection->get;
-for my $i (1 .. $count) {
-    $conn->query(slow_query(), $i)->get;
-}
-$conn->release;
-my $sequential = time() - $start;
-printf "  %.2fs\n", $sequential;
+(async sub {
+    print "Sequential:\n";
+    my $start = time();
+    for my $i (1 .. $count) {
+        await $pg->query(slow_query(), $i);
+    }
+    my $sequential = time() - $start;
+    printf "  %.2fs\n", $sequential;
 
-print "\nParallel:\n";
-$start = time();
-my @futures;
-for my $i (1 .. $count) {
-    push @futures, (async sub {
-        my $c = await $pg->connection;
-        my $result = await $c->query(slow_query(), $i);
-        $c->release;
-        return $result->first->{id};
-    })->();
-}
-my @results = Future->wait_all(@futures)->get;
-my $parallel = time() - $start;
-printf "  %.2fs\n", $parallel;
-printf "  speedup: %.1fx\n", $sequential / $parallel if $parallel > 0;
+    print "\nParallel:\n";
+    $start = time();
+    my @futures;
+    for my $i (1 .. $count) {
+        push @futures, (async sub {
+            my $result = await $pg->query(slow_query(), $i);
+            return $result->first->{id};
+        })->();
+    }
+    my @results = await Future->wait_all(@futures);
+    my $parallel = time() - $start;
+    printf "  %.2fs\n", $parallel;
+    printf "  speedup: %.1fx\n", $sequential / $parallel if $parallel > 0;
 
-print "\nPool stats:\n";
-my $stats = $pg->stats;
-print "  created: $stats->{created}\n";
-print "  idle: ", $pg->idle_count, "\n";
-print "  active: ", $pg->active_count, "\n";
+    print "\nPool stats:\n";
+    my $stats = $pg->stats;
+    print "  created: $stats->{created}\n";
+    print "  idle: ", $pg->idle_count, "\n";
+    print "  active: ", $pg->active_count, "\n";
+})->()->get;
+
+await $pg->shutdown(timeout => 5);

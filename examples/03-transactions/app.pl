@@ -16,80 +16,87 @@ my $pg = Async::DBD::Pg->new(
     max_connections => 5,
 );
 
-my $conn = $pg->connection->get;
+(async sub {
+    # Setup needs one connection held across statements: client_min_messages
+    # is session-scoped and has to be in effect before DROP/CREATE run.
+    await $pg->with_connection(async sub {
+        my ($conn) = @_;
 
-$conn->query("SET client_min_messages TO warning")->get;
-$conn->query('DROP TABLE IF EXISTS accounts')->get;
-$conn->query(q{
-    CREATE TABLE accounts (
-        id SERIAL PRIMARY KEY,
-        name TEXT NOT NULL,
-        balance NUMERIC(10,2) NOT NULL DEFAULT 0
-    )
-})->get;
+        await $conn->query("SET client_min_messages TO warning");
+        await $conn->query('DROP TABLE IF EXISTS accounts');
+        await $conn->query(q{
+            CREATE TABLE accounts (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                balance NUMERIC(10,2) NOT NULL DEFAULT 0
+            )
+        });
+    });
 
-print "Basic transaction:\n";
-$conn->transaction(async sub {
-    my ($tx) = @_;
-
-    await $tx->query(
-        'INSERT INTO accounts (name, balance) VALUES ($1, $2)',
-        'Alice', 1000
-    );
-    await $tx->query(
-        'INSERT INTO accounts (name, balance) VALUES ($1, $2)',
-        'Bob', 500
-    );
-})->get;
-
-my $result = $conn->query('SELECT name, balance FROM accounts ORDER BY id')->get;
-for my $row (@{$result->rows}) {
-    print "  $row->{name}: \$", $row->{balance}, "\n";
-}
-
-print "\nRollback on error:\n";
-eval {
-    $conn->transaction(async sub {
+    print "Basic transaction:\n";
+    await $pg->transaction(async sub {
         my ($tx) = @_;
+
         await $tx->query(
-            'UPDATE accounts SET balance = balance - 200 WHERE name = $1',
-            'Alice'
+            'INSERT INTO accounts (name, balance) VALUES ($1, $2)',
+            'Alice', 1000
         );
-        die "Oops, rollback\n";
-    })->get;
-};
-print "  Caught: $@" if $@;
+        await $tx->query(
+            'INSERT INTO accounts (name, balance) VALUES ($1, $2)',
+            'Bob', 500
+        );
+    });
 
-print "\nNested transaction:\n";
-$conn->transaction(async sub {
-    my ($tx) = @_;
+    my $result = await $pg->query('SELECT name, balance FROM accounts ORDER BY id');
+    for my $row (@{$result->rows}) {
+        print "  $row->{name}: \$", $row->{balance}, "\n";
+    }
 
-    await $tx->query(
-        'UPDATE accounts SET balance = balance - 100 WHERE name = $1',
-        'Alice'
-    );
-
+    print "\nRollback on error:\n";
     eval {
-        await $tx->transaction(async sub {
-            my ($tx2) = @_;
-            await $tx2->query(
-                'UPDATE accounts SET balance = balance + 100 WHERE name = $1',
-                'Bob'
+        await $pg->transaction(async sub {
+            my ($tx) = @_;
+            await $tx->query(
+                'UPDATE accounts SET balance = balance - 200 WHERE name = $1',
+                'Alice'
             );
-            die "inner failure\n";
+            die "Oops, rollback\n";
         });
     };
+    print "  Caught: $@" if $@;
 
-    await $tx->query(
-        'INSERT INTO accounts (name, balance) VALUES ($1, $2)',
-        'Charlie', 100
-    );
-})->get;
+    print "\nNested transaction:\n";
+    await $pg->transaction(async sub {
+        my ($tx) = @_;
 
-$result = $conn->query('SELECT name, balance FROM accounts ORDER BY id')->get;
-for my $row (@{$result->rows}) {
-    print "  $row->{name}: \$", $row->{balance}, "\n";
-}
+        await $tx->query(
+            'UPDATE accounts SET balance = balance - 100 WHERE name = $1',
+            'Alice'
+        );
 
-$conn->query('DROP TABLE accounts')->get;
-$conn->release;
+        eval {
+            await $tx->transaction(async sub {
+                my ($tx2) = @_;
+                await $tx2->query(
+                    'UPDATE accounts SET balance = balance + 100 WHERE name = $1',
+                    'Bob'
+                );
+                die "inner failure\n";
+            });
+        };
+
+        await $tx->query(
+            'INSERT INTO accounts (name, balance) VALUES ($1, $2)',
+            'Charlie', 100
+        );
+    });
+
+    $result = await $pg->query('SELECT name, balance FROM accounts ORDER BY id');
+    for my $row (@{$result->rows}) {
+        print "  $row->{name}: \$", $row->{balance}, "\n";
+    }
+
+    await $pg->query('DROP TABLE accounts');
+})->()->get;
+
+await $pg->shutdown(timeout => 5);
