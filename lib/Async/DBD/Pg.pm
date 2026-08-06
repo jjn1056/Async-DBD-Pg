@@ -1053,10 +1053,13 @@ Async::DBD::Pg - Event-loop agnostic async PostgreSQL client
 
         # Statements that must share one connection go in a block, which
         # returns the connection however the block ends -- including on death.
+        # A temporary table lives only for the connection that created it, so
+        # the INSERT and SELECT below can only see it because both run here.
         await $pg->with_connection(async sub {
             my ($conn) = @_;
-            await $conn->query('SET LOCAL statement_timeout = 5000');
-            await $conn->query('SELECT * FROM big_report');
+            await $conn->query('CREATE TEMPORARY TABLE ids (id int)');
+            await $conn->query('INSERT INTO ids VALUES (1), (2), (3)');
+            await $conn->query('SELECT * FROM ids');
         });
     })->()->get;
 
