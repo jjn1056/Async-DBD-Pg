@@ -47,6 +47,7 @@ sub new {
     my $self = bless {
         dbh             => $args{dbh},
         pool            => $args{pool},
+        id              => $args{id},
         created_at      => $args{created_at} // time(),
         query_count     => $args{query_count} // 0,
         last_used       => time(),
@@ -77,6 +78,16 @@ sub query_count    { shift->{query_count} }
 sub created_at     { shift->{created_at} }
 sub in_transaction { shift->{in_transaction} }
 sub is_released    { shift->{released} }
+sub id { shift->{id} }
+
+# PostgreSQL's own integer form -- 160014 for 16.0.14 -- because every use is
+# a comparison, such as >= 150000 to choose MERGE over ON CONFLICT. Rendering
+# it as a string only for callers to parse it back would help nobody.
+sub server_version {
+    my ($self) = @_;
+    my $dbh = $self->{dbh} or return undef;
+    return $dbh->{pg_server_version};
+}
 
 # Execute a query asynchronously
 async sub query {
@@ -150,12 +161,13 @@ sub _report_query {
     # nor mask the error a failing one is already carrying.
     eval {
         $hook->({
-            sql     => $sql,
-            binds   => $bind,
-            elapsed => $elapsed,
-            rows    => $rows,
-            error   => $error,
-            cached  => $self->{_last_was_cached} ? 1 : 0,
+            sql        => $sql,
+            binds      => $bind,
+            elapsed    => $elapsed,
+            rows       => $rows,
+            error      => $error,
+            cached     => $self->{_last_was_cached} ? 1 : 0,
+            connection => $self->{id},
         });
         1;
     } or $pool->_log(warn => "on_query handler failed: $@");
@@ -1522,6 +1534,17 @@ True while a transaction is open on this connection.
 =head2 is_released
 
 True once the connection has gone back to the pool.
+
+=head2 id
+
+An integer identifying this connection within its pool, assigned when the
+connection is created and never reused. Reported as C<connection> on every
+L<Async::DBD::Pg/on_query> event.
+
+=head2 server_version
+
+The version of the server this connection is attached to, in PostgreSQL's
+integer form -- C<160014> for 16.0.14.
 
 =head2 query_count
 
