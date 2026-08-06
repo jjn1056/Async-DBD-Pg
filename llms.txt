@@ -189,7 +189,9 @@ Failures are objects that stringify, thrown as exceptions:
 
     Async::DBD::Pg::Error::Query          # ->state, ->state_name, ->constraint,
                                           # ->detail, ->hint, ->table, ->column,
-                                          # ->is_retryable
+                                          # ->is_retryable, ->is_unique_violation,
+                                          # ->is_foreign_key_violation,
+                                          # ->is_not_null_violation
     Async::DBD::Pg::Error::Connection
     Async::DBD::Pg::Error::PoolExhausted
     Async::DBD::Pg::Error::Timeout

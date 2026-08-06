@@ -1286,8 +1286,9 @@ read C<pg_catalog> already holds:
         $name, { type => 'bytea', value => $bytes });
 
 The names are DBD::Pg's own, its C<PG_*> constants lowercased with the
-prefix dropped, so C<PG_BYTEA> is C<'bytea'>. Resolution happens against a
-map built when the module loads and costs no round trip.
+prefix dropped, so C<PG_BYTEA> is C<'bytea'>. Matching is case-insensitive,
+so C<'BYTEA'> and C<'Bytea'> resolve the same way. Resolution happens
+against a map built when the module loads and costs no round trip.
 
 That set is exactly what DBD::Pg is able to bind. A type it does not know
 -- a user-defined enum, a domain, an extension type -- croaks here, naming
