@@ -108,6 +108,7 @@ Rows are stored positionally; hashes are derived on demand.
     $r->next  $r->reset  $r->all
     $r->get_column($name_or_index)   # a Column
     $r->preview       # short typed table for logs and debugging
+    $r->map_rows(sub { my ($row, $names) = @_; ... })  # Collection, positional
 
 Views (new object, shared rows, own iterator position):
 

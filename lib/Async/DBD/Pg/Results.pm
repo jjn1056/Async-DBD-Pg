@@ -142,6 +142,38 @@ sub arrays {
     return Async::DBD::Pg::Collection->new(@{ $self->{_rows} });
 }
 
+# Hydration. The callback receives the positional row and the shared column
+# names, and its return values are collected.
+#
+# Positional, deliberately, and the only new way to walk rows this
+# distribution offers. A hashref-passing version would be
+# `map { ... } @{ $r->rows }` with the same allocations and the same croak --
+# the map/grep/sort/reduce sugar the result-access design rejected on the
+# grounds that the builtins are shorter. What positional access adds is what
+# the builtins cannot do: build N objects without building N hashrefs on the
+# way and throwing them away.
+#
+# Nothing here croaks on repeated column names, matching arrays, row_array
+# and get_column by index. A caller reaching for positional access has
+# already stepped around the problem a hash has.
+#
+# The iterator position is untouched, matching arrays rather than next:
+# hydration is not iteration.
+#
+# The names arrayref is passed live rather than copied, as arrays hands out
+# live rows. A callback that mutates it corrupts every later view.
+sub map_rows {
+    my ($self, $callback) = @_;
+
+    croak 'map_rows requires a callback' unless ref $callback eq 'CODE';
+
+    my $names = $self->{_names};
+
+    return Async::DBD::Pg::Collection->new(
+        map { $callback->($_, $names) } @{ $self->{_rows} }
+    );
+}
+
 # Addressable by name and lossless, so this is the one name-keyed view a
 # result with repeated column names supports without renaming. It has nothing
 # to refuse and so is exempt from the croak the other hash views make.
@@ -645,6 +677,29 @@ what L</rows>, L</row_array> and every view built with L</as> report:
 Copy first if you mean to modify -- C<< [ @$row ] >> per row, or
 L<Async::DBD::Pg::Collection/to_array> for the outer list. The same applies
 to L</row_array>.
+
+=head2 map_rows
+
+    my $users = $results->map_rows(sub {
+        my ($row, $names) = @_;
+        My::User->new(id => $row->[0], name => $row->[1]);
+    });
+
+Calls the callback once per row with the row as an arrayref and the column
+names as a second arrayref, and returns a
+L<Async::DBD::Pg::Collection> of whatever the callback returned.
+
+Positional, which is the point: building objects this way never materialises
+the intermediate hashrefs that C<map { ... } @{ $results-E<gt>rows }> would,
+and it works on a result with repeated column names, where the hash views
+croak.
+
+The iterator position is not touched, so this composes with C<next>. The
+names arrayref is the result's own, not a copy -- a callback that modifies it
+corrupts every later view, exactly as writing through C<arrays> does.
+
+For hashrefs, no new method is needed: C<map { ... } @{ $results-E<gt>rows }>
+already works, and still croaks if a column name repeats.
 
 =head2 columns
 

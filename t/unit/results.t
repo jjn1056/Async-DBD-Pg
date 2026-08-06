@@ -640,4 +640,65 @@ subtest 'rows_affected is the payload for a statement returning none' => sub {
     is $r->first, undef, 'first is undef';
 };
 
+subtest 'map_rows hands the callback the positional row and the names' => sub {
+    my $r = results(
+        rows    => [ [1, 'ada'], [2, 'grace'] ],
+        columns => ['id', 'name'],
+        types   => ['int4', 'text'],
+    );
+
+    my @seen;
+    my $out = $r->map_rows(sub {
+        my ($row, $names) = @_;
+        push @seen, [ @$row ];
+        return "$names->[0]=$row->[0] $names->[1]=$row->[1]";
+    });
+
+    is [@seen], [ [1, 'ada'], [2, 'grace'] ],
+        'called once per row, in order, with the positional row';
+    is [@$out], ['id=1 name=ada', 'id=2 name=grace'],
+        'and collects what the callback returned';
+    isa_ok $out, ['Async::DBD::Pg::Collection'], 'the return is a Collection';
+};
+
+subtest 'map_rows works where a hash view refuses' => sub {
+    # Two columns named id is what ->rows croaks on. Positional access has
+    # nothing to refuse, which is the case that justifies map_rows existing
+    # rather than being map over ->rows.
+    my $r = results(
+        rows    => [ [1, 2] ],
+        columns => ['id', 'id'],
+        types   => ['int4', 'int4'],
+    );
+
+    ok dies { $r->rows }, 'the hash view croaks on the repeated name';
+
+    my $out = $r->map_rows(sub { "$_[0][0]/$_[0][1]" });
+    is [@$out], ['1/2'], 'map_rows returns both values';
+};
+
+subtest 'map_rows leaves the iterator position alone' => sub {
+    my $r = results(
+        rows    => [ [1], [2], [3] ],
+        columns => ['id'],
+        types   => ['int4'],
+    );
+
+    $r->next;                       # position now 1
+    $r->map_rows(sub { $_[0][0] });
+    my $after = $r->next;
+
+    is $after->{id}, 2, 'hydration is not iteration';
+};
+
+subtest 'map_rows on an empty result returns an empty Collection' => sub {
+    my $r = results(rows => [], columns => ['id'], types => ['int4']);
+
+    my $called = 0;
+    my $out = $r->map_rows(sub { $called++ });
+
+    is $called, 0, 'the callback is never called';
+    is $out->size, 0, 'and the Collection is empty';
+};
+
 done_testing;
