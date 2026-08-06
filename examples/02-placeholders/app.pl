@@ -2,6 +2,7 @@
 use strict;
 use warnings;
 
+use Future::AsyncAwait;
 use Future::IO;
 use Async::DBD::Pg;
 
@@ -15,22 +16,22 @@ my $pg = Async::DBD::Pg->new(
     max_connections => 5,
 );
 
-my $conn = $pg->connection->get;
+(async sub {
+    print "Positional placeholders:\n";
+    my $sum = await $pg->query_value('SELECT $1::int + $2::int', 10, 20);
+    print "  10 + 20 = $sum\n";
 
-print "Positional placeholders:\n";
-my $result = $conn->query('SELECT $1::int + $2::int AS sum', 10, 20)->get;
-print "  10 + 20 = ", $result->first->{sum}, "\n";
+    print "\nNamed placeholders:\n";
+    my $full = await $pg->query_value(
+        q{SELECT :first_name || ' ' || :last_name},
+        { first_name => 'John', last_name => 'Doe' },
+    );
+    print "  Full name = $full\n";
 
-print "\nNamed placeholders:\n";
-$result = $conn->query(
-    q{SELECT :first_name || ' ' || :last_name AS full_name},
-    { first_name => 'John', last_name => 'Doe' }
-)->get;
-print "  Full name = ", $result->first->{full_name}, "\n";
+    # The value is data, never SQL. Nothing here is escaped by hand.
+    my $malicious = q{'; DROP TABLE users; --};
+    my $safe = await $pg->query_value('SELECT $1::text', $malicious);
+    print "\nSafely escaped:\n  $safe\n";
+})->()->get;
 
-my $malicious = q{'; DROP TABLE users; --};
-$result = $conn->query('SELECT $1::text AS safely_escaped', $malicious)->get;
-print "\nSafely escaped:\n";
-print "  ", $result->first->{safely_escaped}, "\n";
-
-$conn->release;
+await $pg->shutdown(timeout => 5);
