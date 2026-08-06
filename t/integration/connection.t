@@ -596,8 +596,15 @@ subtest 'on_query attributes each statement to its connection' => sub {
     $a->query_value('SELECT 2')->get;
     $b->query_value('SELECT 3')->get;
 
-    is [ map { $_->{connection} } @events ], [ $a->id, $a->id, $b->id ],
-        'every event names the connection that ran the statement';
+    # Not `is [...ids...], [$a->id, $a->id, $b->id]`: the expected side would
+    # be built from the same values under test, so a bug collapsing every id
+    # to one constant would leave both sides equal and the test would still
+    # pass. Check the shape independently of the id values, then identity.
+    my ($e1, $e2, $e3) = map { $_->{connection} } @events;
+    is   $e1, $e2,    "a's two queries share one connection id";
+    isnt $e2, $e3,    "and differ from b's";
+    is   $e1, $a->id, "and it is a's own id";
+    is   $e3, $b->id, "the third is b's own id";
 
     $a->release;
     $b->release;
