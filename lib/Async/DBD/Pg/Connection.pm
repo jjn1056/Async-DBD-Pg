@@ -29,6 +29,15 @@ sub new {
         released        => 0,
         in_transaction  => 0,
         _savepoint_depth => 0,
+
+        # Statement cache. Keyed on the converted SQL, so the :name and $1
+        # spellings of one query share an entry. Lives here rather than
+        # anywhere more general because only the connection sees the
+        # statement guard's exits, which is what says whether a handle is
+        # still fit to reuse.
+        statement_cache_size => $args{statement_cache_size} // 0,
+        _stmt_cache          => {},
+        _stmt_lru            => [],
     }, $class;
 
     weaken($self->{pool}) if $self->{pool};
@@ -118,6 +127,7 @@ sub _report_query {
             elapsed => $elapsed,
             rows    => $rows,
             error   => $error,
+            cached  => $self->{_last_was_cached} ? 1 : 0,
         });
         1;
     } or $pool->_log(warn => "on_query handler failed: $@");
@@ -388,9 +398,57 @@ sub _capture_pg_notices {
 }
 
 # Core async query execution using DBD::Pg async support
-async sub _execute_async {
-    my ($self, $sql, $bind) = @_;
-    $bind //= [];
+# Look the statement up, or prepare and remember it. Returns the handle and
+# whether it came from the cache, which the on_query event reports.
+sub _statement_for {
+    my ($self, $sql) = @_;
+
+    my $size = $self->{statement_cache_size};
+
+    return ($self->_prepare_statement($sql), 0) unless $size;
+
+    if (my $sth = $self->{_stmt_cache}{$sql}) {
+        # A cached handle that has lost its server-side statement has lost the
+        # cached plan whose 0A000 is the only thing standing between a
+        # result-shape change and a segfault. Nothing observed today puts a
+        # handle in that state, which is exactly why it is checked here rather
+        # than assumed: the invariant this cache rests on is cheap to confirm
+        # and fatal to get wrong.
+        if (length($sth->{pg_prepare_name} // '')) {
+            # Most recently used goes to the end.
+            @{ $self->{_stmt_lru} } = grep { $_ ne $sql } @{ $self->{_stmt_lru} };
+            push @{ $self->{_stmt_lru} }, $sql;
+
+            return ($sth, 1);
+        }
+
+        $self->_evict_statement($sql);
+    }
+
+    my $sth = $self->_prepare_statement($sql);
+
+    # Only a statement carrying placeholders is ever promoted to a named
+    # server-side prepared statement, and only a named statement is safe to
+    # reuse -- see the note on pg_switch_prepared where the handle is
+    # created. Caching the rest would buy DBI's local re-parse and nothing on
+    # the server, at the price of the one crash this cache can cause.
+    return ($sth, 0) unless $sth->{NUM_OF_PARAMS};
+
+    $self->{_stmt_cache}{$sql} = $sth;
+    push @{ $self->{_stmt_lru} }, $sql;
+
+    # Dropping the reference is what makes DBD::Pg deallocate the server-side
+    # statement, so the bound is a server-memory bound as much as a local one.
+    while (@{ $self->{_stmt_lru} } > $size) {
+        my $oldest = shift @{ $self->{_stmt_lru} };
+        delete $self->{_stmt_cache}{$oldest};
+    }
+
+    return ($sth, 0);
+}
+
+sub _prepare_statement {
+    my ($self, $sql) = @_;
 
     my $dbh = $self->{dbh};
 
@@ -406,9 +464,71 @@ async sub _execute_async {
             pg_placeholder_dollaronly => 1,
         })
     };
-    if ($@ || !$sth) {
-        $self->_throw_query_error($@ || $dbh->errstr, $sql);
-    }
+
+    $self->_throw_query_error($@ || $dbh->errstr, $sql) if $@ || !$sth;
+
+    return $sth;
+}
+
+# Forget a cached statement. Called whenever a handle's state stops being
+# known to be good: an error, a cancellation, or a server that says the
+# prepared statement it names is not there.
+sub _evict_statement {
+    my ($self, $sql) = @_;
+
+    return unless defined $sql && $self->{statement_cache_size};
+
+    delete $self->{_stmt_cache}{$sql};
+    @{ $self->{_stmt_lru} } = grep { $_ ne $sql } @{ $self->{_stmt_lru} };
+
+    return;
+}
+
+# The two states a cached statement can fail with that say the cache is
+# stale rather than the query wrong.
+#
+# 0A000 is a schema change under a cached plan; 26000 is the server not
+# having the named statement at all, which is what a pooler in
+# transaction-pooling mode produces when consecutive transactions land on
+# different backends.
+#
+# Both fail at parse or bind time, before the statement executes, so
+# evicting and preparing again cannot double-execute anything. That is the
+# whole reason this recovers by itself instead of reaching the caller.
+my %CACHE_STALE = map { $_ => 1 } qw(0A000 26000);
+
+async sub _execute_async {
+    my ($self, $sql, $bind) = @_;
+
+    my $result = eval { await $self->_execute_once($sql, $bind) };
+    my $err = $@;
+
+    return $result unless $err;
+
+    # Once, never in a loop: a second failure with the same state means
+    # something other than a stale cache entry.
+    die $err unless $self->{statement_cache_size};
+    die $err unless ref $err && $CACHE_STALE{ eval { $err->state } // '' };
+
+    $self->_evict_statement($sql);
+
+    return await $self->_execute_once($sql, $bind);
+}
+
+async sub _execute_once {
+    my ($self, $sql, $bind) = @_;
+    $bind //= [];
+
+    my $dbh = $self->{dbh};
+
+    # dollaronly confines DBD::Pg's own placeholder scan to $1, which is the
+    # only form reaching it: positional binds arrive as $1 already, and
+    # convert_placeholders has rewritten :name into $1 by now. Left off, that
+    # scan reads PostgreSQL's own syntax as placeholders -- jsonb's ?, ?| and
+    # ?& operators, and the open array slice arr[:2] -- and the statement dies
+    # at execute on a placeholder the caller never wrote.
+    my ($sth, $cached) = $self->_statement_for($sql);
+    $self->{_last_was_cached} = $cached;
 
     # Hold the in-flight handle on the connection. A query abandoned part way
     # through has its async sub torn down along with the lexicals inside it,
@@ -417,7 +537,12 @@ async sub _execute_async {
     # A guard rather than a release at the end, because a caller cancelling
     # the query stops this sub where it is suspended and nothing after the
     # await runs.
-    my $statement = Async::DBD::Pg::Connection::_StatementGuard->new($self, $sth);
+    #
+    # The guard carries the cache key so its exits can decide the entry's
+    # fate: hand_over means Results finished the handle cleanly and it stays;
+    # release and destruction both mean the handle's state is unknown, and an
+    # unknown handle must not be handed to the next caller.
+    my $statement = Async::DBD::Pg::Connection::_StatementGuard->new($self, $sth, $sql);
 
     my $rv = eval {
         $self->_capture_pg_notices(sub {
@@ -558,6 +683,89 @@ sub cancel {
 }
 
 # Execute code within a transaction
+# Advisory locks, transaction-scoped. PostgreSQL releases these when the
+# transaction ends, whether it commits or rolls back, so nothing here has to
+# be undone by hand and a cancelled caller cannot leak one.
+#
+# The session-scoped form (pg_advisory_lock) is deliberately not offered: it
+# outlives the transaction, so a connection carrying one would go back to the
+# pool still holding it, and the next caller to check that connection out
+# would silently own someone else's mutex.
+async sub advisory_lock {
+    my ($self, @key) = @_;
+
+    await $self->_advisory('pg_advisory_xact_lock', 'advisory_lock', @key);
+
+    return 1;
+}
+
+# Takes the lock if it is free, and says so either way rather than waiting.
+async sub try_advisory_lock {
+    my ($self, @key) = @_;
+
+    my $got = await $self->_advisory(
+        'pg_try_advisory_xact_lock', 'try_advisory_lock', @key,
+    );
+
+    return $got ? 1 : 0;
+}
+
+async sub _advisory {
+    my ($self, $function, $method, @key) = @_;
+
+    # Outside an explicit transaction the lock is released the instant the
+    # implicit single-statement one ends, so it would guard nothing. A mutex
+    # that silently does not lock is worse than no mutex.
+    croak "$method needs a transaction to hold the lock; "
+        . 'call it inside transaction(), which is what releases it'
+        unless $self->{in_transaction};
+
+    croak "$method takes one 64-bit key or two 32-bit keys"
+        unless @key == 1 || @key == 2;
+
+    my $placeholders = join ', ', map { "\$$_" } 1 .. @key;
+
+    my $result = await $self->query(
+        "SELECT $function($placeholders) AS locked", @key,
+    );
+
+    return $result->first_value;
+}
+
+# Run the whole transaction again when the server says it lost a race it
+# could win next time. Only 40001 and 40P01 qualify, which is the entire
+# point: retrying anything else is a slower failure, and retrying a single
+# statement rather than the transaction is the mistake this replaces.
+#
+# Each attempt is an ordinary transaction, so a failed one has already been
+# rolled back before the next BEGIN -- without that, a retry would re-apply
+# whatever the first attempt wrote.
+async sub _transaction_with_retry {
+    my ($self, $retries, $opts, $code, @args) = @_;
+
+    my %inner = %$opts;
+    delete $inner{retry};
+
+    my $backoff = $opts->{retry_delay} // 0.05;
+    my $attempt = 0;
+
+    while (1) {
+        $attempt++;
+
+        my $result = eval { await $self->transaction(\%inner, $code, @args) };
+        my $err = $@;
+
+        return $result unless $err;
+
+        die $err if $attempt > $retries;
+        die $err unless ref $err && eval { $err->is_retryable };
+
+        # Exponential, so a deadlock between two workers does not have them
+        # collide again on the same schedule.
+        await Future::IO->sleep($backoff * (2 ** ($attempt - 1)));
+    }
+}
+
 async sub transaction {
     my ($self, @rest) = @_;
 
@@ -569,6 +777,18 @@ async sub transaction {
 
     my $isolation = $opts{isolation};
     my $savepoint_depth = $self->{_savepoint_depth} // 0;
+
+    if (my $retry = $opts{retry}) {
+        # Retrying an inner block would re-run a savepoint rather than the
+        # transaction, which is the wrong-scope bug this option exists to
+        # stop people writing by hand. Refuse rather than quietly do the
+        # weaker thing.
+        croak 'retry applies to the outermost transaction only; '
+            . 'this one is nested inside another'
+            if $savepoint_depth > 0;
+
+        return await $self->_transaction_with_retry($retry, \%opts, $code, @args);
+    }
 
     if ($savepoint_depth > 0) {
         my $savepoint = "sp_$savepoint_depth";
@@ -720,6 +940,18 @@ sub _close_dbh {
         eval { $self->{dbh}->disconnect };
         $self->{dbh} = undef;
     }
+
+    # A prepared statement belongs to the backend that made it, so the cache
+    # is derived state of the handle and cannot outlive it. Enforced here
+    # rather than at the one call site that currently keeps using the
+    # Connection afterwards -- _replace_dbh, which heals a dead connection in
+    # place -- because every other caller discards the Connection entirely
+    # and only the ordering of a future one would decide whether this matters
+    # again. Executing a statement held over from a closed handle fails with
+    # "Cannot call execute on a disconnected database handle", a DBI error
+    # carrying no SQLSTATE, which the 0A000/26000 recovery does not see.
+    %{ $self->{_stmt_cache} } = ();
+    @{ $self->{_stmt_lru} }   = ();
 }
 
 sub DESTROY {
@@ -780,29 +1012,33 @@ use warnings;
 use Scalar::Util qw(weaken);
 
 sub new {
-    my ($class, $conn, $sth) = @_;
+    my ($class, $conn, $sth, $sql) = @_;
 
     $conn->{_active_sth} = $sth;
 
-    my $self = bless { conn => $conn }, $class;
+    my $self = bless { conn => $conn, sql => $sql }, $class;
     weaken($self->{conn});
 
     return $self;
 }
 
-# The statement is finished with and nobody is going to read it.
+# The statement is finished with and nobody is going to read it. This is an
+# error path, so the handle's state is unknown and it must not be reused.
 sub release {
     my ($self) = @_;
 
     my $conn = delete $self->{conn} or return;
+    $conn->_evict_statement(delete $self->{sql});
     $conn->_release_active_sth;
 }
 
-# Ownership passes to the caller, who finishes the handle instead.
+# Ownership passes to the caller, who finishes the handle instead. The only
+# exit that leaves the statement fit to reuse, so the only one that keeps it.
 sub hand_over {
     my ($self) = @_;
 
     my $conn = delete $self->{conn} or return;
+    delete $self->{sql};
     delete $conn->{_active_sth};
 }
 
@@ -1031,6 +1267,81 @@ C<repeatable_read> becomes C<REPEATABLE READ>. Ignored for nested blocks,
 which join the transaction already running.
 
 =back
+
+=head3 Retrying a transaction
+
+    await $conn->transaction({ retry => 3 }, async sub { ... });
+
+Runs the whole block again when it fails with a SQLSTATE whose documented
+remedy is to retry: C<40001> (serialization failure) and C<40P01> (deadlock
+detected). Nothing else is ever retried, and nothing is retried unless this
+option is given.
+
+Each attempt is a complete transaction, so a failed one is rolled back before
+the next C<BEGIN> and no work from it survives. The delay between attempts
+doubles, starting at 0.05 seconds; C<retry_delay> sets the first one.
+
+The value is the number of B<retries>, so C<< retry => 3 >> means up to four
+attempts. When they are exhausted the last failure propagates unchanged.
+
+Two things to know before using it:
+
+=over 4
+
+=item *
+
+B<The block runs more than once, so anything it does outside the database
+happens more than once.> Sending mail, charging a card, or writing a file
+from inside a retried transaction will do it again on every attempt. Keep
+such work outside the block, or after it.
+
+=item *
+
+B<It applies to the outermost transaction only.> A nested C<transaction> is
+a savepoint, and retrying one would re-run the savepoint rather than the
+transaction -- the wrong-scope mistake this option exists to prevent.
+Asking for C<retry> on a nested call is an error.
+
+=back
+
+Whether an error qualifies is L<Async::DBD::Pg::Error/is_retryable>, which
+can be asked directly if you would rather handle it yourself.
+
+=head2 advisory_lock
+
+    await $pg->transaction(async sub {
+        my ($conn) = @_;
+        await $conn->advisory_lock($id);
+        ...
+    });
+
+    await $conn->advisory_lock($classifier, $id);   # two 32-bit keys
+
+Takes a PostgreSQL advisory lock on an arbitrary number, waiting until it is
+free. Locks taken this way are held by the B<transaction> and released when
+it ends, whether it commits or rolls back.
+
+Calling it outside a transaction is an error. PostgreSQL would release a
+transaction-scoped lock at the end of the implicit single-statement
+transaction, which is to say immediately, and a mutex that silently fails to
+lock is worse than no mutex.
+
+The key is one 64-bit integer, or two 32-bit ones -- a classifier plus an id
+is the usual reason for the second form. The two key spaces are separate and
+do not collide.
+
+The session-scoped C<pg_advisory_lock> is deliberately not offered. It
+outlives its transaction, so a pooled connection would be returned still
+holding it and the next caller to check that connection out would silently
+own someone else's lock.
+
+=head2 try_advisory_lock
+
+    if (await $conn->try_advisory_lock($id)) { ... }
+
+As L</advisory_lock>, but returns false immediately rather than waiting when
+another session holds the lock. This is what to use for "run this if nobody
+else is running it", where waiting would be pointless.
 
 =head2 cursor
 

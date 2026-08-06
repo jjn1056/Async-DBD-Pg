@@ -37,6 +37,11 @@ sub new {
         statement_timeout => delete $args{statement_timeout},
         max_queries      => delete $args{max_queries},
 
+        # Per-connection prepared-statement cache. Off by default: it holds
+        # server-side statements open, and behind a transaction-pooling
+        # pgbouncer it is actively slower than not caching.
+        statement_cache_size => delete $args{statement_cache_size} // 0,
+
         # Callbacks
         on_connect => delete $args{on_connect},
         on_release => delete $args{on_release},
@@ -546,6 +551,20 @@ async sub _create_connection {
     await $self->_complete_async_connect($dbh);
     $dbh->{RaiseError} = 1;
 
+    # Promote to a named server-side prepared statement on the first execute
+    # rather than the second. This is a handle attribute, not a per-statement
+    # one, and the statement cache does not work without it: DBD::Pg's default
+    # of 2 promotes on a handle's second execute, but a handle the cache has
+    # not kept is gone before then, so every execute would be a first one and
+    # nothing would ever be promoted.
+    #
+    # It is also what makes a cached handle safe to reuse. Only a named
+    # statement has a server-side cached plan, and only a cached plan makes
+    # PostgreSQL raise 0A000 when a schema change alters the result shape.
+    # Without that error the reused handle fetches the new shape through a row
+    # buffer sized for the old one, which segfaults DBD::Pg 3.20.2.
+    $dbh->{pg_switch_prepared} = 1 if $self->{statement_cache_size};
+
     # Set statement timeout if configured
     if (my $timeout = $self->{statement_timeout}) {
         $dbh->do("SET statement_timeout = '${timeout}s'");
@@ -556,6 +575,7 @@ async sub _create_connection {
         pool        => $self,
         created_at  => time(),
         query_count => 0,
+        statement_cache_size => $self->{statement_cache_size},
     );
 
     # Run on_connect callback
@@ -621,6 +641,9 @@ async sub _replace_dbh {
     # silently; on a listener loop, forever.
     delete $conn->{_cached_sock};
     delete $conn->{_cached_fd};
+
+    # The statement cache is emptied by _close_dbh above, which owns that
+    # invariant: prepared statements belong to the backend that made them.
 
     return $conn;
 }
@@ -1165,6 +1188,48 @@ Statements a connection may run before it is closed and replaced. Unset by
 default, meaning connections are kept indefinitely. Useful against slow growth
 in a long-lived backend.
 
+=head3 statement_cache_size
+
+Prepared statements each connection keeps for reuse. C<0>, the default,
+disables the cache, and nothing below applies.
+
+The cache holds a server-side prepared statement per entry, so what it saves
+is B<planning>, not round trips. That makes the workload decide whether it is
+worth anything. Measured here against PostgreSQL 16, 300 statements per run:
+
+=over 4
+
+=item * Statements the planner disposes of instantly -- C<SELECT $1::int> and
+the like -- gain nothing measurable, at any latency.
+
+=item * A three-table join with an C<ORDER BY> saves around 400 microseconds
+per execution, which was 22% end to end over a loopback socket and 5.7% with
+2ms of round-trip latency in the way. The absolute saving barely moves with
+latency; the percentage shrinks because the round trips grow.
+
+=back
+
+Size it to hold the working set. A cache too small for the statements in
+rotation evicts an entry on every query and re-prepares it on the next,
+which costs a round trip that not caching at all would never have paid: two
+statements sharing a cache of one measured 36% B<slower> than C<0> on the
+join workload and 131% slower on the trivial one. Undersized is worse than
+absent, so prefer to leave this off rather than guess low.
+
+Only statements carrying placeholders are cached. DBD::Pg gives a
+server-side prepared statement to those and to no others, so for the rest an
+entry would hold nothing the server knows about. Enabling the cache also
+sets C<pg_switch_prepared> to C<1> on every connection it opens, which is
+what makes that statement exist from the first execution rather than the
+second.
+
+Do not enable this behind a connection pooler in transaction-pooling mode.
+Consecutive transactions land on different backends there, and a prepared
+statement belongs to the backend that made it. Recovery is automatic -- the
+missing statement comes back as SQLSTATE 26000 and the query is retried on a
+freshly prepared one -- but paying for that on most queries is slower than
+never having cached. Session pooling is unaffected.
+
 =head3 on_connect
 
     on_connect => async sub {
@@ -1233,6 +1298,12 @@ were rewritten
 =item * C<rows> -- the number of rows returned, or C<undef> if it failed
 
 =item * C<error> -- the failure, or C<undef> if it succeeded
+
+=item * C<cached> -- true if the statement was reused from the connection's
+prepared-statement cache. Always false when L</statement_cache_size> is C<0>,
+and always false for a statement without placeholders, which is never cached.
+A hit rate well below 1 says the cache is too small for the working set,
+which is the case where it costs more than it saves.
 
 =back
 
