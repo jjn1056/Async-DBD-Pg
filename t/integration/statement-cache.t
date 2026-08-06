@@ -35,6 +35,44 @@ sub kill_this_suites_backends {
     return;
 }
 
+sub wait_until {
+    my ($code, $label, $timeout) = @_;
+
+    $timeout //= 1;
+    my $deadline = time + $timeout;
+
+    while (time < $deadline) {
+        return 1 if $code->();
+        Future::IO->sleep(0.02)->get;
+    }
+
+    return $code->() ? 1 : 0;
+}
+
+# True if any of the given backend pids are still visible in
+# pg_stat_activity. pg_terminate_backend sends a signal and returns as soon
+# as it is sent, not once the backend has actually exited, so this is what a
+# wait for "actually gone" polls -- a fresh, throwaway connection each call,
+# never one of the pool's own.
+sub backends_alive {
+    my (@pids) = @_;
+    return 0 unless @pids;
+
+    my $parsed = Async::DBD::Pg::Util::parse_dsn(test_dsn());
+    my $dbh = DBI->connect(
+        $parsed->{dbi_dsn}, $parsed->{user}, $parsed->{password},
+        { RaiseError => 1, PrintError => 0 },
+    );
+    my $placeholders = join ',', ('?') x @pids;
+    my ($count) = $dbh->selectrow_array(
+        "SELECT count(*) FROM pg_stat_activity WHERE pid IN ($placeholders)",
+        undef, @pids,
+    );
+    $dbh->disconnect;
+
+    return $count > 0;
+}
+
 sub pool {
     my (%args) = @_;
     return Async::DBD::Pg->new(
@@ -294,6 +332,10 @@ subtest 'healing a dead connection empties its cache' => sub {
     is $conn->query_value($sql, 1)->get, 1, 'the statement runs and is cached';
     ok exists $conn->{_stmt_cache}{$sql}, 'and is in the cache';
 
+    # pg_pid is a cached attribute recorded at connect time, not a live read,
+    # so fetching it here does not touch the socket.
+    my $pid = $conn->dbh->{pg_pid};
+
     # Idle in the pool when its backend dies, which is the state
     # heal_dead_connections exists for: the next checkout finds this same
     # Connection object dead and replaces the handle underneath it. The
@@ -305,6 +347,17 @@ subtest 'healing a dead connection empties its cache' => sub {
     # visible on the first use of every statement in it.
     $conn->release;
     kill_this_suites_backends();
+
+    # pg_terminate_backend sends the signal and returns as soon as it is
+    # sent, not once the backend has actually exited. _heal_if_dead's check
+    # is a non-blocking select() on the socket fd: if the checkout below races
+    # the backend's real exit, the fd isn't readable yet, the ping it falls
+    # back to still succeeds, and no heal happens at all -- the termination
+    # then lands later, mid-query, as a bare FATAL instead of the heal this
+    # subtest exists to test. Wait for the backend to actually be gone first,
+    # through a separate, throwaway connection that never touches the pool's
+    # own sockets.
+    wait_until(sub { !backends_alive($pid) }, 'the killed backend actually gone', 5);
 
     my $healed = $pg->connection->get;
 
