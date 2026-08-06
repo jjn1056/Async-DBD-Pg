@@ -1159,9 +1159,12 @@ you want for statements that stand alone.
 
 Asking a B<connection> runs on that connection every time. That matters
 whenever two statements have to see each other: a transaction, a cursor, a
-temporary table, C<SET LOCAL>, an advisory lock, C<LISTEN>. Sending those
-through the pool would scatter them across connections and they would not
-work.
+temporary table, C<SET LOCAL>, an advisory lock. Sending those through the
+pool would scatter them across connections and they would not work.
+
+C<LISTEN> is not on that list: it needs a connection dedicated to it for the
+life of the subscription, not one borrowed from the pool and given back. See
+L<Async::DBD::Pg::PubSub>.
 
 So: reach for the pool by default, and get a connection when statements must
 share one -- through L</with_connection> or L</transaction>, which give it
