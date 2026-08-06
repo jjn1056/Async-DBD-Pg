@@ -1,6 +1,6 @@
 # 03 Transactions
 
-Atomic operations with commit, rollback, nested savepoints, and isolation levels.
+Atomic operations with commit, rollback, and nested savepoints.
 
 ```bash
 DATABASE_URL='postgresql://postgres:test@localhost:5432/test' perl -Ilib examples/03-transactions/app.pl

@@ -9,6 +9,6 @@ DATABASE_URL='postgresql://postgres:test@localhost:5432/test' perl -Ilib example
 This example shows:
 
 - Creating cursors with `cursor()`
-- Fetching batches with `next()`
+- Fetching rows one at a time with `next()`, `batch_size` rows per round trip
 - Using placeholders with cursors
 - Closing cursor resources explicitly

@@ -281,7 +281,7 @@ sub supervised {
 
     await $pg->query('DROP TABLE jobs');
 
-    await $pg->shutdown;
+    await $pg->shutdown(timeout => 5);
 })->()->get;
 
 print "\nDone.\n";

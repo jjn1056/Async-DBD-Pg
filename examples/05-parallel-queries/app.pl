@@ -42,7 +42,7 @@ my $count = 5;
             return $result->first->{id};
         })->();
     }
-    my @results = await Future->wait_all(@futures);
+    await Future->wait_all(@futures);
     my $parallel = time() - $start;
     printf "  %.2fs\n", $parallel;
     printf "  speedup: %.1fx\n", $sequential / $parallel if $parallel > 0;

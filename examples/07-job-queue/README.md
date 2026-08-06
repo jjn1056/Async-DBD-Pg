@@ -17,6 +17,9 @@ Points worth borrowing:
 - Each branch is wrapped so a failure is reported and contained rather than
   taking down the whole tree. One job in the run fails deliberately to show
   it: the other workers carry on.
+- A failed job is classified with `is_unique_violation`, and the offending
+  `->constraint` is captured for reporting rather than just the raw error
+  text.
 
 Requires `Future::Selector`, which is not needed by the library itself.
 

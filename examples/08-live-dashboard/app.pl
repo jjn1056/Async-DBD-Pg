@@ -176,7 +176,7 @@ sub supervised {
 
     await $pg->query('DROP TABLE metrics');
 
-    await $pg->shutdown;
+    await $pg->shutdown(timeout => 5);
 })->()->get;
 
 print "\nDone.\n";
