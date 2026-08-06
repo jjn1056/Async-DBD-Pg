@@ -323,27 +323,37 @@ sub _resolve_bind_types {
     return \@resolved;
 }
 
-sub _parse_query_args {
-    my ($self, @args) = @_;
+# Split a call's trailing arguments into bind values and options.
+#
+# The ambiguity this resolves: a trailing hashref is either the options for
+# this call or a hashref of named binds, and only the keys tell them apart.
+# So each caller names the keys that mean "options to me" -- timeout for a
+# query, batch_size or name for a cursor -- and a hashref carrying none of
+# them is left alone as binds.
+sub _split_bind_and_options {
+    my ($args, @option_keys) = @_;
 
     my $opts = {};
     my $bind = [];
 
-    if (@args && ref $args[-1] eq 'HASH') {
-        my $last = $args[-1];
-        if (exists $last->{timeout}) {
-            $opts = pop @args;
-        }
+    if (@$args && ref $args->[-1] eq 'HASH') {
+        my $last = $args->[-1];
+        $opts = pop @$args if grep { exists $last->{$_} } @option_keys;
     }
 
-    if (@args == 1 && ref $args[0] eq 'HASH') {
-        $bind = $args[0];
+    if (@$args == 1 && ref $args->[0] eq 'HASH') {
+        $bind = $args->[0];
     }
-    elsif (@args) {
-        $bind = \@args;
+    elsif (@$args) {
+        $bind = $args;
     }
 
     return ($bind, $opts);
+}
+
+sub _parse_query_args {
+    my ($self, @args) = @_;
+    return _split_bind_and_options(\@args, 'timeout');
 }
 
 # Execute async query with timeout
@@ -1055,25 +1065,7 @@ async sub cursor {
 
 sub _parse_cursor_args {
     my ($self, @args) = @_;
-
-    my $opts = {};
-    my $bind = [];
-
-    if (@args && ref $args[-1] eq 'HASH') {
-        my $last = $args[-1];
-        if (exists $last->{batch_size} || exists $last->{name}) {
-            $opts = pop @args;
-        }
-    }
-
-    if (@args == 1 && ref $args[0] eq 'HASH') {
-        $bind = $args[0];
-    }
-    elsif (@args) {
-        $bind = \@args;
-    }
-
-    return ($bind, $opts);
+    return _split_bind_and_options(\@args, 'batch_size', 'name');
 }
 
 # Release connection back to pool

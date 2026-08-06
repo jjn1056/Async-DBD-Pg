@@ -223,25 +223,48 @@ subtest 'the public API is covered by the machine reference' => sub {
     my $text = do { local $/; <$fh> };
     close $fh;
 
-    # Anything added to Results without being written down here is invisible
-    # to everyone reading the reference, which is the drift this catches.
-    my @results_api = qw(
-        rows arrays columns types count rows_affected is_empty elapsed
-        first single first_value single_value first_list single_list row_array
-        next reset all get_column
-        preview as multi expand by groups
-    );
+    # Derived from what each module DOCUMENTS, rather than from a list kept
+    # here. Two reasons for that definition. A hand-written list only covers
+    # what somebody remembered to add, and this one had already fallen behind
+    # -- map_rows shipped without entering it, so the check reported full
+    # coverage of a set that was missing a method. And "public" is better
+    # defined by having POD than by lacking a leading underscore: Util's
+    # helpers and Results::new_from_data are callable but internal, while a
+    # method with a =head2 is one this distribution tells people to call.
+    #
+    # So the rule is: if you document it, the machine reference must name it.
+    my @missing;
+    my $checked = 0;
 
-    my @missing = grep { $text !~ /\b\Q$_\E\b/ } @results_api;
-    is \@missing, [], 'every Results method appears in llms.txt';
+    for my $file (@MODULES) {
+        open my $mfh, '<', $file or die "cannot read $file: $!";
+        my $src = do { local $/; <$mfh> };
+        close $mfh;
 
-    my @pool_api = qw(
-        query query_row query_value query_list connection with_connection transaction
-        shutdown on_query stats
-    );
+        # Two things carry POD without being part of the surface a caller
+        # writes against, so the machine reference deliberately omits them
+        # and naming them here would tell a generator to call internals:
+        # Util is this distribution's shared helpers, and new_from_data
+        # exists so the library can build a Results with no statement handle.
+        next if $file =~ m{/Util\.pm$};
 
-    my @missing_pool = grep { $text !~ /\b\Q$_\E\b/ } @pool_api;
-    is \@missing_pool, [], 'and every pool entry point';
+        my %documented = map { $_ => 1 } $src =~ /^=head[23]\s+([a-z]\w*)/mg;
+        delete $documented{new_from_data};
+
+        (my $code = $src) =~ s/^=\w.*?^=cut//msg;
+
+        for my $name ($code =~ /^\s*(?:async\s+)?sub\s+([a-z]\w*)/mg) {
+            next unless $documented{$name};
+            $checked++;
+            push @missing, "$name ($file)" unless $text =~ /\b\Q$name\E\b/;
+        }
+    }
+
+    is \@missing, [], 'every documented method appears in llms.txt'
+        or diag "documented but absent from the machine reference:\n  "
+              . join("\n  ", @missing);
+
+    ok $checked >= 80, "checked a real number of documented methods ($checked)";
 };
 
 subtest 'the machine reference shows code that compiles' => sub {

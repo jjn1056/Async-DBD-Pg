@@ -103,7 +103,7 @@ over. A transaction holds its connection across every await inside the body.
     await $conn->cursor($sql, @bind, { batch_size => 100 });
     $conn->cancel;  $conn->release;  $conn->dbh;
     $conn->in_transaction;  $conn->is_released;  $conn->query_count;
-    $conn->id;  $conn->server_version;
+    $conn->id;  $conn->server_version;  $conn->created_at;  $conn->last_used;
 
 ## Results: Async::DBD::Pg::Results
 
@@ -197,6 +197,7 @@ broadcast namespace, not a work queue.
     await $pg->unlisten_all;
     my $ps = $pg->pubsub;
     $ps->is_connected;  $ps->subscribed_channels;
+    await $ps->connect;  await $ps->disconnect;   # usually implicit
 
 ## Errors
 
@@ -210,8 +211,11 @@ they need no `can` guard:
                                           # ->is_foreign_key_violation,
                                           # ->is_not_null_violation
     Async::DBD::Pg::Error::Connection
-    Async::DBD::Pg::Error::PoolExhausted
+    Async::DBD::Pg::Error::PoolExhausted   # ->pool_size
     Async::DBD::Pg::Error::Timeout
+
+All carry ->message; Query adds ->severity and ->schema alongside the fields
+listed above.
 
 ## Gotchas
 
