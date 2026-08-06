@@ -200,10 +200,9 @@ broadcast namespace, not a work queue.
 
 ## Errors
 
-Failures are objects that stringify, thrown as exceptions:
-
-Thrown, not returned, so `eval { await ... ; 1 } or do { $@ }` catches them.
-Predicates answer on every class, so they need no `can` guard.
+Failures are objects that stringify. Thrown, not returned, so `eval { await
+... ; 1 } or do { $@ }` catches them. Predicates answer on every class, so
+they need no `can` guard:
 
     Async::DBD::Pg::Error::Query          # ->state, ->state_name, ->constraint,
                                           # ->detail, ->hint, ->table, ->column,
