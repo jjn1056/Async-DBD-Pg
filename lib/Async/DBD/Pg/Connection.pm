@@ -252,16 +252,33 @@ sub _warn_if_several {
     return;
 }
 
-# True if any bind names its type rather than giving the numeric OID. Cheap,
-# and it runs on every query, so it is a scan of binds already in hand and
-# never a second pass over anything.
+# True for a { type => ..., value => ... } bind whose type is not already a
+# numeric OID: either a type name still to resolve, or undef, which is a
+# caller mistake -- not "no type given" -- since the hashref shape says a
+# type was meant to be here. Shared by the array-level scan below and the
+# resolve loop so the two can never disagree about which binds need the
+# loop's attention.
+sub _names_a_type {
+    my ($value) = @_;
+
+    return 0 unless ref $value eq 'HASH';
+    return 0 unless exists $value->{type} && exists $value->{value};
+    return 1 unless defined $value->{type};
+    return $value->{type} !~ /\A[0-9]+\z/ ? 1 : 0;
+}
+
+# True if any bind needs the resolve loop below: a named type to look up, or
+# an undef type to reject. This is its own pass over @$bind, and when it
+# finds something, _resolve_bind_types copies the array and makes a second
+# pass over the copy. Both passes are only a ref test per bind, negligible
+# next to the round trip the query itself makes, which is why running this
+# scan on every query is fine even though most queries have nothing to
+# resolve.
 sub _binds_name_a_type {
     my ($bind) = @_;
 
     for my $value (@$bind) {
-        next unless ref $value eq 'HASH';
-        next unless exists $value->{type} && exists $value->{value};
-        return 1 if defined $value->{type} && $value->{type} !~ /\A[0-9]+\z/;
+        return 1 if _names_a_type($value);
     }
 
     return 0;
@@ -282,9 +299,14 @@ sub _resolve_bind_types {
     for my $i (0 .. $#resolved) {
         my $value = $resolved[$i];
 
-        next unless ref $value eq 'HASH';
-        next unless exists $value->{type} && exists $value->{value};
-        next unless defined $value->{type} && $value->{type} !~ /\A[0-9]+\z/;
+        next unless _names_a_type($value);
+
+        croak 'Bind parameter ' . ($i + 1) . ' gave type => undef. A typed '
+            . 'bind with no type resolves to nothing and would reach '
+            . 'bind_param untyped, silently losing data -- an embedded NUL '
+            . 'in a bytea value, for instance. Give a type name or numeric '
+            . 'OID, or bind the value without the hashref'
+            unless defined $value->{type};
 
         my $oid = $TYPE_OID{ lc $value->{type} };
 

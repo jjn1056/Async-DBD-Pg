@@ -114,6 +114,30 @@ subtest 'an unknown type name croaks and names the type' => sub {
     $pg->shutdown(timeout => 5)->get;
 };
 
+subtest 'a bind with type => undef croaks rather than silently losing data' => sub {
+    my $pg = pool();
+    my $conn = $pg->connection->get;
+
+    # { type => undef, value => ... } is what a mapper produces when its own
+    # type lookup misses -- the hashref has both keys, so it looks like a
+    # typed bind, but with no type to resolve it used to fall through to
+    # bind_param(..., { pg_type => undef }), an untyped bind. For bytea that
+    # truncates at the first embedded NUL and reports success: exactly the
+    # silent loss typed binds exist to prevent.
+    my $err = dies {
+        $conn->query_value('SELECT $1::bytea',
+            { type => undef, value => "a\0bcd" })->get
+    };
+
+    like "$err", qr/type => undef/, 'the message names the problem';
+
+    ok lives { $conn->query_value('SELECT 42')->get },
+        'and the connection stays usable afterwards';
+
+    $conn->release;
+    $pg->shutdown(timeout => 5)->get;
+};
+
 subtest 'a numeric type is passed through untouched' => sub {
     my @sql;
     my $pg = pool(on_query => sub { push @sql, $_[0]{sql} });
