@@ -530,6 +530,30 @@ share one -- through L</with_connection> or L</transaction>, which give it
 back for you.
 ```
 
+- [ ] **Step 1a: Resolve an apparent contradiction between two sections**
+
+The `connection` documentation says an `async sub` holds its lexicals, "so in
+practice the destructor does not run" -- which is why an unreleased connection
+is lost. But `with_connection` reliably gives its connection back even when the
+body dies, and it is also inside an `async sub`. Both statements are true and a
+careful reader comparing them will stall on it. Found by the Task 3 reviewer.
+
+Add this to the end of the pool-and-connection section:
+
+```pod
+This is also why C<with_connection> can promise something C<connection>
+cannot. Dying inside the block unwinds the scope in the ordinary way, and the
+guard holding the checkout is released as part of that unwind -- immediately,
+not whenever the enclosing C<async sub> is eventually collected. A connection
+you took by hand has no such guard: nothing is watching the scope on your
+behalf, so nothing gives it back.
+```
+
+Verify the claim before writing it rather than taking it from this plan: read
+`Async::DBD::Pg::_ReleaseGuard` and confirm its C<DESTROY> is what releases,
+and that C<with_connection> wraps the checkout in one. Say in your report what
+you found.
+
 - [ ] **Step 2: Add the short form to README**
 
 Before the transaction example, replacing "Several statements that must share a connection go through...":
