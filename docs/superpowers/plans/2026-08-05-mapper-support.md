@@ -27,7 +27,7 @@
 | File | Responsibility in this plan |
 |---|---|
 | `lib/Async/DBD/Pg/Connection.pm` | `_resolve_bind_types` and `_type_oid` (Task 1); the diagnostics-ordering comment (Task 3); `id` accessor and the `connection` event field (Task 4) |
-| `lib/Async/DBD/Pg.pm` | Per-pool type-OID cache (Task 1); `server_version`, connection id counter (Task 4); POD for all of it |
+| `lib/Async/DBD/Pg.pm` | Per-pool type-OID cache (Task 1); `server_version`, connection id counter (Task 4). Task 1 adds no POD here -- typed binds are documented in Connection.pm, which already owns that section |
 | `lib/Async/DBD/Pg/Results.pm` | `map_rows` (Task 2) |
 | `lib/Async/DBD/Pg/Error.pm` | Three violation predicates (Task 3) |
 | `t/integration/typed-binds.t` | **new** -- Task 1 |
@@ -44,7 +44,7 @@ Task order follows the spec's "Order of work": binds first because the mapper ca
 
 **Files:**
 - Modify: `lib/Async/DBD/Pg/Connection.pm` (`query`, plus two new private methods)
-- Modify: `lib/Async/DBD/Pg.pm` (pool-level cache, POD)
+- Modify: `lib/Async/DBD/Pg.pm` (pool-level type-OID cache only; no POD -- the typed-bind docs live in Connection.pm)
 - Modify: `llms.txt`
 - Test: `t/integration/typed-binds.t` (create)
 
@@ -343,31 +343,29 @@ Expected: PASS, 5 subtests, no stray output.
 
 - [ ] **Step 9: Document it**
 
-In `lib/Async/DBD/Pg.pm`, find `=head3 on_query` and insert this new section immediately **before** it:
+`Async::DBD::Pg::Connection` already owns this topic at `=head3 Typed bind parameters`. Extend that section; add **nothing** to `Async::DBD::Pg`, which has no typed-bind POD and must not grow a duplicate one.
+
+Do NOT insert a new `=head2` before `=head3 on_query` in `Pg.pm`. That `on_query` is a `=head3` inside the `=head2 new(%args)` run, so a `=head2` there would re-parent on_query, reconnect, and heal_dead_connections under the new heading in rendered docs.
+
+In `lib/Async/DBD/Pg/Connection.pm`, inside the existing `=head3 Typed bind parameters`, insert this immediately after the paragraph ending "...familiar if you have used that." and before "A value that is a hashref without both keys is not a typed parameter". It is POD body text -- do not add new `=head` directives:
 
 ```pod
-=head2 Typed bind parameters
+The type may also be given by name, which is what
+L<Async::DBD::Pg::Results/types> reports and what an application that has
+read C<pg_catalog> already holds:
 
-A bind may carry its own PostgreSQL type, which matters most for C<bytea>:
-sent as text, a value is truncated at its first NUL byte and the write
-reports success.
-
-    use DBD::Pg qw(:pg_types);
-    await $pg->query('INSERT INTO f (body) VALUES ($1)',
-        { type => PG_BYTEA, value => $bytes });
-
-The type may also be given by name, which is what C<types> reports and what
-an application reading C<pg_catalog> already has:
-
-    await $pg->query('INSERT INTO f (body) VALUES ($1)',
-        { type => 'bytea', value => $bytes });
+    await $conn->query('INSERT INTO files (name, body) VALUES ($1, $2)',
+        $name, { type => 'bytea', value => $bytes });
 
 Names are resolved by PostgreSQL itself, through C<to_regtype>, so they
 follow C<search_path> and reach user-defined enums and extension types as
 well as built-ins. Resolution costs one round trip the first time a given
-name is used on a pool and nothing afterwards. A name PostgreSQL does not
-know croaks, naming the type -- binding it untyped instead is how a C<bytea>
-gets silently truncated.
+name is used on a pool and nothing afterwards. The lookup is an ordinary
+statement, so it is reported to L<Async::DBD::Pg/on_query> like any other.
+
+A name PostgreSQL does not know croaks, naming the type. Binding it
+untyped instead is how a C<bytea> is silently truncated, which is the
+whole reason typed binds exist.
 
 Numeric types are passed straight through, so C<:pg_types> constants keep
 working and cost no lookup.
