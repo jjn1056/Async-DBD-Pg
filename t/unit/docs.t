@@ -242,4 +242,39 @@ subtest 'the public API is covered by the machine reference' => sub {
     is \@missing_pool, [], 'and every pool entry point';
 };
 
+subtest 'the machine reference shows code that compiles' => sub {
+    # This file exists to be read by code generators, so a snippet that
+    # cannot compile becomes generated code that cannot run. The method-name
+    # check above cannot see this: `await $pg->query(...)` at file scope
+    # names a real method and is still a syntax error.
+    open my $fh, '<', 'llms.txt' or die "cannot read llms.txt: $!";
+    my @lines = <$fh>;
+    close $fh;
+
+    # Indented blocks are the code samples.
+    my (@blocks, @current);
+    for my $line (@lines, "\n") {
+        if ($line =~ /^\s{4}\S/) { push @current, $line; next }
+        push @blocks, join('', @current) if @current;
+        @current = ();
+    }
+
+    my $checked = 0;
+    for my $code (@blocks) {
+        next unless $code =~ /\bawait\b|\bAsync::DBD::Pg\b/;
+
+        # Wrapped exactly as the SYNOPSIS check wraps: await is legal only
+        # inside an async sub, and a reference names variables it never
+        # declares.
+        my $ok = eval "use feature 'say'; no strict; no warnings; "
+                    . "my \$unused = async sub {\n$code\n}; 1";
+        my $err = $@; $err =~ s/\s+at\s\(eval.*//s; $err =~ s/\n.*//s;
+
+        ok $ok, 'llms.txt block compiles' or diag "$err\n$code";
+        $checked++;
+    }
+
+    ok $checked >= 5, "checked a real number of blocks ($checked)";
+};
+
 done_testing;

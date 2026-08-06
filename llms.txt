@@ -11,13 +11,21 @@ Requires Perl 5.24+, DBD::Pg 3.20.0+.
     use Future::AsyncAwait;
     use Future::IO;
     use Async::DBD::Pg;
+
+    # Required: without it Future::IO drives one filehandle at a time and
+    # the pool runs serially, with no error and no warning.
     BEGIN { Future::IO->load_best_impl }
 
     my $pg = Async::DBD::Pg->new(dsn => 'postgresql://user:pass@host/db');
 
+    # await is legal only inside an async sub.
+    (async sub {
     my $row   = await $pg->query_row('SELECT * FROM users WHERE id = $1', 42);
     my $count = await $pg->query_value('SELECT count(*) FROM users');
     my $rs    = await $pg->query('SELECT id, name FROM users');
+    })->()->get;
+
+    await $pg->shutdown(timeout => 5);
 
 ## Placeholders
 
@@ -35,10 +43,8 @@ Binary and other typed values must say their type, or a NUL byte silently
 truncates the value. The type may be a constant or a name:
 
     use DBD::Pg qw(:pg_types);
-    await $pg->query('INSERT INTO f (body) VALUES ($1)',
-        { type => PG_BYTEA, value => $bytes });
-    await $pg->query('INSERT INTO f (body) VALUES ($1)',
-        { type => 'bytea', value => $bytes });
+    await $pg->query('INSERT INTO f (body) VALUES ($1)', { type => PG_BYTEA, value => $bytes });
+    await $pg->query('INSERT INTO f (body) VALUES ($1)', { type => 'bytea', value => $bytes });
 
 Names are DBD::Pg's PG_* constants lowercased ('bytea', 'jsonb'), resolved
 from a load-time map, so no round trip. A type DBD::Pg does not know (a user
@@ -48,19 +54,19 @@ it untyped or cast in SQL. Note 'char' is PG_CHAR (1 byte); SQL CHAR(n) is
 
 ## Pool: Async::DBD::Pg
 
-    Async::DBD::Pg->new(dsn => $dsn, min_connections => 2, max_connections => 10)
-    await $pg->query($sql, @bind)        # Results
-    await $pg->query_row($sql, @bind)    # one hashref, or undef
-    await $pg->query_value($sql, @bind)  # one value, or undef
-    await $pg->query_list($sql, @bind)   # one row as a list: my ($id, $name) = ...
-    await $pg->connection                # check out a Connection yourself
-    await $pg->with_connection($code, @args)  # scoped checkout, always released
-    await $pg->transaction($code, @args)      # commit, or rollback and rethrow
-    await $pg->shutdown(timeout => 5)
-    $pg->on_query(sub { my ($e) = @_ })  # {sql, binds, elapsed, rows, error, cached, connection}
-    $pg->server_version                  # 160014, integer, for feature gating
-    $pg->stats  $pg->idle_count  $pg->active_count  $pg->waiting_count
-    $pg->total_count  $pg->is_healthy  $pg->is_shut_down  $pg->safe_dsn
+    Async::DBD::Pg->new(dsn => $dsn, min_connections => 2, max_connections => 10);
+    await $pg->query($sql, @bind);        # Results
+    await $pg->query_row($sql, @bind);    # one hashref, or undef
+    await $pg->query_value($sql, @bind);  # one value, or undef
+    await $pg->query_list($sql, @bind);   # one row as a list: my ($id, $name) = ...
+    await $pg->connection;                # check out a Connection yourself
+    await $pg->with_connection($code, @args);  # scoped checkout, always released
+    await $pg->transaction($code, @args);      # commit, or rollback and rethrow
+    await $pg->shutdown(timeout => 5);
+    $pg->on_query(sub { my ($e) = @_ });  # {sql, binds, elapsed, rows, error, cached, connection}
+    $pg->server_version;                  # 160014, integer, for feature gating
+    $pg->stats;  $pg->idle_count;  $pg->active_count;  $pg->waiting_count;
+    $pg->total_count;  $pg->is_healthy;  $pg->is_shut_down;  $pg->safe_dsn;
 
 Constructor options: `dsn`, `min_connections`, `max_connections`,
 `connect_timeout`, `statement_timeout`, `max_queries`, `statement_cache_size`,
@@ -77,18 +83,18 @@ over. A transaction holds its connection across every await inside the body.
 
 ## Connection: Async::DBD::Pg::Connection
 
-    await $conn->query($sql, @bind)
-    await $conn->query($sql, @bind, { timeout => 5 })
-    await $conn->query_row($sql, @bind)
-    await $conn->query_value($sql, @bind)
-    await $conn->transaction($code, @args)   # nests via savepoints
-    await $conn->transaction({ retry => 3 }, $code)  # retries 40001/40P01 only
-    await $conn->advisory_lock($key)         # xact-scoped; inside a transaction
-    await $conn->try_advisory_lock($key)     # false rather than waiting
-    await $conn->cursor($sql, @bind, { batch_size => 100 })
-    $conn->cancel  $conn->release  $conn->dbh
-    $conn->in_transaction  $conn->is_released  $conn->query_count
-    $conn->id  $conn->server_version
+    await $conn->query($sql, @bind);
+    await $conn->query($sql, @bind, { timeout => 5 });
+    await $conn->query_row($sql, @bind);
+    await $conn->query_value($sql, @bind);
+    await $conn->transaction($code, @args);   # nests via savepoints
+    await $conn->transaction({ retry => 3 }, $code);  # retries 40001/40P01 only
+    await $conn->advisory_lock($key);         # xact-scoped; inside a transaction
+    await $conn->try_advisory_lock($key);     # false rather than waiting
+    await $conn->cursor($sql, @bind, { batch_size => 100 });
+    $conn->cancel;  $conn->release;  $conn->dbh;
+    $conn->in_transaction;  $conn->is_released;  $conn->query_count;
+    $conn->id;  $conn->server_version;
 
 ## Results: Async::DBD::Pg::Results
 
@@ -165,7 +171,7 @@ Streams a large result without holding it in memory.
     await $cur->each(sub { my ($row) = @_ }, @args);
     await $cur->all;                             # Collection of rows
     await $cur->close;
-    $cur->name  $cur->batch_size  $cur->is_exhausted  $cur->is_closed
+    $cur->name;  $cur->batch_size;  $cur->is_exhausted;  $cur->is_closed;
 
 `batch_size` is rows per round trip, not what `next` returns. No `reset`: a
 server-side cursor is consumed, and re-running the query is a different
@@ -181,7 +187,7 @@ broadcast namespace, not a work queue.
     await $pg->unlisten('channel');
     await $pg->unlisten_all;
     my $ps = $pg->pubsub;
-    $ps->is_connected  $ps->subscribed_channels
+    $ps->is_connected;  $ps->subscribed_channels;
 
 ## Errors
 
