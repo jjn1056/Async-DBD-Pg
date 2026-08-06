@@ -32,11 +32,19 @@ Two forms, not mixable in one statement:
     await $pg->query('SELECT tags[:2] FROM posts');           # array slice
 
 Binary and other typed values must say their type, or a NUL byte silently
-truncates the value:
+truncates the value. The type may be a constant or a name:
 
     use DBD::Pg qw(:pg_types);
     await $pg->query('INSERT INTO f (body) VALUES ($1)',
         { type => PG_BYTEA, value => $bytes });
+    await $pg->query('INSERT INTO f (body) VALUES ($1)',
+        { type => 'bytea', value => $bytes });
+
+Names are DBD::Pg's PG_* constants lowercased ('bytea', 'jsonb'), resolved
+from a load-time map, so no round trip. A type DBD::Pg does not know (a user
+enum, an extension type) croaks -- it cannot be bound by type at all, so bind
+it untyped or cast in SQL. Note 'char' is PG_CHAR (1 byte); SQL CHAR(n) is
+'bpchar'.
 
 ## Pool: Async::DBD::Pg
 

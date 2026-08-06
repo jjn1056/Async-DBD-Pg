@@ -18,6 +18,30 @@ use Async::DBD::Pg::Error;
 use Async::DBD::Pg::Results;
 use Async::DBD::Pg::Util qw(convert_placeholders);
 
+# name => OID for a bind that names its PostgreSQL type, derived from
+# DBD::Pg's own :pg_types exports rather than a table maintained here:
+# PG_BYTEA becomes 'bytea'. That is by construction exactly the set
+# bind_param accepts, which resolving through PostgreSQL is not -- to_regtype
+# happily returns the OID of a user-defined enum, and bind_param then refuses
+# it with "Cannot bind 1 unknown pg_type 65025".
+#
+# Such a type does not need a typed bind in any case: it is text on the wire.
+# The types that need one -- bytea above all, whose text form truncates at the
+# first NUL -- are exactly the ones DBD::Pg knows.
+#
+# 29 of these are pseudo-types (any, internal, record, trigger, void) that
+# bind_param refuses. They are left in rather than filtered by a list that
+# would rot against DBD::Pg's next release; nobody binds them.
+#
+# 'char' follows DBD::Pg's PG_CHAR, the internal single-byte type (18), not
+# SQL CHAR(n), which is 'bpchar' (1042).
+my %TYPE_OID = do {
+    no strict 'refs';
+    map  { ( lc(substr $_, 3) => &{"DBD::Pg::$_"}() ) }
+    grep { /\APG_./ }
+    @{ $DBD::Pg::EXPORT_TAGS{pg_types} || [] };
+};
+
 sub new {
     my ($class, %args) = @_;
     my $self = bless {
@@ -76,10 +100,9 @@ async sub query {
         }
     }
 
-    # Before the timer starts and outside any timeout: resolving a type name
-    # is setup for the caller's query, not part of it, and it happens at most
-    # once per name for the life of the pool.
-    $bind = await $self->_resolve_bind_types($bind);
+    # Synchronous: the map is built at load time, so this costs no round trip
+    # and needs no await.
+    $bind = $self->_resolve_bind_types($bind);
 
     # Once per checkout, and only for a connection that was idle.
     if (delete $self->{_check_liveness}) {
@@ -234,11 +257,10 @@ sub _binds_name_a_type {
 
 # Rewrite { type => 'bytea' } to { type => 17 } before the bind loop sees it.
 #
-# Done here rather than inside the loop because that loop runs in a
-# synchronous closure inside _capture_pg_notices, with no await available --
-# and because a croak raised in there would be caught by the surrounding eval
-# and re-reported as a query error rather than as the caller's mistake.
-async sub _resolve_bind_types {
+# Done here rather than inside that loop because a croak raised in there would
+# be caught by the surrounding eval and re-reported as a query error rather
+# than as the caller's mistake.
+sub _resolve_bind_types {
     my ($self, $bind) = @_;
 
     return $bind unless _binds_name_a_type($bind);
@@ -252,37 +274,18 @@ async sub _resolve_bind_types {
         next unless exists $value->{type} && exists $value->{value};
         next unless defined $value->{type} && $value->{type} !~ /\A[0-9]+\z/;
 
-        my $oid = await $self->_type_oid($value->{type});
+        my $oid = $TYPE_OID{ lc $value->{type} };
 
-        croak "Unknown PostgreSQL type name '$value->{type}' for bind parameter "
-            . ($i + 1)
+        croak "Unknown PostgreSQL type name '$value->{type}' for bind "
+            . 'parameter ' . ($i + 1) . '. Names are DBD::Pg\'s, such as '
+            . 'bytea or jsonb; a type DBD::Pg does not know cannot be bound '
+            . 'by type at all, so bind it untyped or cast it in SQL'
             unless defined $oid;
 
         $resolved[$i] = { type => $oid, value => $value->{value} };
     }
 
     return \@resolved;
-}
-
-# One round trip the first time a given name is seen on this pool, none
-# afterwards -- including for a name PostgreSQL does not know, whose undef is
-# cached too so a typo does not re-ask on every query.
-#
-# The lookup runs on this connection rather than checking out another: a pool
-# of size one has no second connection to give, and asking for one while
-# holding the only one is a deadlock.
-async sub _type_oid {
-    my ($self, $name) = @_;
-
-    my $key  = lc $name;
-    my $pool = $self->{pool};
-
-    return undef unless $pool;
-    return $pool->_cached_type_oid($key) if $pool->_type_oid_is_cached($key);
-
-    my $result = await $self->query('SELECT to_regtype($1)::oid AS oid', $key);
-
-    return $pool->_cache_type_oid($key, $result->first_value);
 }
 
 sub _parse_query_args {
@@ -1224,6 +1227,32 @@ scalar you hold; C<bytea> is simply the case where the loss is silent.
 Perl has no distinct binary type to detect, which is why the type has to be
 stated rather than inferred. The convention is L<Mojo::Pg>'s, so it should be
 familiar if you have used that.
+
+The type may also be given by name, which is what
+L<Async::DBD::Pg::Results/types> reports and what an application that has
+read C<pg_catalog> already holds:
+
+    await $conn->query('INSERT INTO files (name, body) VALUES ($1, $2)',
+        $name, { type => 'bytea', value => $bytes });
+
+The names are DBD::Pg's own, its C<PG_*> constants lowercased with the
+prefix dropped, so C<PG_BYTEA> is C<'bytea'>. Resolution happens against a
+map built when the module loads and costs no round trip.
+
+That set is exactly what DBD::Pg is able to bind. A type it does not know
+-- a user-defined enum, a domain, an extension type -- croaks here, naming
+the type. It cannot be bound by type at all: bind it untyped, or cast it in
+SQL. This is no loss, because such a type does not need a typed bind; it is
+text on the wire. The types that need one, C<bytea> above all, are exactly
+the ones DBD::Pg knows.
+
+Two names are worth knowing. C<'char'> is DBD::Pg's C<PG_CHAR>, PostgreSQL's
+internal single-byte type -- SQL C<CHAR(n)> is C<'bpchar'>. And the map
+includes pseudo-types such as C<'internal'> and C<'trigger'>, which resolve
+but which DBD::Pg refuses to bind; nothing sensible binds them.
+
+Numeric types are passed straight through, so C<:pg_types> constants keep
+working and cost no lookup.
 
 A value that is a hashref without both keys is not a typed parameter, and
 reaches DBD::Pg as a reference, which it refuses.

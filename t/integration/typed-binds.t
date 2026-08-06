@@ -49,23 +49,48 @@ subtest 'a type name binds the same bytes as the constant' => sub {
     $pg->shutdown(timeout => 5)->get;
 };
 
-subtest 'each name is resolved once, and only when one is used' => sub {
+subtest 'a type DBD::Pg cannot bind croaks, naming the type' => sub {
+    my $pg = pool();
+    my $conn = $pg->connection->get;
+
+    $conn->query('SET client_min_messages = warning')->get;
+    $conn->query('DROP TYPE IF EXISTS mapper_mood CASCADE')->get;
+    $conn->query("CREATE TYPE mapper_mood AS ENUM ('ok', 'bad')")->get;
+
+    # bind_param refuses any OID outside DBD::Pg's own table, so naming a
+    # user-defined type has to fail -- the question is only whether it fails
+    # legibly here or as "Cannot bind 1 unknown pg_type 65025" deep inside
+    # DBD::Pg. This is the case that decided the design.
+    my $err = dies {
+        $conn->query_value('SELECT $1::mapper_mood::text',
+            { type => 'mapper_mood', value => 'ok' })->get
+    };
+
+    like "$err", qr/mapper_mood/, 'the message names the type, not an OID';
+
+    # And it did not need a typed bind in the first place: an enum is text on
+    # the wire. This is the documented way to bind one.
+    my $value = $conn->query_value('SELECT $1::mapper_mood::text', 'ok')->get;
+    is $value, 'ok', 'binding it untyped works, which is why this is no loss';
+
+    $conn->query('DROP TYPE mapper_mood')->get;
+    $conn->release;
+    $pg->shutdown(timeout => 5)->get;
+};
+
+subtest 'resolving a name costs no query of its own' => sub {
     my @sql;
     my $pg = pool(on_query => sub { push @sql, $_[0]{sql} });
     my $conn = $pg->connection->get;
 
-    # No bind names a type, so nothing is resolved at all.
-    $conn->query_value('SELECT $1::int', 1)->get;
-    is scalar(grep { /to_regtype/ } @sql), 0,
-        'an untyped query resolves nothing';
-
     @sql = ();
     $conn->query_value('SELECT length($1)', { type => 'bytea', value => 'abc' })->get;
-    $conn->query_value('SELECT length($1)', { type => 'bytea', value => 'defg' })->get;
-    $conn->query_value('SELECT length($1)', { type => 'BYTEA', value => 'hi' })->get;
+    $conn->query_value('SELECT length($1)', { type => 'BYTEA', value => 'defg' })->get;
 
-    is scalar(grep { /to_regtype/ } @sql), 1,
-        'one resolution serves every later bind of that name, case-insensitively';
+    # The map is built at load time, so the only statements are the caller's.
+    is scalar(@sql), 2,
+        'two queries in, two statements out -- no lookup round trip, and the '
+      . 'name is matched case-insensitively';
 
     $conn->release;
     $pg->shutdown(timeout => 5)->get;
@@ -94,12 +119,12 @@ subtest 'a numeric type is passed through untouched' => sub {
     my $pg = pool(on_query => sub { push @sql, $_[0]{sql} });
     my $conn = $pg->connection->get;
 
+    @sql = ();
     my $n = $conn->query_value('SELECT length($1)',
         { type => PG_BYTEA, value => "ab\0cd" })->get;
 
     is $n, 5, 'the constant form still works, NUL and all';
-    is scalar(grep { /to_regtype/ } @sql), 0,
-        'and costs no resolution round trip';
+    is scalar(@sql), 1, 'and adds no statement of its own';
 
     $conn->release;
     $pg->shutdown(timeout => 5)->get;
