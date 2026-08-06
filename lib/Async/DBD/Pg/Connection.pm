@@ -55,11 +55,12 @@ sub new {
         in_transaction  => 0,
         _savepoint_depth => 0,
 
-        # Statement cache. Keyed on the converted SQL, so the :name and $1
-        # spellings of one query share an entry. Lives here rather than
-        # anywhere more general because only the connection sees the
-        # statement guard's exits, which is what says whether a handle is
-        # still fit to reuse.
+        # Statement cache. Keyed on the converted SQL plus the types its binds
+        # carry -- see _cache_key -- so the :name and $1 spellings of one query
+        # share an entry while two calls with different type intent do not.
+        # Lives here rather than anywhere more general because only the
+        # connection sees the statement guard's exits, which is what says
+        # whether a handle is still fit to reuse.
         statement_cache_size => $args{statement_cache_size} // 0,
         _stmt_cache          => {},
         _stmt_lru            => [],
@@ -510,14 +511,45 @@ sub _capture_pg_notices {
 # Core async query execution using DBD::Pg async support
 # Look the statement up, or prepare and remember it. Returns the handle and
 # whether it came from the cache, which the on_query event reports.
+# The cache key: the converted SQL, plus the types the binds carry.
+#
+# A type set with bind_param persists on the handle for later executes -- DBI
+# documents this, and it survives passing values to execute() as well. So a
+# handle bound (untyped, bytea) hands that bytea type to a later
+# (untyped, untyped) call on the same handle, and the second caller's value
+# goes to the server as something it never asked for. Two calls with different
+# type intent must therefore never share a handle.
+#
+# Clearing a type is not available: neither an empty attribute hash nor
+# pg_type => 0 clears one, and there is no synthetic default to overwrite it
+# with -- "untyped" is not PG_TEXT, which turns `WHERE n = $1` on an integer
+# into a comparison against text that matches nothing.
+#
+# A bind list with no typed position keys on the bare SQL, so the common case
+# is byte-for-byte the key it always was.
+sub _cache_key {
+    my ($sql, $bind) = @_;
+
+    my @signature = map {
+        ref $_ eq 'HASH' && exists $_->{type} && exists $_->{value}
+            ? ( $_->{type} // '' )
+            : ''
+    } @$bind;
+
+    return $sql unless grep { $_ ne '' } @signature;
+
+    # NUL, because it cannot appear in a statement that reached this far.
+    return join "\0", $sql, join(',', @signature);
+}
+
 sub _statement_for {
-    my ($self, $sql) = @_;
+    my ($self, $key, $sql) = @_;
 
     my $size = $self->{statement_cache_size};
 
     return ($self->_prepare_statement($sql), 0) unless $size;
 
-    if (my $sth = $self->{_stmt_cache}{$sql}) {
+    if (my $sth = $self->{_stmt_cache}{$key}) {
         # A cached handle that has lost its server-side statement has lost the
         # cached plan whose 0A000 is the only thing standing between a
         # result-shape change and a segfault. Nothing observed today puts a
@@ -526,13 +558,13 @@ sub _statement_for {
         # and fatal to get wrong.
         if (length($sth->{pg_prepare_name} // '')) {
             # Most recently used goes to the end.
-            @{ $self->{_stmt_lru} } = grep { $_ ne $sql } @{ $self->{_stmt_lru} };
-            push @{ $self->{_stmt_lru} }, $sql;
+            @{ $self->{_stmt_lru} } = grep { $_ ne $key } @{ $self->{_stmt_lru} };
+            push @{ $self->{_stmt_lru} }, $key;
 
             return ($sth, 1);
         }
 
-        $self->_evict_statement($sql);
+        $self->_evict_statement($key);
     }
 
     my $sth = $self->_prepare_statement($sql);
@@ -544,8 +576,8 @@ sub _statement_for {
     # the server, at the price of the one crash this cache can cause.
     return ($sth, 0) unless $sth->{NUM_OF_PARAMS};
 
-    $self->{_stmt_cache}{$sql} = $sth;
-    push @{ $self->{_stmt_lru} }, $sql;
+    $self->{_stmt_cache}{$key} = $sth;
+    push @{ $self->{_stmt_lru} }, $key;
 
     # Dropping the reference is what makes DBD::Pg deallocate the server-side
     # statement, so the bound is a server-memory bound as much as a local one.
@@ -584,12 +616,12 @@ sub _prepare_statement {
 # known to be good: an error, a cancellation, or a server that says the
 # prepared statement it names is not there.
 sub _evict_statement {
-    my ($self, $sql) = @_;
+    my ($self, $key) = @_;
 
-    return unless defined $sql && $self->{statement_cache_size};
+    return unless defined $key && $self->{statement_cache_size};
 
-    delete $self->{_stmt_cache}{$sql};
-    @{ $self->{_stmt_lru} } = grep { $_ ne $sql } @{ $self->{_stmt_lru} };
+    delete $self->{_stmt_cache}{$key};
+    @{ $self->{_stmt_lru} } = grep { $_ ne $key } @{ $self->{_stmt_lru} };
 
     return;
 }
@@ -620,7 +652,7 @@ async sub _execute_async {
     die $err unless $self->{statement_cache_size};
     die $err unless ref $err && $CACHE_STALE{ eval { $err->state } // '' };
 
-    $self->_evict_statement($sql);
+    $self->_evict_statement(_cache_key($sql, $bind));
 
     return await $self->_execute_once($sql, $bind);
 }
@@ -637,7 +669,8 @@ async sub _execute_once {
     # scan reads PostgreSQL's own syntax as placeholders -- jsonb's ?, ?| and
     # ?& operators, and the open array slice arr[:2] -- and the statement dies
     # at execute on a placeholder the caller never wrote.
-    my ($sth, $cached) = $self->_statement_for($sql);
+    my $key = _cache_key($sql, $bind);
+    my ($sth, $cached) = $self->_statement_for($key, $sql);
     $self->{_last_was_cached} = $cached;
 
     # Hold the in-flight handle on the connection. A query abandoned part way
@@ -652,7 +685,7 @@ async sub _execute_once {
     # fate: hand_over means Results finished the handle cleanly and it stays;
     # release and destruction both mean the handle's state is unknown, and an
     # unknown handle must not be handed to the next caller.
-    my $statement = Async::DBD::Pg::Connection::_StatementGuard->new($self, $sth, $sql);
+    my $statement = Async::DBD::Pg::Connection::_StatementGuard->new($self, $sth, $key);
 
     my $rv = eval {
         $self->_capture_pg_notices(sub {
@@ -1138,11 +1171,11 @@ use warnings;
 use Scalar::Util qw(weaken);
 
 sub new {
-    my ($class, $conn, $sth, $sql) = @_;
+    my ($class, $conn, $sth, $key) = @_;
 
     $conn->{_active_sth} = $sth;
 
-    my $self = bless { conn => $conn, sql => $sql }, $class;
+    my $self = bless { conn => $conn, key => $key }, $class;
     weaken($self->{conn});
 
     return $self;
@@ -1154,7 +1187,7 @@ sub release {
     my ($self) = @_;
 
     my $conn = delete $self->{conn} or return;
-    $conn->_evict_statement(delete $self->{sql});
+    $conn->_evict_statement(delete $self->{key});
     $conn->_release_active_sth;
 }
 
@@ -1164,7 +1197,7 @@ sub hand_over {
     my ($self) = @_;
 
     my $conn = delete $self->{conn} or return;
-    delete $self->{sql};
+    delete $self->{key};
     delete $conn->{_active_sth};
 }
 
