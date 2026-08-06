@@ -31,7 +31,12 @@ my $pg = Async::DBD::Pg->new(
     my $rs = await $pg->query('SELECT id, name FROM users WHERE active');
     print $_->{name}, "\n" for @{ $rs->rows };
 })->()->get;
+
+await $pg->shutdown(timeout => 5);
 ```
+
+A long-running program should shut the pool down when it is done, so
+in-flight work finishes rather than being cut off.
 
 `$pg->query` runs one statement on any free connection and gives it straight
 back. Statements that must see each other -- a transaction, a cursor, a
@@ -104,7 +109,8 @@ and so does `multi`, which is lossless.
 The rest of the surface:
 
 ```perl
-$rs->columns  $rs->types  $rs->count  $rs->elapsed
+$rs->columns  $rs->types  $rs->count
+$rs->elapsed        # query duration, fractional seconds
 $rs->first  $rs->single  $rs->first_value  $rs->first_list
 $rs->get_column('name')->all
 $rs->by('id')  $rs->groups('dept')  $rs->expand
@@ -120,6 +126,43 @@ my $users = $rs->map_rows(sub {
     My::User->new(id => $row->[0], name => $row->[1]);
 });
 ```
+
+## Placeholders
+
+Placeholders come in two forms, not mixable in one statement:
+
+```perl
+await $pg->query('SELECT * FROM t WHERE id = $1 AND x = $2', 1, 'a');
+await $pg->query('SELECT * FROM t WHERE id = :id', { id => 1 });
+```
+
+`?` is not a placeholder here, which leaves PostgreSQL's own operators alone:
+
+```perl
+await $pg->query(q{SELECT data ? 'key' FROM docs});   # jsonb exists
+```
+
+## Typed binds
+
+A value may state its PostgreSQL type. This is required for `bytea`: sent as
+text, a value is truncated at its first NUL byte and the write reports
+success.
+
+```perl
+use DBD::Pg qw(:pg_types);
+
+await $pg->query('INSERT INTO files (name, body) VALUES ($1, $2)',
+    $name, { type => PG_BYTEA, value => $bytes });
+
+# Or by name, which is what ->types reports and what a schema introspection
+# already holds. Matching is case-insensitive.
+await $pg->query('INSERT INTO files (name, body) VALUES ($1, $2)',
+    $name, { type => 'bytea', value => $bytes });
+```
+
+Names are DBD::Pg's `PG_*` constants lowercased. A type DBD::Pg does not know
+-- a user-defined enum, an extension type -- croaks naming the type; such a
+type needs no typed bind anyway, being text on the wire.
 
 ## Requirements
 
