@@ -415,4 +415,57 @@ subtest 'eviction inside an aborted transaction is harmless' => sub {
     $pg->shutdown(timeout => 5)->get;
 };
 
+subtest 'a typed bind does not leak its type to a later untyped one' => sub {
+    my $pg = pool();
+    my $conn = $pg->connection->get;
+
+    $conn->query('SET client_min_messages = warning')->get;
+    $conn->query('DROP TABLE IF EXISTS leak_probe')->get;
+    $conn->query('CREATE TABLE leak_probe (n int, body bytea)')->get;
+
+    # A bytea sent as text truncates at its first NUL. That is why a typed
+    # bind exists, and it makes the leak visible as a length: an untyped bind
+    # must store 1 byte whether or not a typed bind ran before it.
+    my $bytes = "a\0bcd";
+    my $sql   = 'INSERT INTO leak_probe VALUES ($1, $2)';
+
+    $conn->query($sql, 1, $bytes)->get;
+    $conn->query($sql, 2, { type => 'bytea', value => $bytes })->get;
+    $conn->query($sql, 3, $bytes)->get;
+
+    my $got = $conn->query(
+        'SELECT n, length(body) AS len FROM leak_probe ORDER BY n')->get;
+
+    is [ map { $_->{len} } @{ $got->rows } ], [1, 5, 1],
+        'the third call stores what the first did, not what the second did';
+
+    $conn->query('DROP TABLE leak_probe')->get;
+    $conn->release;
+    $pg->shutdown(timeout => 5)->get;
+};
+
+subtest 'each type signature gets its own cache entry' => sub {
+    my $pg = pool();
+    my $conn = $pg->connection->get;
+
+    my $sql = 'SELECT length($1::bytea) AS n';
+
+    $conn->query_value($sql, "a\0bcd")->get;
+    is scalar(keys %{ $conn->{_stmt_cache} }), 1, 'the untyped form cached one';
+
+    $conn->query_value($sql, { type => 'bytea', value => "a\0bcd" })->get;
+    is scalar(keys %{ $conn->{_stmt_cache} }), 2,
+        'the typed form is a second entry, not a reuse of the first';
+
+    # Both stay cached, so a caller alternating the two forms does not thrash.
+    $conn->query_value($sql, "a\0bcd")->get;
+    is scalar(keys %{ $conn->{_stmt_cache} }), 2, 'and both survive';
+
+    ok exists $conn->{_stmt_cache}{$sql},
+        'the all-untyped form still keys on the bare SQL, so nothing else moves';
+
+    $conn->release;
+    $pg->shutdown(timeout => 5)->get;
+};
+
 done_testing;

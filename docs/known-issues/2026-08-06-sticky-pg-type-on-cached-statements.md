@@ -1,10 +1,19 @@
 # A bind type is sticky on a cached statement handle
 
-**Status:** open, not fixed. Found during the mapper-support final review,
-reproduced independently before filing.
+**Status:** FIXED. Found during the mapper-support final review, reproduced
+independently before filing, fixed before the work was pushed.
 
-**Affects:** any pool with `statement_cache_size` set to a non-zero value.
-Does not reproduce with the cache off, which is the default.
+The statement cache is now keyed on the converted SQL plus the types its binds
+carry, so two calls with different type intent never share a handle. A bind
+list with no typed position still keys on the bare SQL. Regression tests are
+in `t/integration/statement-cache.t`: 'a typed bind does not leak its type to
+a later untyped one' and 'each type signature gets its own cache entry'.
+
+The rest of this note is kept as the record of why the cache is keyed the way
+it is.
+
+**Affected:** any pool with `statement_cache_size` set to a non-zero value.
+Did not reproduce with the cache off, which is the default.
 
 ## What happens
 
@@ -55,14 +64,26 @@ The fix belongs in the statement cache's handle-reuse path, not in the bind
 resolution the mapper work touched. Folding it into that branch's fix wave
 would have mixed an unrelated correctness fix into a reviewed feature diff.
 
-## Where to look
+## Why the fix took the shape it did
 
-`Async::DBD::Pg::Connection::_execute_once` binds parameters one at a time and
-passes `pg_type` only for binds that carry a type. A cached handle keeps the
-attributes from its previous execution, so a bind that passes no `pg_type`
-does not clear what was set before. Any fix has to make each execution state
-the full type intent for every parameter, rather than relying on the handle
-being fresh.
+The stickiness is documented DBI behaviour, not a driver bug: a type set with
+`bind_param` persists for later executes, survives passing values through
+`execute($v)`, and applies per parameter position. Our cache was what put two
+callers with different type intent on one handle.
+
+Two simpler fixes were measured and rejected:
+
+- **Clear the type before reuse.** Not possible. Neither an empty attribute
+  hash nor `pg_type => 0` clears one; only overwriting with another real type
+  works.
+- **Always state a type.** A trap. "Untyped" is not `PG_TEXT` -- binding an
+  integer parameter as text turns `WHERE n = $1` into a comparison that
+  matches nothing (measured: untyped matched, `PG_TEXT` returned NULL). There
+  is no safe synthetic default to overwrite with.
+
+What does give clean state is a fresh handle, which a compound cache key
+guarantees. A fresh `prepare` of identical SQL inherits nothing, so separate
+entries cannot leak into each other.
 
 The statement cache's design notes are in
 `docs/superpowers/specs/2026-08-05-statement-cache-design.md`.
