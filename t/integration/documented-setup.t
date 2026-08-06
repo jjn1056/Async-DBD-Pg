@@ -62,4 +62,33 @@ subtest 'every module SYNOPSIS names the setup it needs' => sub {
     }
 };
 
+subtest 'a connection checked out by hand is lost if it is not released' => sub {
+    # The behaviour the documentation has to warn about, pinned so the
+    # warning cannot quietly stop being true. DESTROY does release, but the
+    # enclosing async sub's frame holds the reference, so it never runs.
+    my $pg = Async::DBD::Pg->new(
+        dsn => test_dsn(), min_connections => 0, max_connections => 2);
+
+    (async sub {
+        my $conn = await $pg->connection;
+        await $conn->query_value('SELECT 1');
+    })->()->get;
+
+    is $pg->active_count, 1,
+        'still checked out after the sub that took it has ended';
+    is $pg->idle_count, 0, 'and the pool does not have it back';
+
+    # with_connection returns it even when the body dies.
+    my $err = dies {
+        $pg->with_connection(async sub {
+            my ($conn) = @_;
+            await $conn->query('SELECT * FROM no_such_table_at_all');
+        })->get
+    };
+    ok $err, 'the failure still reaches the caller';
+    is $pg->idle_count, 1, 'and with_connection gave the connection back anyway';
+
+    $pg->shutdown(timeout => 10)->get;
+};
+
 done_testing;

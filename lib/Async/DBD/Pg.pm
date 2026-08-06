@@ -1439,8 +1439,27 @@ flapping is visible rather than silently absorbed.
 =head2 connection
 
     my $conn = await $pg->connection;
+    ...
+    $conn->release;
 
-Get a connection from the pool. Returns a L<Async::DBD::Pg::Connection>.
+Check a connection out of the pool. Returns a
+L<Async::DBD::Pg::Connection>.
+
+B<You must release it, and a connection that is not released is gone for the
+life of the pool.> Destruction would return it, but an C<async sub> holds its
+lexicals until the sub itself is collected, so in practice the destructor does
+not run and the slot is never recovered. A pool that loses every slot this way
+stops answering: callers queue on C<connection> until C<queue_timeout> and then
+fail with L<Async::DBD::Pg::Error::PoolExhausted>.
+
+Releasing at the end of the block is not enough either, because anything that
+dies in between skips it -- including a query that fails, which is not an
+unusual event.
+
+Prefer L</with_connection> or L</transaction>, which hold the checkout across
+every C<await> and give it back however the block ends, death included. Reach
+for C<connection> only when the checkout has to outlive a single block, and
+then release it in the same place you would close a filehandle.
 
 =head2 query
 

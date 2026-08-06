@@ -1577,6 +1577,11 @@ used afterwards.
 Releasing is not optional: a connection that is never released is never
 available to anyone else.
 
+A connection obtained from L<Async::DBD::Pg/connection> must be released, and
+one that is not is lost to the pool permanently -- see that method for why the
+destructor does not save you. Connections given to L<Async::DBD::Pg/with_connection>
+or L<Async::DBD::Pg/transaction> are released for you.
+
 =head1 ACCESSORS
 
 =head2 dbh
