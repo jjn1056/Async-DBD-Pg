@@ -21,7 +21,11 @@ use Async::DBD::Pg;
 # puts handles into blocking mode, so a pool built without loading a real
 # implementation runs serially while looking perfectly correct.
 
-subtest 'the documented setup actually overlaps queries' => sub {
+subtest 'a pool with a real Future::IO implementation loaded overlaps queries' => sub {
+    # This exercises the test file's own BEGIN { Future::IO->load_best_impl }
+    # above, not the SYNOPSIS text in any shipped module. The next subtest is
+    # what ties this property to the documentation, by checking that the
+    # SYNOPSIS a reader would copy carries the same setup.
     my $pg = Async::DBD::Pg->new(
         dsn => test_dsn(), min_connections => 4, max_connections => 4);
 
