@@ -20,9 +20,9 @@ Requires Perl 5.24+, DBD::Pg 3.20.0+.
 
     # await is legal only inside an async sub.
     (async sub {
-    my $row   = await $pg->query_row('SELECT * FROM users WHERE id = $1', 42);
-    my $count = await $pg->query_value('SELECT count(*) FROM users');
-    my $rs    = await $pg->query('SELECT id, name FROM users');
+        my $row   = await $pg->query_row('SELECT * FROM users WHERE id = $1', 42);
+        my $count = await $pg->query_value('SELECT count(*) FROM users');
+        my $rs    = await $pg->query('SELECT id, name FROM users');
     })->()->get;
 
     await $pg->shutdown(timeout => 5);
@@ -43,8 +43,10 @@ Binary and other typed values must say their type, or a NUL byte silently
 truncates the value. The type may be a constant or a name:
 
     use DBD::Pg qw(:pg_types);
-    await $pg->query('INSERT INTO f (body) VALUES ($1)', { type => PG_BYTEA, value => $bytes });
-    await $pg->query('INSERT INTO f (body) VALUES ($1)', { type => 'bytea', value => $bytes });
+    await $pg->query('INSERT INTO f (body) VALUES ($1)',
+        { type => PG_BYTEA, value => $bytes });
+    await $pg->query('INSERT INTO f (body) VALUES ($1)',
+        { type => 'bytea', value => $bytes });
 
 Names are DBD::Pg's PG_* constants lowercased ('bytea', 'jsonb'), resolved
 from a load-time map, so no round trip. A type DBD::Pg does not know (a user

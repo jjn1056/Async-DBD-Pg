@@ -251,11 +251,16 @@ subtest 'the machine reference shows code that compiles' => sub {
     my @lines = <$fh>;
     close $fh;
 
-    # Indented blocks are the code samples.
+    # A code block is a maximal run of indented or blank lines. Two details
+    # matter and both were wrong before: a nested line indented deeper than
+    # four spaces is still part of the block, and a blank line inside a block
+    # must not split it. A block torn into fragments gets each fragment
+    # compiled alone, which can pass for reasons that have nothing to do with
+    # whether the example works.
     my (@blocks, @current);
-    for my $line (@lines, "\n") {
-        if ($line =~ /^\s{4}\S/) { push @current, $line; next }
-        push @blocks, join('', @current) if @current;
+    for my $line (@lines, "end-of-file sentinel\n") {
+        if ($line =~ /^(?:\s*$|\s{4})/) { push @current, $line; next }
+        push @blocks, join('', @current) if grep { /\S/ } @current;
         @current = ();
     }
 
