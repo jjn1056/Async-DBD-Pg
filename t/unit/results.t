@@ -701,4 +701,13 @@ subtest 'map_rows on an empty result returns an empty Collection' => sub {
     is $out->size, 0, 'and the Collection is empty';
 };
 
+subtest 'map_rows requires a callback' => sub {
+    my $r = results(rows => [[1]], columns => ['id'], types => ['int4']);
+
+    like dies { $r->map_rows(undef) }, qr/map_rows requires a callback/,
+        'undef is rejected';
+    like dies { $r->map_rows('not a coderef') }, qr/map_rows requires a callback/,
+        'a non-coderef is rejected';
+};
+
 done_testing;
