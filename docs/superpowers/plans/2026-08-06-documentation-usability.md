@@ -752,6 +752,42 @@ podchecker lib/Async/DBD/Pg.pm lib/Async/DBD/Pg/*.pm
 
 Expected: `pod syntax OK` for each, and the new subtest green.
 
+- [ ] **Step 2a: Close the commented-out-setup hole**
+
+Task 1's SYNOPSIS check is a substring match, so a SYNOPSIS whose `BEGIN`
+block had been commented out would still pass if the word `load_best_impl`
+survived anywhere in it -- in prose, or in a neighbouring comment. Found by
+the Task 1 reviewer; the test cannot tell live code from a mention of it.
+
+Tighten the assertion in `t/integration/documented-setup.t` so the main
+SYNOPSIS must carry the setup as live code. Replace the `like` in the
+'every module SYNOPSIS names the setup it needs' subtest with:
+
+```perl
+        if ($file eq 'lib/Async/DBD/Pg.pm') {
+            # The canonical example must carry the setup as code, not as a
+            # mention of it. A commented-out BEGIN with the word still
+            # present nearby would otherwise satisfy a substring match.
+            my $live = join "\n",
+                grep { !/^\s*#/ } split /\n/, $synopsis;
+            like $live, qr/BEGIN\s*\{\s*Future::IO->load_best_impl/,
+                "$file SYNOPSIS loads an implementation in live code";
+        }
+        else {
+            like $synopsis, qr/load_best_impl|Async::DBD::Pg\/SYNOPSIS|SEE ALSO/,
+                "$file SYNOPSIS points at the async setup";
+        }
+```
+
+The five pointer modules keep the substring check: they are meant to name
+where the setup lives, not to repeat it.
+
+- [ ] **Step 2b: Mutation check it**
+
+Comment out the `BEGIN` line in the Pg.pm SYNOPSIS while leaving the
+explanatory comment above it -- which still contains the word -- and confirm
+the subtest now fails for `Pg.pm`. Restore.
+
 - [ ] **Step 3a: Mutation check the ASCII test**
 
 Commit first. Put a single em-dash into a POD line in `lib/Async/DBD/Pg.pm`
