@@ -32,11 +32,19 @@ Two forms, not mixable in one statement:
     await $pg->query('SELECT tags[:2] FROM posts');           # array slice
 
 Binary and other typed values must say their type, or a NUL byte silently
-truncates the value:
+truncates the value. The type may be a constant or a name:
 
     use DBD::Pg qw(:pg_types);
     await $pg->query('INSERT INTO f (body) VALUES ($1)',
         { type => PG_BYTEA, value => $bytes });
+    await $pg->query('INSERT INTO f (body) VALUES ($1)',
+        { type => 'bytea', value => $bytes });
+
+Names are DBD::Pg's PG_* constants lowercased ('bytea', 'jsonb'), resolved
+from a load-time map, so no round trip. A type DBD::Pg does not know (a user
+enum, an extension type) croaks -- it cannot be bound by type at all, so bind
+it untyped or cast in SQL. Note 'char' is PG_CHAR (1 byte); SQL CHAR(n) is
+'bpchar'.
 
 ## Pool: Async::DBD::Pg
 
@@ -49,7 +57,8 @@ truncates the value:
     await $pg->with_connection($code, @args)  # scoped checkout, always released
     await $pg->transaction($code, @args)      # commit, or rollback and rethrow
     await $pg->shutdown(timeout => 5)
-    $pg->on_query(sub { my ($e) = @_ })  # {sql, binds, elapsed, rows, error, cached}
+    $pg->on_query(sub { my ($e) = @_ })  # {sql, binds, elapsed, rows, error, cached, connection}
+    $pg->server_version                  # 160014, integer, for feature gating
     $pg->stats  $pg->idle_count  $pg->active_count  $pg->waiting_count
     $pg->total_count  $pg->is_healthy  $pg->is_shut_down  $pg->safe_dsn
 
@@ -79,6 +88,7 @@ over. A transaction holds its connection across every await inside the body.
     await $conn->cursor($sql, @bind, { batch_size => 100 })
     $conn->cancel  $conn->release  $conn->dbh
     $conn->in_transaction  $conn->is_released  $conn->query_count
+    $conn->id  $conn->server_version
 
 ## Results: Async::DBD::Pg::Results
 
@@ -100,6 +110,7 @@ Rows are stored positionally; hashes are derived on demand.
     $r->next  $r->reset  $r->all
     $r->get_column($name_or_index)   # a Column
     $r->preview       # short typed table for logs and debugging
+    $r->map_rows(sub { my ($row, $names) = @_; ... })  # Collection, positional
 
 Views (new object, shared rows, own iterator position):
 
@@ -178,7 +189,9 @@ Failures are objects that stringify, thrown as exceptions:
 
     Async::DBD::Pg::Error::Query          # ->state, ->state_name, ->constraint,
                                           # ->detail, ->hint, ->table, ->column,
-                                          # ->is_retryable
+                                          # ->is_retryable, ->is_unique_violation,
+                                          # ->is_foreign_key_violation,
+                                          # ->is_not_null_violation
     Async::DBD::Pg::Error::Connection
     Async::DBD::Pg::Error::PoolExhausted
     Async::DBD::Pg::Error::Timeout

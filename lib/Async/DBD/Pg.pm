@@ -69,6 +69,11 @@ sub new {
         # idle nor the active list yet, so without counting them separately
         # concurrent callers all see room and all create one.
         _connecting => 0,
+
+        # Monotonic, never reused. A refaddr would be: Perl reuses an address
+        # after collection, so two connections could report the same one over
+        # a pool's life and any attribution built on it would merge them.
+        _next_connection_id => 1,
         pid     => $$,
 
         # Stats
@@ -109,6 +114,19 @@ sub waiting_count   { scalar grep { !$_->{future}->is_ready } @{shift->{waiting}
 sub total_count     { my $s = shift; scalar(@{$s->{idle}}) + scalar(@{$s->{active}}) }
 sub stats           { shift->{stats} }
 sub safe_dsn        { Async::DBD::Pg::Util::safe_dsn(shift->{dsn}) }
+
+# The version of the server this pool is connected to, in PostgreSQL's integer
+# form. Read from any live connection, since a pool addresses one database.
+sub server_version {
+    my ($self) = @_;
+
+    for my $conn (@{ $self->{idle} }, @{ $self->{active} }) {
+        my $v = $conn->server_version;
+        return $v if defined $v;
+    }
+
+    return undef;
+}
 
 sub pubsub {
     my ($self) = @_;
@@ -573,6 +591,7 @@ async sub _create_connection {
     my $conn = Async::DBD::Pg::Connection->new(
         dbh         => $dbh,
         pool        => $self,
+        id          => $self->{_next_connection_id}++,
         created_at  => time(),
         query_count => 0,
         statement_cache_size => $self->{statement_cache_size},
@@ -1305,6 +1324,9 @@ and always false for a statement without placeholders, which is never cached.
 A hit rate well below 1 says the cache is too small for the working set,
 which is the case where it costs more than it saves.
 
+=item * C<connection> -- the id of the connection that ran it, so statements
+can be attributed to a connection across a pool
+
 =back
 
 Fires on success and on failure alike, so a handler counting statements sees
@@ -1542,6 +1564,16 @@ take a busy service out of rotation.
 =head2 stats
 
 Returns hashref of cumulative statistics (created, released, discarded, etc).
+
+=head2 server_version
+
+    if ($pg->server_version >= 150000) { ... }
+
+The version of the server this pool is connected to, in PostgreSQL's own
+integer form -- C<160014> for 16.0.14. A number rather than a string because
+every use is a comparison, typically to gate a feature such as C<MERGE>.
+
+Returns undef if the pool has no connection yet.
 
 =head2 safe_dsn
 

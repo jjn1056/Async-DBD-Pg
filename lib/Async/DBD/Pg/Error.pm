@@ -19,6 +19,14 @@ sub message { shift->{message} }
 # query error can be retryable, and only for the two states below.
 sub is_retryable { 0 }
 
+# Answerable on every error, matching is_retryable above. Only a query error
+# carries a SQLSTATE to test; a caller branching on one of these around a
+# statement must not get "method not found" the first time the failure is a
+# dropped connection or an exhausted pool instead.
+sub is_unique_violation      { 0 }
+sub is_foreign_key_violation { 0 }
+sub is_not_null_violation    { 0 }
+
 sub throw {
     my $self = shift;
     die ref $self ? $self : $self->new(@_);
@@ -88,6 +96,21 @@ my %RETRYABLE = map { $_ => 1 } qw(40001 40P01);
 sub is_retryable {
     my ($self) = @_;
     return $RETRYABLE{ $self->{code} // '' } ? 1 : 0;
+}
+
+# The three integrity violations a caller routinely branches on, named so the
+# branch reads as the domain rather than as a five-character code. Answered
+# from the same SQLSTATE the rest of this class is answered from.
+#
+# Deliberately not a generic ->is($name): that would be a second spelling of
+# state_name, which already exists and already covers every code in the map.
+sub is_unique_violation      { $_[0]->_state_is('23505') }
+sub is_foreign_key_violation { $_[0]->_state_is('23503') }
+sub is_not_null_violation    { $_[0]->_state_is('23502') }
+
+sub _state_is {
+    my ($self, $code) = @_;
+    return ( ($self->{code} // '') eq $code ) ? 1 : 0;
 }
 
 
@@ -201,6 +224,29 @@ from one. Reported for syntax errors.
 =head3 context
 
 The server's call stack context, for errors raised inside PL/pgSQL.
+
+=head2 is_unique_violation, is_foreign_key_violation, is_not_null_violation
+
+    if ($err->is_unique_violation) {
+        my $which = $err->constraint;   # 'users_email_key'
+    }
+
+True for SQLSTATE C<23505>, C<23503> and C<23502> respectively, false
+otherwise.
+
+For a unique violation, PostgreSQL reports C<constraint> but leaves C<column>
+undef -- it names the index that was violated, not the columns in it, so
+mapping a unique violation back to a field is done through the constraint
+name. C<column> is populated for NOT NULL and check violations, where a
+single column is at fault.
+
+These are the three worth naming. Every other code is available through
+C<state> and C<state_name>.
+
+Answerable on every error this distribution raises, not only on a query
+error, so they never need guarding with C<can>. False on anything that is
+not C<Async::DBD::Pg::Error::Query>, since only a query error carries a
+SQLSTATE to test.
 
 =head2 is_retryable
 

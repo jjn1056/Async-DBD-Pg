@@ -563,4 +563,52 @@ subtest 'a hashref that is not a sentinel is left alone' => sub {
     $pg->shutdown->get;
 };
 
+subtest 'server_version is the integer PostgreSQL reports' => sub {
+    my $pg = Async::DBD::Pg->new(
+        dsn => test_dsn(), min_connections => 0, max_connections => 1);
+    my $conn = $pg->connection->get;
+
+    my $v = $conn->server_version;
+
+    like $v, qr/\A[0-9]+\z/, 'an integer, not a string to be parsed';
+    ok $v >= 90000, "and a plausible server version ($v)";
+    is $pg->server_version, $v, 'the pool reports the same';
+
+    $conn->release;
+    $pg->shutdown(timeout => 5)->get;
+};
+
+subtest 'on_query attributes each statement to its connection' => sub {
+    my @events;
+    my $pg = Async::DBD::Pg->new(
+        dsn => test_dsn(), min_connections => 0, max_connections => 2,
+        on_query => sub { push @events, $_[0] },
+    );
+
+    my $a = $pg->connection->get;
+    my $b = $pg->connection->get;
+
+    ok $a->id, 'a connection has an id';
+    isnt $a->id, $b->id, 'and two connections differ';
+
+    @events = ();
+    $a->query_value('SELECT 1')->get;
+    $a->query_value('SELECT 2')->get;
+    $b->query_value('SELECT 3')->get;
+
+    # Not `is [...ids...], [$a->id, $a->id, $b->id]`: the expected side would
+    # be built from the same values under test, so a bug collapsing every id
+    # to one constant would leave both sides equal and the test would still
+    # pass. Check the shape independently of the id values, then identity.
+    my ($e1, $e2, $e3) = map { $_->{connection} } @events;
+    is   $e1, $e2,    "a's two queries share one connection id";
+    isnt $e2, $e3,    "and differ from b's";
+    is   $e1, $a->id, "and it is a's own id";
+    is   $e3, $b->id, "the third is b's own id";
+
+    $a->release;
+    $b->release;
+    $pg->shutdown(timeout => 5)->get;
+};
+
 done_testing;
