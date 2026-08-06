@@ -296,9 +296,26 @@ cache warming. No decision by statement type -- the LRU handles a one-off DDL
 without help. No pipeline mode.
 
 The warn-once heuristic for "26000 recoveries exceed some fraction of hits,
-this looks like transaction pooling" ships only if it earns its place; it is a
-guess about a deployment from inside a library, and a wrong guess is noise in
-someone's log.
+this looks like transaction pooling" was weighed and **dropped**.
+
+The benchmark decided it. The heuristic watches 26000 recoveries, which is the
+transaction-pooling signature -- but the failure that actually costs the most
+is an undersized cache, and that produces plain misses, not 26000s. It would
+have sat silent through a 36% to 131% regression while warning about a
+deployment mistake the POD already flags at configuration time, which is where
+a reader can still act on it.
+
+Two further objections stand on their own. The threshold is unpickable: an
+application running migrations, or anything issuing `DEALLOCATE ALL`, produces
+legitimate 26000s, so any fraction chosen is arbitrary and a wrong guess is
+noise in someone's production log. And it infers infrastructure from inside a
+library, when the operator already knows their own topology.
+
+If cache health needs reporting later, the answer is counters -- hits, misses,
+evictions -- on the pool's `stats`, where the numbers are exact rather than
+inferred and cover both failure modes. Not built, because `on_query` already
+carries `cached` per statement and nothing needs the aggregate until the cache
+is switched on.
 
 ## Risk
 
