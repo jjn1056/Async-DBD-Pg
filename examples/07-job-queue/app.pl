@@ -163,11 +163,13 @@ async sub do_the_work {
 # A caught failure might be a real database error carrying diagnostics, or
 # just a plain die from application code -- do_the_work() can still throw
 # either. Only Error::Query carries state_name and the other diagnostic
-# accessors (a Connection/Timeout/PoolExhausted error never reached the
-# database, so there is nothing to report beyond a message). The violation
-# predicates and is_retryable, by contrast, ARE answerable on every
-# Async::DBD::Pg::Error -- stubbed false on the base class -- which is why
-# ->is_unique_violation needs no isa check of its own.
+# accessors. A Timeout error may have reached the database but was
+# cancelled locally before any diagnostic came back; Connection and
+# PoolExhausted never got that far at all -- either way there is no
+# SQLSTATE to report. The violation predicates and is_retryable, by
+# contrast, ARE answerable on every Async::DBD::Pg::Error -- stubbed false
+# on the base class -- which is why ->is_unique_violation needs no isa
+# check of its own.
 sub failure_result {
     my ($err) = @_;
 
