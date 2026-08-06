@@ -162,12 +162,16 @@ async sub do_the_work {
 
 # A caught failure might be a real database error carrying diagnostics, or
 # just a plain die from application code -- do_the_work() can still throw
-# either. is_unique_violation and state_name are answerable on every
-# Async::DBD::Pg::Error, so no isa check beyond the base class is needed.
+# either. Only Error::Query carries state_name and the other diagnostic
+# accessors (a Connection/Timeout/PoolExhausted error never reached the
+# database, so there is nothing to report beyond a message). The violation
+# predicates and is_retryable, by contrast, ARE answerable on every
+# Async::DBD::Pg::Error -- stubbed false on the base class -- which is why
+# ->is_unique_violation needs no isa check of its own.
 sub failure_result {
     my ($err) = @_;
 
-    return { error => "$err" } unless ref $err && $err->isa('Async::DBD::Pg::Error');
+    return { error => "$err" } unless ref $err && $err->isa('Async::DBD::Pg::Error::Query');
 
     my $result = { error => $err->message, state => $err->state_name };
     $result->{constraint} = $err->constraint if $err->is_unique_violation;
