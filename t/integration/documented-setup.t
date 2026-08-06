@@ -44,6 +44,7 @@ subtest 'a pool with a real Future::IO implementation loaded overlaps queries' =
 
 subtest 'every module SYNOPSIS names the setup it needs' => sub {
     my @modules = glob 'lib/Async/DBD/Pg.pm lib/Async/DBD/Pg/*.pm';
+    my $checked = 0;
 
     for my $file (@modules) {
         open my $fh, '<', $file or die "cannot read $file: $!";
@@ -57,6 +58,7 @@ subtest 'every module SYNOPSIS names the setup it needs' => sub {
         my $synopsis = join '', @block;
 
         next unless $synopsis =~ /\bawait\b/;
+        $checked++;
 
         # Either it shows the setup, or it says where the setup lives. A
         # synopsis that awaits and mentions neither is one a reader can copy
@@ -75,6 +77,11 @@ subtest 'every module SYNOPSIS names the setup it needs' => sub {
                 "$file SYNOPSIS points at the async setup";
         }
     }
+
+    # If SYNOPSIS extraction broke for one module (e.g. a =head1 typo), it
+    # would drop that module out of the loop above silently. Asserted here
+    # the same way docs.t asserts its own per-module counts.
+    ok $checked >= 6, "checked at least 6 module SYNOPSES ($checked)";
 };
 
 subtest 'a connection checked out by hand is lost if it is not released' => sub {
