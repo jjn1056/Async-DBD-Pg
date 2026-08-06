@@ -2,6 +2,7 @@
 use strict;
 use warnings;
 
+use Future::AsyncAwait;
 use Future::IO;
 use Async::DBD::Pg;
 
@@ -15,17 +16,15 @@ my $pg = Async::DBD::Pg->new(
     max_connections => 5,
 );
 
-my $conn = eval { $pg->connection->get }
-    or die "Connection failed: $@\n";
+(async sub {
+    # Asking the pool runs one statement on any free connection and gives it
+    # straight back, so nothing can be left checked out.
+    my $version = await $pg->query_value('SELECT version()');
+    print "PostgreSQL version:\n  $version\n\n";
 
-my $result = $conn->query('SELECT version() AS version')->get;
-print "PostgreSQL version:\n";
-print "  ", $result->first->{version}, "\n\n";
+    my $series = await $pg->query('SELECT generate_series(1, 5) AS n');
+    print "Generated series:\n";
+    print "  n = $_->{n}\n" for @{ $series->rows };
+})->()->get;
 
-$result = $conn->query('SELECT generate_series(1, 5) AS n')->get;
-print "Generated series:\n";
-for my $row (@{$result->rows}) {
-    print "  n = $row->{n}\n";
-}
-
-$conn->release;
+await $pg->shutdown(timeout => 5);

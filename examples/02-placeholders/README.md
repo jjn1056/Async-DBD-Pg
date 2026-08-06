@@ -11,3 +11,5 @@ This example shows:
 - Positional placeholders using `$1`, `$2`, ...
 - Named placeholders using `:name`
 - Passing user input without SQL interpolation
+- Running queries directly against the pool with `query_value`
+- Shutting the pool down

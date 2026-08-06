@@ -9,7 +9,6 @@ DATABASE_URL='postgresql://postgres:test@localhost:5432/test' perl -Ilib example
 This example shows:
 
 - Creating a pool with `Async::DBD::Pg->new`
-- Getting a pooled connection
-- Running simple queries
+- Running simple queries directly against the pool with `query_value`/`query`
 - Accessing result rows
-- Releasing the connection
+- Shutting the pool down

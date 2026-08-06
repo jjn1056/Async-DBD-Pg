@@ -2,6 +2,7 @@
 use strict;
 use warnings;
 
+use Future::AsyncAwait;
 use Future::IO;
 use Async::DBD::Pg;
 
@@ -15,23 +16,28 @@ my $pg = Async::DBD::Pg->new(
     max_connections => 5,
 );
 
-my @received;
+(async sub {
+    my @received;
 
-$pg->listen('demo_channel', sub {
-    my ($channel, $payload, $pid) = @_;
-    push @received, [$channel, $payload, $pid];
-    print "Received on $channel from pid $pid: $payload\n";
-})->get;
+    await $pg->listen('demo_channel', sub {
+        my ($channel, $payload, $pid) = @_;
+        push @received, [$channel, $payload, $pid];
+        print "Received on $channel from pid $pid: $payload\n";
+    });
 
-print "Sending notification...\n";
-$pg->notify('demo_channel', 'hello from Async::DBD::Pg')->get;
+    print "Sending notification...\n";
+    await $pg->notify('demo_channel', 'hello from Async::DBD::Pg');
 
-my $deadline = time + 2;
-while (!@received && time < $deadline) {
-    Future::IO->sleep(0.05)->get;
-}
+    # A notification arrives on the listener's own connection, so this waits
+    # for the callback above rather than for the notify to return.
+    my $deadline = time + 2;
+    while (!@received && time < $deadline) {
+        await Future::IO->sleep(0.05);
+    }
 
-@received or die "Timed out waiting for notification\n";
+    @received or die "Timed out waiting for notification\n";
 
-$pg->unlisten_all->get;
-$pg->pubsub->disconnect->get;
+    await $pg->unlisten_all;
+})->()->get;
+
+await $pg->shutdown(timeout => 5);

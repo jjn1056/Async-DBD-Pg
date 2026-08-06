@@ -19,10 +19,13 @@ BEGIN { Future::IO->load_best_impl; }
 
 my $dsn = $ENV{DATABASE_URL} // 'postgresql://postgres:test@localhost:5432/test';
 
+my $queries = 0;    # statement count, kept by the on_query hook below
+
 my $pg = Async::DBD::Pg->new(
     dsn             => $dsn,
     min_connections => 2,
     max_connections => 8,
+    on_query        => sub { $queries++ },
 );
 
 my $json = JSON::PP->new->utf8;
@@ -35,20 +38,20 @@ use constant RUN_FOR => 4;    # seconds
 # ----------------------------------------------------------------- schema
 
 async sub setup_schema {
-    my $conn = await $pg->connection;
+    await $pg->with_connection(async sub {
+        my ($conn) = @_;
 
-    await $conn->query('SET client_min_messages TO warning');
-    await $conn->query('DROP TABLE IF EXISTS metrics');
-    await $conn->query(q{
-        CREATE TABLE metrics (
-            id          SERIAL PRIMARY KEY,
-            name        TEXT NOT NULL,
-            value       NUMERIC NOT NULL,
-            recorded_at TIMESTAMPTZ DEFAULT NOW()
-        )
+        await $conn->query('SET client_min_messages TO warning');
+        await $conn->query('DROP TABLE IF EXISTS metrics');
+        await $conn->query(q{
+            CREATE TABLE metrics (
+                id          SERIAL PRIMARY KEY,
+                name        TEXT NOT NULL,
+                value       NUMERIC NOT NULL,
+                recorded_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        });
     });
-
-    $conn->release;
 }
 
 # --------------------------------------------------------------- producing
@@ -56,11 +59,9 @@ async sub setup_schema {
 async sub record_metric {
     my ($name, $value) = @_;
 
-    my $conn = await $pg->connection;
-    await $conn->query(
+    await $pg->query(
         'INSERT INTO metrics (name, value) VALUES ($1, $2)', $name, $value,
     );
-    $conn->release;
 
     await $pg->notify(metrics => $json->encode({ name => $name, value => $value }));
 }
@@ -84,6 +85,7 @@ async sub report_metric {
 
 sub draw {
     printf "\n== dashboard (%d updates) %s\n", $updates, '=' x 28;
+    printf "   queries run: %d\n", $queries;
 
     if (!%current) {
         print "   waiting for metrics...\n";
@@ -161,8 +163,7 @@ sub supervised {
 
     print "\n== summary ", '=' x 38, "\n\n";
 
-    my $conn = await $pg->connection;
-    my $rows = await $conn->query(q{
+    my $rows = await $pg->query(q{
         SELECT name, COUNT(*) AS updates, ROUND(AVG(value)::numeric, 1) AS avg_value
           FROM metrics
          GROUP BY name
@@ -173,10 +174,9 @@ sub supervised {
     printf "   %-14s %8d %10.1f\n", $_->{name}, $_->{updates}, $_->{avg_value}
         for @{ $rows->rows };
 
-    await $conn->query('DROP TABLE metrics');
-    $conn->release;
+    await $pg->query('DROP TABLE metrics');
 
-    await $pg->shutdown;
+    await $pg->shutdown(timeout => 5);
 })->()->get;
 
 print "\nDone.\n";
