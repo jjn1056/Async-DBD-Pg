@@ -40,9 +40,10 @@ does rather than from what it ought to.
 
 - **The `PG_*` constants are the catalog OIDs.** `PG_BYTEA` is 17, `PG_JSONB`
   3802, `PG_TIMESTAMPTZ` 1184, `PG_TEXT` 25, and `pg_type` gives the same
-  numbers for the same names. A stock database has **629** entries in
-  `pg_type`. Any hardcoded table covers the built-ins and misses every
-  extension type, enum and user-defined type.
+  numbers for the same names. `DBD::Pg`'s `:pg_types` tag enumerates **200**
+  of them, and that set is exactly what `bind_param` will accept -- a stock
+  database's other ~429 catalog types resolve but cannot be bound. See
+  change 3.
 
 - **`pg_server_version` is an integer**, 160014 on this server, not a string.
 
@@ -117,43 +118,55 @@ it can bind. `types()` already reports names, so accepting them closes the
 loop and lets the mapper auto-type every bind it generates without importing
 `:pg_types` at all.
 
-**Resolved by asking PostgreSQL, not from a hardcoded table.** The constants
-are the catalog OIDs, so the catalog is both authoritative and complete.
-Resolution goes through `to_regtype`, which is how PostgreSQL itself reads a
-type name: it honours `search_path` and returns NULL for a name it does not
-know rather than raising. Measured:
+**Resolved from DBD::Pg's own type table, not from PostgreSQL.** This
+reverses an earlier ratified decision in this spec, which said to resolve
+through `to_regtype`. That decision rested on a premise measurement
+falsified, so the reasoning is kept here rather than replaced.
 
-    bytea       -> 17      int4range   -> 3904
-    jsonb       -> 3802    probe_mood  -> 64937   (a user-defined enum)
-    timestamptz -> 1184    text[]      -> 1009
-    no_such_type_at_all -> NULL
+The premise was that resolving through PostgreSQL would reach user-defined
+enums and extension types. It does resolve them -- and the result is
+unusable. `bind_param`'s `pg_type` attribute is checked against DBD::Pg's own
+fixed table of built-in OIDs, so anything outside it is refused:
 
-An earlier draft of this spec said to load `SELECT typname, oid FROM pg_type`
-restricted to the `pg_catalog` namespace. That was self-contradictory and is
-recorded here rather than quietly dropped: a user-defined enum lives in
-`public`, so a `pg_catalog`-only map cannot see it, while the same paragraph
-claimed the design covered enums. Confirmed by measurement -- the catalog-only
-query returns nothing for `probe_mood`. `to_regtype` resolves it, needs no
-namespace rule, and handles array spellings like `text[]` at no extra cost.
+    to_regtype('probe_mood')            -> 65025      (resolves fine)
+    bind_param(1, 'ok', {pg_type=>65025}) -> dies: Cannot bind 1 unknown
+                                                    pg_type 65025
+    bind_param(1, $b,   {pg_type=>17})    -> accepted  (bytea, a built-in)
 
-**Resolved lazily, cached on the pool, one name at a time.** The first bind
-naming a given type costs one round trip; every later bind of that type costs
-none. Nothing is paid by anyone who never names a type, and a pool addresses
-one database, so one cache serves every connection in it. An application uses
-a handful of distinct types, so this is a handful of round trips for the life
-of the process -- cheaper in practice than loading a 629-row map, and exactly
-correct where the map was ambiguous.
+The decisive measurement is the one that makes the whole claim moot:
 
-**The lookup runs on the connection already in hand.** Checking out a second
-connection to resolve a type would deadlock a pool of size one, whose only
-connection is the one waiting on the resolution.
+    enum bound with no type at all       -> 'ok'      (correct)
+    bytea bound with no type at all      -> length 2, not 5 (truncated at NUL)
 
-**An implementation constraint that decides the shape.** The bind loop runs
-inside a synchronous closure passed to `_capture_pg_notices`, inside an
-`eval`, with no await available. The map therefore cannot be loaded from
-inside it. `_execute_once` must scan the binds for named types and await the
-map *before* entering that block -- a scan that costs nothing when no bind
-names a type, which is the common case.
+A user-defined type does not need a typed bind, because it is text on the
+wire. The types that need one are exactly the types DBD::Pg already knows.
+The original claim was not merely unachievable, it was solving a problem that
+does not exist.
+
+So the map is built from DBD::Pg's `:pg_types` exports -- `PG_BYTEA` becomes
+`bytea` -- which yields **200** names and is by construction exactly the set
+`bind_param` accepts. Built once when the module loads. No round trip, no
+per-pool cache, and the resolver is synchronous, which also removes the
+constraint that shaped the earlier design.
+
+Two measured wrinkles, both documented rather than hidden:
+
+- **29 of the 200 are pseudo-types** -- `any`, `internal`, `record`,
+  `trigger`, `void` and the like -- which `bind_param` refuses. They are
+  names nobody binds, so they are left in the map rather than filtered by a
+  list that would rot against DBD::Pg's next release.
+- **`char` is ambiguous.** DBD::Pg's `PG_CHAR` is 18, the internal
+  single-byte type; SQL `CHAR(n)` is `bpchar`, 1042. The name follows
+  DBD::Pg's constant, so `char` means 18 and SQL `CHAR(n)` is spelled
+  `bpchar`. Documented, because binding a string as type 18 would truncate
+  it -- the same class of silent loss this feature exists to prevent.
+
+`to_regtype` also turned out to raise rather than return NULL for `any`,
+contradicting the earlier draft's claim that it never raises.
+
+**An unknown name croaks**, naming the type, before anything is sent. That is
+strictly better than what resolution through PostgreSQL produced, which was a
+failure deep inside `bind_param` naming an OID rather than the type.
 
 **Numeric types keep working.** A `type` that is already a number is passed
 through untouched, so every existing caller is unaffected and `:pg_types`
@@ -213,12 +226,12 @@ Not the order the mapper consumes them, because change 1 is nearly finished:
 7. A bind naming a type produces the same bytes as the same bind using the
    constant. Round-tripped through `bytea` with an embedded NUL, since a
    silently truncated write is the failure being prevented.
-8. A named type resolves for a type absent from any hardcoded list -- an enum
-   created by the test -- which is what distinguishes asking PostgreSQL from
-   consulting a table.
-9. Each distinct type name is resolved at most once per pool, asserted by
-   counting resolutions through `on_query`, and none is resolved when no bind
-   names a type.
+8. Naming a type DBD::Pg cannot bind -- a user-defined enum created by the
+   test -- croaks naming the type, before anything is sent. This is the case
+   that decided the design, and the croak is what replaced a failure deep in
+   `bind_param` that named an OID instead.
+9. Resolving a name issues no query of its own, asserted by counting
+   statements through `on_query`. The map is built at load time.
 10. An unknown type name croaks and names the type.
 11. `server_version` is an integer and matches the server.
 12. `on_query` reports a stable connection identifier: two statements on one
@@ -238,9 +251,13 @@ this would be implicit on the way in, which only looks symmetric.
 
 **A hashref-passing `map_rows`** -- see change 2.
 
-**A bulk type map.** Resolution is per name. Loading all 629 catalog rows up
-front would still miss anything outside `pg_catalog` and would need a
-namespace rule that `to_regtype` does not.
+**Binding a user-defined type by name.** `bind_param` refuses any OID
+outside DBD::Pg's table, and such a type does not need a typed bind anyway --
+it is text on the wire. Bind it untyped, or cast in SQL.
+
+**Filtering the 29 pseudo-types out of the map.** They are names nobody
+binds, and a hand-maintained exclusion list would rot against DBD::Pg's next
+release faster than it would ever help.
 
 ## Risk
 

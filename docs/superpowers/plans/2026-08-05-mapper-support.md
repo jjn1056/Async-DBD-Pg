@@ -4,7 +4,7 @@
 
 **Goal:** Give a schema mapper the four things it needs from this driver: binds typed by PostgreSQL type name, a positional hydration hook, violation predicates on query errors, and per-connection attribution in the query event.
 
-**Architecture:** Four independent changes across four existing files. Type names resolve through PostgreSQL's own `to_regtype`, cached per name on the pool, and are rewritten to OIDs in `query()` before the synchronous bind loop ever sees them -- so the hot path is untouched. `map_rows` hands the callback the positional row, adding the one thing `map` over `->rows` cannot do. The error predicates are lookups over an existing SQLSTATE map.
+**Architecture:** Four independent changes across four existing files. Type names resolve through a map derived at load time from DBD::Pg's own `:pg_types` exports -- by construction the set `bind_param` accepts -- and are rewritten to OIDs in `query()` before the bind loop sees them, so the hot path is untouched and no round trip is added. `map_rows` hands the callback the positional row, adding the one thing `map` over `->rows` cannot do. The error predicates are lookups over an existing SQLSTATE map.
 
 **Tech Stack:** Perl 5.42 via perlbrew, DBD::Pg 3.20.2, DBI 1.650, PostgreSQL 16, Future::AsyncAwait, Test2::V0.
 
@@ -26,8 +26,8 @@
 
 | File | Responsibility in this plan |
 |---|---|
-| `lib/Async/DBD/Pg/Connection.pm` | `_resolve_bind_types` and `_type_oid` (Task 1); the diagnostics-ordering comment (Task 3); `id` accessor and the `connection` event field (Task 4) |
-| `lib/Async/DBD/Pg.pm` | Per-pool type-OID cache (Task 1); `server_version`, connection id counter (Task 4). Task 1 adds no POD here -- typed binds are documented in Connection.pm, which already owns that section |
+| `lib/Async/DBD/Pg/Connection.pm` | `%TYPE_OID` and `_resolve_bind_types` (Task 1); the diagnostics-ordering comment (Task 3); `id` accessor and the `connection` event field (Task 4) |
+| `lib/Async/DBD/Pg.pm` | `server_version` and the connection id counter (Task 4) only. Task 1 touches it not at all |
 | `lib/Async/DBD/Pg/Results.pm` | `map_rows` (Task 2) |
 | `lib/Async/DBD/Pg/Error.pm` | Three violation predicates (Task 3) |
 | `t/integration/typed-binds.t` | **new** -- Task 1 |
@@ -44,13 +44,12 @@ Task order follows the spec's "Order of work": binds first because the mapper ca
 
 **Files:**
 - Modify: `lib/Async/DBD/Pg/Connection.pm` (`query`, plus two new private methods)
-- Modify: `lib/Async/DBD/Pg.pm` (pool-level type-OID cache only; no POD -- the typed-bind docs live in Connection.pm)
 - Modify: `llms.txt`
 - Test: `t/integration/typed-binds.t` (create)
 
 **Interfaces:**
-- Produces: `$conn->_resolve_bind_types($bind_arrayref)` returns a Future of a new arrayref with any `{ type => 'name' }` rewritten to `{ type => $oid }`. Croaks on an unknown name.
-- Produces: `$pool->{_type_oids}` -- hashref, lowercased type name => OID (or `undef` cached for a name PostgreSQL does not know).
+- Produces: `$conn->_resolve_bind_types($bind_arrayref)` -- **synchronous**, returns a new arrayref with any `{ type => 'name' }` rewritten to `{ type => $oid }`. Croaks on a name DBD::Pg does not know.
+- Produces: `%TYPE_OID` -- file-scope in Connection.pm, lowercased type name => OID, built once at load from `@{ $DBD::Pg::EXPORT_TAGS{pg_types} }` (200 entries).
 - Consumes: nothing from other tasks.
 
 - [ ] **Step 1: Write the failing test**
@@ -122,46 +121,44 @@ prove -l t/integration/typed-binds.t
 
 Expected: FAIL. `{ type => 'bytea' }` reaches `bind_param` as the string `bytea` where DBD::Pg wants a numeric OID.
 
-- [ ] **Step 3: Add the pool-level resolver**
+- [ ] **Step 3: Build the name map from DBD::Pg's own exports**
 
-In `lib/Async/DBD/Pg.pm`, add after the `notify` method (around line 137):
+In `lib/Async/DBD/Pg/Connection.pm`, add at file scope after the `use` block:
 
 ```perl
-# name => OID for bind parameters that name their PostgreSQL type. Cached on
-# the pool because a pool addresses one database, so one answer serves every
-# connection in it.
+# name => OID for a bind that names its PostgreSQL type, derived from
+# DBD::Pg's own :pg_types exports rather than a table maintained here:
+# PG_BYTEA becomes 'bytea'. That is by construction exactly the set
+# bind_param accepts, which resolving through PostgreSQL is not -- to_regtype
+# happily returns the OID of a user-defined enum, and bind_param then refuses
+# it with "Cannot bind 1 unknown pg_type 65025".
 #
-# Resolution is PostgreSQL's own: to_regtype honours search_path and returns
-# NULL for a name it does not know rather than raising, which is why this
-# needs no namespace rule and reaches user-defined enums and extension types
-# that a pg_catalog query would miss.
-sub _cached_type_oid {
-    my ($self, $name) = @_;
-    return $self->{_type_oids}{$name};
-}
-
-sub _cache_type_oid {
-    my ($self, $name, $oid) = @_;
-    $self->{_type_oids}{$name} = $oid;
-    return $oid;
-}
-
-sub _type_oid_is_cached {
-    my ($self, $name) = @_;
-    return exists $self->{_type_oids}{$name};
-}
+# Such a type does not need a typed bind in any case: it is text on the wire.
+# The types that need one -- bytea above all, whose text form truncates at the
+# first NUL -- are exactly the ones DBD::Pg knows.
+#
+# 29 of these are pseudo-types (any, internal, record, trigger, void) that
+# bind_param refuses. They are left in rather than filtered by a list that
+# would rot against DBD::Pg's next release; nobody binds them.
+#
+# 'char' follows DBD::Pg's PG_CHAR, the internal single-byte type (18), not
+# SQL CHAR(n), which is 'bpchar' (1042).
+my %TYPE_OID = do {
+    no strict 'refs';
+    map  { ( lc(substr $_, 3) => &{"DBD::Pg::$_"}() ) }
+    grep { /\APG_./ }
+    @{ $DBD::Pg::EXPORT_TAGS{pg_types} || [] };
+};
 ```
 
-In `Async::DBD::Pg::new`, add `_type_oids => {},` to the blessed hash, directly after the `_connecting => 0,` line.
-
-- [ ] **Step 4: Add resolution to the Connection**
+- [ ] **Step 4: Add the resolver**
 
 In `lib/Async/DBD/Pg/Connection.pm`, add these two subs immediately before `sub _parse_query_args`:
 
 ```perl
-# True if any bind names its type rather than giving the numeric OID. Cheap,
-# and it runs on every query, so it is a scan of binds already in hand and
-# never a second pass over anything.
+# True if any bind names its type rather than giving the numeric OID. Runs on
+# every query, so it is a scan of binds already in hand and never a second
+# pass over anything.
 sub _binds_name_a_type {
     my ($bind) = @_;
 
@@ -176,11 +173,10 @@ sub _binds_name_a_type {
 
 # Rewrite { type => 'bytea' } to { type => 17 } before the bind loop sees it.
 #
-# Done here rather than inside the loop because that loop runs in a
-# synchronous closure inside _capture_pg_notices, with no await available --
-# and because a croak raised in there would be caught by the surrounding eval
-# and re-reported as a query error rather than as the caller's mistake.
-async sub _resolve_bind_types {
+# Done here rather than inside that loop because a croak raised in there would
+# be caught by the surrounding eval and re-reported as a query error rather
+# than as the caller's mistake.
+sub _resolve_bind_types {
     my ($self, $bind) = @_;
 
     return $bind unless _binds_name_a_type($bind);
@@ -194,37 +190,18 @@ async sub _resolve_bind_types {
         next unless exists $value->{type} && exists $value->{value};
         next unless defined $value->{type} && $value->{type} !~ /\A[0-9]+\z/;
 
-        my $oid = await $self->_type_oid($value->{type});
+        my $oid = $TYPE_OID{ lc $value->{type} };
 
-        croak "Unknown PostgreSQL type name '$value->{type}' for bind parameter "
-            . ($i + 1)
+        croak "Unknown PostgreSQL type name '$value->{type}' for bind "
+            . 'parameter ' . ($i + 1) . '. Names are DBD::Pg\'s, such as '
+            . 'bytea or jsonb; a type DBD::Pg does not know cannot be bound '
+            . 'by type at all, so bind it untyped or cast it in SQL'
             unless defined $oid;
 
         $resolved[$i] = { type => $oid, value => $value->{value} };
     }
 
     return \@resolved;
-}
-
-# One round trip the first time a given name is seen on this pool, none
-# afterwards -- including for a name PostgreSQL does not know, whose undef is
-# cached too so a typo does not re-ask on every query.
-#
-# The lookup runs on this connection rather than checking out another: a pool
-# of size one has no second connection to give, and asking for one while
-# holding the only one is a deadlock.
-async sub _type_oid {
-    my ($self, $name) = @_;
-
-    my $key  = lc $name;
-    my $pool = $self->{pool};
-
-    return undef unless $pool;
-    return $pool->_cached_type_oid($key) if $pool->_type_oid_is_cached($key);
-
-    my $result = await $self->query('SELECT to_regtype($1)::oid AS oid', $key);
-
-    return $pool->_cache_type_oid($key, $result->first_value);
 }
 ```
 
@@ -233,11 +210,12 @@ async sub _type_oid {
 In `lib/Async/DBD/Pg/Connection.pm`, in `sub query`, insert immediately after the `if (ref $bind eq 'HASH') { ... }` block and before the `if (delete $self->{_check_liveness})` block:
 
 ```perl
-    # Before the timer starts and outside any timeout: resolving a type name
-    # is setup for the caller's query, not part of it, and it happens at most
-    # once per name for the life of the pool.
-    $bind = await $self->_resolve_bind_types($bind);
+    # Synchronous: the map is built at load time, so this costs no round trip
+    # and needs no await.
+    $bind = $self->_resolve_bind_types($bind);
 ```
+
+Nothing is added to `lib/Async/DBD/Pg.pm` for this task -- there is no pool-level cache, because there is nothing to cache.
 
 - [ ] **Step 6: Run the test**
 
@@ -254,7 +232,7 @@ Expected: PASS.
 Append to `t/integration/typed-binds.t`, before `done_testing`:
 
 ```perl
-subtest 'a user-defined enum resolves, which a hardcoded table could not' => sub {
+subtest 'a type DBD::Pg cannot bind croaks, naming the type' => sub {
     my $pg = pool();
     my $conn = $pg->connection->get;
 
@@ -262,35 +240,40 @@ subtest 'a user-defined enum resolves, which a hardcoded table could not' => sub
     $conn->query('DROP TYPE IF EXISTS mapper_mood CASCADE')->get;
     $conn->query("CREATE TYPE mapper_mood AS ENUM ('ok', 'bad')")->get;
 
-    # Lives in public, not pg_catalog, which is exactly the case that decided
-    # resolution goes through to_regtype rather than a catalog query.
-    my $value = $conn->query_value('SELECT $1::mapper_mood::text',
-        { type => 'mapper_mood', value => 'ok' })->get;
+    # bind_param refuses any OID outside DBD::Pg's own table, so naming a
+    # user-defined type has to fail -- the question is only whether it fails
+    # legibly here or as "Cannot bind 1 unknown pg_type 65025" deep inside
+    # DBD::Pg. This is the case that decided the design.
+    my $err = dies {
+        $conn->query_value('SELECT $1::mapper_mood::text',
+            { type => 'mapper_mood', value => 'ok' })->get
+    };
 
-    is $value, 'ok', 'an enum binds by name';
+    like "$err", qr/mapper_mood/, 'the message names the type, not an OID';
+
+    # And it did not need a typed bind in the first place: an enum is text on
+    # the wire. This is the documented way to bind one.
+    my $value = $conn->query_value('SELECT $1::mapper_mood::text', 'ok')->get;
+    is $value, 'ok', 'binding it untyped works, which is why this is no loss';
 
     $conn->query('DROP TYPE mapper_mood')->get;
     $conn->release;
     $pg->shutdown(timeout => 5)->get;
 };
 
-subtest 'each name is resolved once, and only when one is used' => sub {
+subtest 'resolving a name costs no query of its own' => sub {
     my @sql;
     my $pg = pool(on_query => sub { push @sql, $_[0]{sql} });
     my $conn = $pg->connection->get;
 
-    # No bind names a type, so nothing is resolved at all.
-    $conn->query_value('SELECT $1::int', 1)->get;
-    is scalar(grep { /to_regtype/ } @sql), 0,
-        'an untyped query resolves nothing';
-
     @sql = ();
     $conn->query_value('SELECT length($1)', { type => 'bytea', value => 'abc' })->get;
-    $conn->query_value('SELECT length($1)', { type => 'bytea', value => 'defg' })->get;
-    $conn->query_value('SELECT length($1)', { type => 'BYTEA', value => 'hi' })->get;
+    $conn->query_value('SELECT length($1)', { type => 'BYTEA', value => 'defg' })->get;
 
-    is scalar(grep { /to_regtype/ } @sql), 1,
-        'one resolution serves every later bind of that name, case-insensitively';
+    # The map is built at load time, so the only statements are the caller's.
+    is scalar(@sql), 2,
+        'two queries in, two statements out -- no lookup round trip, and the '
+      . 'name is matched case-insensitively';
 
     $conn->release;
     $pg->shutdown(timeout => 5)->get;
@@ -319,12 +302,12 @@ subtest 'a numeric type is passed through untouched' => sub {
     my $pg = pool(on_query => sub { push @sql, $_[0]{sql} });
     my $conn = $pg->connection->get;
 
+    @sql = ();
     my $n = $conn->query_value('SELECT length($1)',
         { type => PG_BYTEA, value => "ab\0cd" })->get;
 
     is $n, 5, 'the constant form still works, NUL and all';
-    is scalar(grep { /to_regtype/ } @sql), 0,
-        'and costs no resolution round trip';
+    is scalar(@sql), 1, 'and adds no statement of its own';
 
     $conn->release;
     $pg->shutdown(timeout => 5)->get;
@@ -357,15 +340,21 @@ read C<pg_catalog> already holds:
     await $conn->query('INSERT INTO files (name, body) VALUES ($1, $2)',
         $name, { type => 'bytea', value => $bytes });
 
-Names are resolved by PostgreSQL itself, through C<to_regtype>, so they
-follow C<search_path> and reach user-defined enums and extension types as
-well as built-ins. Resolution costs one round trip the first time a given
-name is used on a pool and nothing afterwards. The lookup is an ordinary
-statement, so it is reported to L<Async::DBD::Pg/on_query> like any other.
+The names are DBD::Pg's own, its C<PG_*> constants lowercased with the
+prefix dropped, so C<PG_BYTEA> is C<'bytea'>. Resolution happens against a
+map built when the module loads and costs no round trip.
 
-A name PostgreSQL does not know croaks, naming the type. Binding it
-untyped instead is how a C<bytea> is silently truncated, which is the
-whole reason typed binds exist.
+That set is exactly what DBD::Pg is able to bind. A type it does not know
+-- a user-defined enum, a domain, an extension type -- croaks here, naming
+the type. It cannot be bound by type at all: bind it untyped, or cast it in
+SQL. This is no loss, because such a type does not need a typed bind; it is
+text on the wire. The types that need one, C<bytea> above all, are exactly
+the ones DBD::Pg knows.
+
+Two names are worth knowing. C<'char'> is DBD::Pg's C<PG_CHAR>, PostgreSQL's
+internal single-byte type -- SQL C<CHAR(n)> is C<'bpchar'>. And the map
+includes pseudo-types such as C<'internal'> and C<'trigger'>, which resolve
+but which DBD::Pg refuses to bind; nothing sensible binds them.
 
 Numeric types are passed straight through, so C<:pg_types> constants keep
 working and cost no lookup.
@@ -385,8 +374,11 @@ truncates the value. The type may be a constant or a name:
     await $pg->query('INSERT INTO f (body) VALUES ($1)',
         { type => 'bytea', value => $bytes });
 
-Names resolve via to_regtype, so search_path applies and user enums work.
-Resolved once per name per pool. An unknown name croaks.
+Names are DBD::Pg's PG_* constants lowercased ('bytea', 'jsonb'), resolved
+from a load-time map, so no round trip. A type DBD::Pg does not know (a user
+enum, an extension type) croaks -- it cannot be bound by type at all, so bind
+it untyped or cast in SQL. Note 'char' is PG_CHAR (1 byte); SQL CHAR(n) is
+'bpchar'.
 ```
 
 - [ ] **Step 11: Run the full suite and commit**
