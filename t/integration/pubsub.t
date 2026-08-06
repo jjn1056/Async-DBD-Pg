@@ -1186,6 +1186,9 @@ subtest 'a connection dying again mid-replay does not leave the supervisor inert
     # just died, not a synthetic failure that never touches any of that.
     my $orig_query = Async::DBD::Pg::Connection->can('query');
     my $seen = 0;
+    # Which connection the doomed attempt is holding, so its release can be
+    # asserted by identity below rather than by counting what is checked out.
+    my $doomed_id;
     my $captured2 = capture_stderr(sub {
         {
             no strict 'refs';
@@ -1193,7 +1196,10 @@ subtest 'a connection dying again mid-replay does not leave the supervisor inert
             *Async::DBD::Pg::Connection::query = sub {
                 my ($conn, $sql, @bind) = @_;
                 if ($sql =~ /^LISTEN/) {
-                    kill_backends() if $seen == 0;
+                    if ($seen == 0) {
+                        $doomed_id = $conn->id;
+                        kill_backends();
+                    }
                     $seen++;
                 }
                 return $conn->$orig_query($sql, @bind);
@@ -1221,7 +1227,20 @@ subtest 'a connection dying again mid-replay does not leave the supervisor inert
     # _return_connection removes from {active} before ever checking whether
     # the dbh is still alive, so this holds whether or not the connection is
     # genuinely dead by the time it gets here.
-    is $pg->active_count, 0,
+    #
+    # Asserted by identity rather than by active_count, because the count
+    # cannot answer this question here. The doomed attempt fails within
+    # milliseconds of the kill above, and the supervisor's next attempt
+    # becomes eligible to check a connection out exactly two seconds after
+    # that -- the same two seconds this subtest waits. The count is therefore
+    # a coin flip between "nothing is checked out" and "the next attempt is
+    # already holding one", while the release under test has happened either
+    # way. Identity is also the stronger claim: a count of zero would be
+    # satisfied just as well by some other connection leaking in its place.
+    ok defined $doomed_id,
+        'the doomed attempt got as far as checking a connection out';
+    my $doomed = $doomed_id // -1;
+    ok !(grep { $_->id == $doomed } @{ $pg->{active} }),
         'the connection checked out for the doomed attempt was released, not leaked';
 
     # The failure this branch used to die from silently now has to be
